@@ -41,7 +41,7 @@ from http_tls.structures import CaseInsensitiveDict
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "0.2.0"
+    __version__ = "0.2.1"
 
 # Register module alias in sys.modules so `import http_tls.requests as requests` works
 sys.modules["http_tls.requests"] = requests
