@@ -3,7 +3,7 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "http_tls"
+name = "http-tls"
 version = "0.2.0"
 description = "High-performance Rust-powered TLS & Browser Impersonating HTTP client for Python"
 readme = "README.md"
