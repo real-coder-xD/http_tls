@@ -1,0 +1,35 @@
+[package]
+name = "http_tls"
+version = "0.2.0"
+edition = "2021"
+description = "Rust native core for http_tls Python library"
+license = "MIT"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "cookies",
+    "gzip",
+    "brotli",
+    "deflate",
+    "socks",
+    "json",
+    "http2"
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+encoding_rs = "0.8"
+url = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

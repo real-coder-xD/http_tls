@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "http_tls"
+version = "0.2.0"
+description = "High-performance Rust-powered TLS & Browser Impersonating HTTP client for Python"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = []
+
+[tool.maturin]
+python-source = "python"
+module-name = "http_tls._core"
+features = ["pyo3/extension-module"]
+strip = true
+opt-level = 3
