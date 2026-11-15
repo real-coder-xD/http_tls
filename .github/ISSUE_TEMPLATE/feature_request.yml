@@ -1,0 +1,13 @@
+name: 💡 Feature Request / New Browser Preset
+description: Suggest an idea, optimization, or request a new browser impersonation target
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: feature
+    attributes:
+      label: Feature Description / New Preset
+      description: Describe the feature or browser version you would like added
+      placeholder: E.g., Add preset for Chrome 156 / Safari iOS 18.5
+    validations:
+      required: true

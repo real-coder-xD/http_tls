@@ -1,0 +1,33 @@
+name: 🐛 Bug Report
+description: Create a report to help us fix a bug or bypass failure
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to report this issue!
+  - type: input
+    id: url
+    attributes:
+      label: Target URL
+      description: The website URL that triggered the issue (or tls.peet.ws)
+      placeholder: https://example.com
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal Python code to reproduce the issue
+      placeholder: |
+        import http_tls
+        resp = http_tls.get("...")
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
