@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from http_tls.structures import CaseInsensitiveDict
 
 __version__: str
 
@@ -6,41 +7,72 @@ def supported_presets() -> List[str]: ...
 
 class Response:
     status_code: int
-    headers: Dict[str, str]
+    headers: CaseInsensitiveDict
     url: str
     content: bytes
     text: str
-    encoding: str
+    encoding: Optional[str]
     elapsed: float
     cookies: Dict[str, str]
+    history: List["Response"]
 
-    def json(self) -> Any: ...
+    @property
     def ok(self) -> bool: ...
+    @property
+    def reason(self) -> str: ...
+    @property
+    def challenge(self) -> Optional[str]: ...
+
+    def json(self, **kwargs: Any) -> Any: ...
+    def raise_for_status(self) -> None: ...
+    def iter_content(self, chunk_size: Optional[int] = 1, decode_unicode: bool = False) -> Iterator[Any]: ...
+    def iter_lines(self, chunk_size: int = 512, decode_unicode: bool = False, delimiter: Optional[Any] = None) -> Iterator[Any]: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "Response": ...
+    def __exit__(self, *exc: Any) -> None: ...
 
 class Session:
+    impersonate: str
+    headers: CaseInsensitiveDict
+    cookies: Dict[str, str]
+    proxies: Dict[str, str]
+    mode: str
+
     def __init__(
         self,
         impersonate: str = "chrome_152",
         timeout: float = 30.0,
+        verify: Union[bool, str] = True,
+        verify_ssl: bool = True,
+        proxies: Optional[Dict[str, str]] = None,
+        proxy: Optional[str] = None,
+        allow_redirects: bool = True,
         follow_redirects: bool = True,
         max_redirects: int = 10,
-        verify_ssl: bool = True,
-        proxy: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        cookies: Optional[Dict[str, str]] = None,
+        auth: Optional[Tuple[str, str]] = None,
+        cert: Union[str, Tuple[str, str], None] = None,
+        engine: str = "auto",
+        **kwargs: Any,
     ) -> None: ...
-    @property
-    def impersonate(self) -> str: ...
     def request(
         self,
         method: str,
         url: str,
-        params: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
-        data: Optional[Union[bytes, str]] = None,
+        data: Optional[Union[bytes, str, Dict[str, Any]]] = None,
         json: Optional[Any] = None,
         timeout: Optional[float] = None,
+        verify: Optional[Union[bool, str]] = None,
+        proxies: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
+        allow_redirects: Optional[bool] = None,
+        auth: Optional[Tuple[str, str]] = None,
+        stream: bool = False,
+        **kwargs: Any,
     ) -> Response: ...
     def get(self, url: str, **kwargs: Any) -> Response: ...
     def post(self, url: str, **kwargs: Any) -> Response: ...
@@ -49,22 +81,15 @@ class Session:
     def patch(self, url: str, **kwargs: Any) -> Response: ...
     def head(self, url: str, **kwargs: Any) -> Response: ...
     def options(self, url: str, **kwargs: Any) -> Response: ...
-    def __enter__(self) -> Session: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "Session": ...
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None: ...
 
 class AsyncSession:
-    def __init__(
-        self,
-        impersonate: str = "chrome_152",
-        timeout: float = 30.0,
-        follow_redirects: bool = True,
-        max_redirects: int = 10,
-        verify_ssl: bool = True,
-        proxy: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-    ) -> None: ...
-    @property
-    def impersonate(self) -> str: ...
+    headers: CaseInsensitiveDict
+    cookies: Dict[str, str]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
     async def request(self, method: str, url: str, **kwargs: Any) -> Response: ...
     async def get(self, url: str, **kwargs: Any) -> Response: ...
     async def post(self, url: str, **kwargs: Any) -> Response: ...
@@ -73,7 +98,8 @@ class AsyncSession:
     async def patch(self, url: str, **kwargs: Any) -> Response: ...
     async def head(self, url: str, **kwargs: Any) -> Response: ...
     async def options(self, url: str, **kwargs: Any) -> Response: ...
-    async def __aenter__(self) -> AsyncSession: ...
+    async def close(self) -> None: ...
+    async def __aenter__(self) -> "AsyncSession": ...
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None: ...
 
 def request(method: str, url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...

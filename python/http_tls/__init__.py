@@ -1,4 +1,4 @@
-"""http_tls: High-performance Rust & TLS Fingerprint Impersonating HTTP client for Python.
+﻿"""http_tls: High-performance Rust & TLS Fingerprint Impersonating HTTP client for Python.
 
 100% Drop-in replacement for both `requests` and `curl_cffi.requests`:
     import http_tls as requests
@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import sys
-from http_tls import exceptions, requests, status_codes, structures
+from http_tls import challenge, exceptions, requests, status_codes, structures
 from http_tls.exceptions import (
     ConnectTimeout,
     ConnectionError,
@@ -41,7 +41,7 @@ from http_tls.structures import CaseInsensitiveDict
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "0.2.1"
+    __version__ = "0.3.0"
 
 # Register module alias in sys.modules so `import http_tls.requests as requests` works
 sys.modules["http_tls.requests"] = requests

@@ -157,6 +157,62 @@ with http_tls.Session(impersonate="chrome_152", engine="rust") as s:
 
 ---
 
+### Mode 5: Streaming Large Responses (`stream=True`)
+
+Stream large payloads, downloads, and EventStreams directly from the socket without loading entire bodies into RAM:
+
+```python
+import http_tls as requests
+
+# Stream download chunk-by-chunk
+with requests.get("https://httpbin.org/stream/20", stream=True) as resp:
+    for line in resp.iter_lines():
+        if line:
+            print("Received line:", line.decode("utf-8"))
+
+# Custom chunk size
+with requests.get("https://example.com/large-file.zip", stream=True) as resp:
+    with open("local_file.zip", "wb") as f:
+        for chunk in resp.iter_content(chunk_size=65536):
+            f.write(chunk)
+```
+
+---
+
+### Mode 6: Built-in Anti-Bot & JS Challenge Detection
+
+Inspect whether an anti-bot system is challenging your request (`resp.challenge` returns the provider name or `None`):
+
+```python
+import http_tls as requests
+
+resp = requests.get("https://protected-site.com", impersonate="chrome_152")
+
+if resp.challenge:
+    print(f"Intercepted by: {resp.challenge}")
+    # Detected providers: "cloudflare", "datadome", "ddos-guard", "imperva", "perimeterx", "sucuri"
+else:
+    print("Normal response:", resp.status_code)
+```
+
+---
+
+### Mode 7: Custom CA Bundles & Client Certificates (mTLS)
+
+```python
+import http_tls as requests
+
+# Custom Root CA bundle (PEM)
+session = requests.Session(verify="./custom_ca_bundle.pem")
+
+# Client mTLS authentication
+session = requests.Session(cert=("client.crt", "client.key"))
+# Or combined PEM:
+session = requests.Session(cert="client_combined.pem")
+```
+
+---
+
 ## 🎯 Supported Browser Presets (Updated to Nov 2026)
 
 - **Chrome (Default `chrome_152`):** `chrome_152`, `chrome_152_macos`, `chrome_151`, `chrome_150`, `chrome_146`, `chrome_145`, `chrome_142`, `chrome_136`, `chrome_133`, `chrome_131`, `chrome_130`, `chrome_128`, `chrome_124`
@@ -196,7 +252,22 @@ with http_tls.Session(impersonate="chrome_152", engine="rust") as s:
    from http_tls import requests, BrowserType
    resp = requests.get("https://target.com", impersonate=BrowserType.chrome152)
    ```
-3. **Cào dữ liệu Async đa luồng:**
+3. **Tải file lớn tiết kiệm RAM (Streaming):**
+   ```python
+   import http_tls as requests
+   with requests.get("https://httpbin.org/stream/10", stream=True) as resp:
+       for line in resp.iter_lines():
+           if line:
+               print(line.decode("utf-8"))
+   ```
+4. **Tự động nhận diện rào chắn Anti-Bot:**
+   ```python
+   import http_tls as requests
+   resp = requests.get("https://target.com", impersonate="chrome_152")
+   if resp.challenge:
+       print("Bị chặn bởi:", resp.challenge)  # 'cloudflare', 'datadome', 'ddos-guard'...
+   ```
+5. **Cào dữ liệu Async đa luồng:**
    ```python
    import asyncio, http_tls
    async def main():

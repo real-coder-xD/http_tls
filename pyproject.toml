@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "http-tls"
-version = "0.2.1"
+version = "0.3.0"
 description = "High-performance Rust-powered TLS & Browser Impersonating HTTP client for Python"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -17,6 +17,14 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules"
 ]
 dependencies = []
+
+[project.optional-dependencies]
+# Byte-exact browser TLS/HTTP2 fingerprints via libcurl-impersonate.
+impersonate = ["curl_cffi>=0.17"]
+
+[project.urls]
+Homepage = "https://github.com/real-coder-xD/http_tls"
+Issues = "https://github.com/real-coder-xD/http_tls/issues"
 
 [tool.maturin]
 python-source = "python"

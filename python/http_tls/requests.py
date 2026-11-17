@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 from enum import Enum
 import json as _json
-from typing import Any, Dict, List, Optional, Tuple, Union
+import warnings
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
+from http_tls import challenge as _challenge
 from http_tls.exceptions import (
     ConnectTimeout,
     ConnectionError,
@@ -24,15 +27,13 @@ from http_tls.structures import CaseInsensitiveDict
 # Native Rust engine
 try:
     from http_tls._core import (
-        Response as _NativeResponse,
         Session as _RustSession,
         __version__,
         supported_presets as _rust_presets,
     )
 except ImportError:
     _RustSession = None
-    _NativeResponse = None
-    __version__ = "0.2.0"
+    __version__ = "0.3.0"
     def _rust_presets() -> List[str]:
         return []
 
@@ -159,6 +160,75 @@ def _extract_proxy(proxy: Optional[str], proxies: Optional[Dict[str, str]]) -> O
     return None
 
 
+
+_ERROR_KINDS = {
+    "connect_timeout": ConnectTimeout,
+    "timeout": ReadTimeout,
+    "redirect": TooManyRedirects,
+    "ssl": SSLError,
+    "connect": ConnectionError,
+    "request": RequestException,
+}
+
+
+def _translate_error(exc: BaseException) -> RequestException:
+    """Map native "[kind] msg" errors and curl_cffi errors onto requests-style exceptions."""
+    msg = str(exc)
+    if msg.startswith("[") and "]" in msg:
+        kind, _, rest = msg[1:].partition("]")
+        cls = _ERROR_KINDS.get(kind)
+        if cls is not None:
+            return cls(rest.strip())
+    # curl_cffi exceptions: walk the MRO (e.g. CertificateVerifyError -> SSLError).
+    mro = [k.__name__ for k in type(exc).__mro__]
+    for cls in (ConnectTimeout, ReadTimeout, SSLError, TooManyRedirects, Timeout, ConnectionError):
+        if cls.__name__ in mro:
+            return cls(msg)
+    if any("Certificate" in n or "SSL" in n for n in mro):
+        return SSLError(msg)
+    if any("Timeout" in n for n in mro):
+        return Timeout(msg)
+    return RequestException(msg)
+
+
+_FALLBACK_WARNED = False
+
+
+def _warn_fallback() -> None:
+    global _FALLBACK_WARNED
+    if not _FALLBACK_WARNED:
+        _FALLBACK_WARNED = True
+        warnings.warn(
+            "http_tls: curl_cffi not installed -> using the Rust/rustls engine. Browser headers are "
+            "applied, but the TLS ClientHello is rustls, not a browser. For byte-exact browser TLS: "
+            'pip install "http-tls[impersonate]"',
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _read_file(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _split_verify(verify: Union[bool, str, None]) -> Tuple[bool, Optional[str]]:
+    """requests semantics: verify=False | True | "/path/to/ca_bundle.pem"."""
+    if isinstance(verify, str):
+        return True, verify
+    return bool(True if verify is None else verify), None
+
+
+def _identity_pem(cert: Union[str, Tuple[str, str], None]) -> Optional[bytes]:
+    """cert="combined.pem" or cert=("client.crt", "client.key") -> one PEM blob (chain + key)."""
+    if cert is None:
+        return None
+    if isinstance(cert, (tuple, list)):
+        crt, key = cert
+        return _read_file(crt).rstrip(b"\r\n") + b"\n" + _read_file(key)
+    return _read_file(cert)
+
+
 class _OkDescriptor:
     def __init__(self, is_ok: bool):
         self._is_ok = is_ok
@@ -174,31 +244,140 @@ class _OkDescriptor:
 
 
 class Response:
-    """Unified Response object 100% compatible with requests.Response."""
+    """Unified Response object compatible with requests.Response.
+
+    With stream=True the body stays on the socket until `content`, `text`,
+    `iter_content()` or `iter_lines()` is touched.
+    """
 
     def __init__(
         self,
         status_code: int,
         headers: Dict[str, str],
         url: str,
-        content: bytes,
-        text: str,
-        encoding: str = "utf-8",
+        content: Optional[bytes] = b"",
+        text: Optional[str] = None,
+        encoding: Optional[str] = "utf-8",
         elapsed: float = 0.0,
         cookies: Optional[Dict[str, str]] = None,
+        *,
+        raw_chunks: Optional[Iterator[bytes]] = None,
+        closer: Optional[Callable[[], None]] = None,
     ) -> None:
         self.status_code = status_code
         self.headers = CaseInsensitiveDict(headers)
         self.url = url
-        self.content = content
-        self.text = text
-        self.encoding = encoding
+        self.encoding = encoding or None
         self.elapsed = elapsed
         self.cookies = cookies or {}
+        self.history: List["Response"] = []
+        self._raw_chunks = raw_chunks
+        self._closer = closer
+        self._content: Optional[bytes] = None if raw_chunks is not None else (content or b"")
+        self._text = text
 
+    # -- body -------------------------------------------------------------
+    @property
+    def content(self) -> bytes:
+        if self._content is None:
+            self._content = b"".join(self._drain())
+        return self._content
+
+    @property
+    def text(self) -> str:
+        if self._text is None:
+            self._text = self.content.decode(self.encoding or "utf-8", errors="replace")
+        return self._text
+
+    @property
+    def apparent_encoding(self) -> str:
+        return self.encoding or "utf-8"
+
+    def _drain(self) -> Iterator[bytes]:
+        if self._raw_chunks is None:
+            raise RuntimeError("The content for this response was already consumed")
+        chunks, self._raw_chunks = self._raw_chunks, None
+        try:
+            for chunk in chunks:
+                if chunk:
+                    yield chunk
+        finally:
+            self.close()
+
+    def iter_content(self, chunk_size: Optional[int] = 1, decode_unicode: bool = False) -> Iterator[Any]:
+        if self._content is not None:
+            data = self._content
+            step = chunk_size or len(data) or 1
+            source: Iterator[bytes] = (data[i:i + step] for i in range(0, len(data), step))
+        elif chunk_size is None:
+            source = self._drain()
+        else:
+            source = self._rechunk(self._drain(), chunk_size)
+
+        if not decode_unicode:
+            yield from source
+            return
+        decoder = codecs.getincrementaldecoder(self.encoding or "utf-8")(errors="replace")
+        for chunk in source:
+            out = decoder.decode(chunk)
+            if out:
+                yield out
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            yield tail
+
+    @staticmethod
+    def _rechunk(source: Iterator[bytes], size: int) -> Iterator[bytes]:
+        buf = bytearray()
+        for chunk in source:
+            buf += chunk
+            while len(buf) >= size:
+                yield bytes(buf[:size])
+                del buf[:size]
+        if buf:
+            yield bytes(buf)
+
+    def iter_lines(
+        self, chunk_size: int = 512, decode_unicode: bool = False, delimiter: Optional[Any] = None
+    ) -> Iterator[Any]:
+        pending = None
+        for chunk in self.iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode):
+            if pending is not None:
+                chunk = pending + chunk
+            lines = chunk.split(delimiter) if delimiter else chunk.splitlines()
+            if lines and lines[-1] and chunk and lines[-1][-1] == chunk[-1]:
+                pending = lines.pop()
+            else:
+                pending = None
+            yield from lines
+        if pending is not None:
+            yield pending
+
+    def close(self) -> None:
+        closer, self._closer = self._closer, None
+        if closer is not None:
+            try:
+                closer()
+            except Exception:
+                pass
+
+    # -- helpers ----------------------------------------------------------
     @property
     def ok(self) -> _OkDescriptor:
         return _OkDescriptor(200 <= self.status_code < 400)
+
+    @property
+    def reason(self) -> str:
+        try:
+            from http import HTTPStatus
+            return HTTPStatus(self.status_code).phrase
+        except ValueError:
+            return ""
+
+    @property
+    def challenge(self) -> Optional[str]:
+        """Edge provider name if this is a browser-verification interstitial (e.g. "cloudflare"), else None."""
+        return _challenge.detect(self)
 
     def json(self, **kwargs: Any) -> Any:
         return _json.loads(self.text, **kwargs)
@@ -206,9 +385,15 @@ class Response:
     def raise_for_status(self) -> None:
         """Raise HTTPError if the response was a client or server error (4xx/5xx)."""
         if 400 <= self.status_code < 500:
-            raise HTTPError(f"{self.status_code} Client Error for url: {self.url}", response=self)
-        elif 500 <= self.status_code < 600:
-            raise HTTPError(f"{self.status_code} Server Error for url: {self.url}", response=self)
+            raise HTTPError(f"{self.status_code} Client Error: {self.reason} for url: {self.url}", response=self)
+        if 500 <= self.status_code < 600:
+            raise HTTPError(f"{self.status_code} Server Error: {self.reason} for url: {self.url}", response=self)
+
+    def __enter__(self) -> "Response":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
     def __repr__(self) -> str:
         return f"<Response [{self.status_code}]>"
@@ -221,14 +406,27 @@ def supported_presets() -> List[str]:
     return list(_PRESET_MAP.keys())
 
 
+def _native_chunks(stream: Any) -> Iterator[bytes]:
+    while True:
+        chunk = stream.read_chunk()
+        if chunk is None:
+            return
+        yield chunk
+
+
 class Session:
-    """HTTP Session: 100% drop-in for requests.Session and curl_cffi.requests.Session."""
+    """HTTP Session: drop-in for requests.Session and curl_cffi.requests.Session.
+
+    verify: True | False | "/path/to/ca_bundle.pem"
+    cert:   "client_combined.pem" | ("client.crt", "client.key")
+    engine: "auto" (curl_cffi if installed, else Rust) | "impersonate" | "rust"
+    """
 
     def __init__(
         self,
         impersonate: Union[str, BrowserType] = "chrome_152",
         timeout: float = 30.0,
-        verify: bool = True,
+        verify: Union[bool, str] = True,
         verify_ssl: bool = True,
         proxies: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
@@ -238,12 +436,20 @@ class Session:
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
+        cert: Union[str, Tuple[str, str], None] = None,
         engine: str = "auto",
         **kwargs: Any,
     ) -> None:
+        if engine not in ("auto", "impersonate", "rust"):
+            raise ValueError("engine must be 'auto', 'impersonate' or 'rust'")
+        if engine == "impersonate" and not _HAS_IMPERSONATE:
+            raise RuntimeError('engine="impersonate" requires curl_cffi: pip install "http-tls[impersonate]"')
+
+        verify_flag, ca_path = _split_verify(verify)
         self.impersonate = str(impersonate)
         self.timeout = timeout
-        self.verify = verify and verify_ssl
+        self.verify: Union[bool, str] = ca_path if ca_path else (verify_flag and verify_ssl)
+        self.cert = cert
         self.max_redirects = max_redirects
         self.allow_redirects = allow_redirects and follow_redirects
         self.engine = engine
@@ -251,128 +457,176 @@ class Session:
 
         self.headers = CaseInsensitiveDict(headers or {})
         self.cookies = dict(cookies or {})
-        self.proxies = proxies or ({"all": proxy, "http": proxy, "https": proxy} if proxy else {})
+        p_val = _extract_proxy(proxy, proxies)
+        self.proxies = dict(proxies) if proxies else ({"all": proxy, "http": proxy, "https": proxy} if proxy else {})
 
-        use_impersonate = (engine in ("auto", "impersonate")) and _HAS_IMPERSONATE
-        if use_impersonate:
+        if engine != "rust" and _HAS_IMPERSONATE:
             self._mode = "impersonate"
-            target = _resolve_target(self.impersonate)
-            p_val = _extract_proxy(proxy, proxies)
-            p_dict = {"all": p_val, "http": p_val, "https": p_val} if p_val else None
             self._session = _CffiSession(
-                impersonate=target,
+                impersonate=_resolve_target(self.impersonate),
                 timeout=timeout,
                 max_redirects=max_redirects,
                 verify=self.verify,
-                proxies=p_dict,
+                proxies={"all": p_val, "http": p_val, "https": p_val} if p_val else None,
             )
         else:
             self._mode = "rust"
             if _RustSession is None:
                 raise RuntimeError("Rust native engine '_core' not compiled.")
+            if engine == "auto":
+                _warn_fallback()
             self._session = _RustSession(
                 impersonate=self.impersonate,
                 timeout=timeout,
                 follow_redirects=self.allow_redirects,
                 max_redirects=max_redirects,
-                verify_ssl=self.verify,
-                proxy=_extract_proxy(proxy, proxies),
+                verify_ssl=bool(self.verify),
+                proxy=p_val,
+                ca_bundle=_read_file(ca_path) if ca_path else None,
+                client_identity=_identity_pem(cert),
             )
+
+    @property
+    def mode(self) -> str:
+        """Engine actually in use: "impersonate" (curl_cffi) or "rust"."""
+        return self._mode
 
     def request(
         self,
         method: str,
         url: str,
-        params: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
-        data: Optional[Union[bytes, str]] = None,
+        data: Optional[Union[bytes, str, Dict[str, Any]]] = None,
         json: Optional[Any] = None,
         timeout: Optional[float] = None,
-        verify: Optional[bool] = None,
+        verify: Optional[Union[bool, str]] = None,
         proxies: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
         allow_redirects: Optional[bool] = None,
         auth: Optional[Tuple[str, str]] = None,
+        stream: bool = False,
         **kwargs: Any,
     ) -> Response:
-        # Merge headers
         req_headers = dict(self.headers.items())
         if headers:
             req_headers.update(headers)
 
-        # Merge cookies
         req_cookies = dict(self.cookies)
         if cookies:
             req_cookies.update(cookies)
 
-        # Basic Auth
         active_auth = auth or self.auth
         if active_auth and len(active_auth) == 2:
-            auth_str = f"{active_auth[0]}:{active_auth[1]}"
-            b64_auth = base64.b64encode(auth_str.encode()).decode()
-            req_headers["Authorization"] = f"Basic {b64_auth}"
+            token = base64.b64encode(f"{active_auth[0]}:{active_auth[1]}".encode()).decode()
+            req_headers["Authorization"] = f"Basic {token}"
 
         actual_proxy = _extract_proxy(proxy, proxies) or _extract_proxy(None, self.proxies)
         actual_timeout = timeout if timeout is not None else self.timeout
+        redirects = self.allow_redirects if allow_redirects is None else allow_redirects
 
-        if self._mode == "impersonate":
-            p_dict = {"all": actual_proxy, "http": actual_proxy, "https": actual_proxy} if actual_proxy else None
-            cffi_resp = self._session.request(
-                method=method.upper(),
-                url=url,
-                params=params,
-                headers=req_headers,
-                cookies=req_cookies,
-                data=data,
-                json=json,
-                timeout=actual_timeout,
-                proxies=p_dict,
-                verify=self.verify if verify is None else verify,
-                allow_redirects=self.allow_redirects if allow_redirects is None else allow_redirects,
-                **kwargs,
+        try:
+            if self._mode == "impersonate":
+                return self._request_cffi(
+                    method, url, params, req_headers, req_cookies, data, json, actual_timeout,
+                    self.verify if verify is None else verify, actual_proxy, redirects, stream, kwargs,
+                )
+            return self._request_rust(
+                method, url, params, req_headers, req_cookies, data, json, actual_timeout,
+                verify, actual_proxy, redirects, stream,
             )
-            raw_cookies = {}
+        except RequestException:
+            raise
+        except (RuntimeError, OSError) as exc:
+            raise _translate_error(exc) from exc
+        except Exception as exc:
+            if type(exc).__module__.startswith("curl_cffi"):
+                raise _translate_error(exc) from exc
+            raise
+
+    def _request_cffi(self, method, url, params, headers, cookies, data, json, timeout,
+                      verify, proxy, redirects, stream, extra) -> Response:
+        extra = dict(extra)
+        if self.cert is not None:
+            extra.setdefault("cert", self.cert)
+        r = self._session.request(
+            method=method.upper(),
+            url=url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            data=data,
+            json=json,
+            timeout=timeout,
+            proxies={"all": proxy, "http": proxy, "https": proxy} if proxy else None,
+            verify=verify,
+            allow_redirects=redirects,
+            stream=stream,
+            **extra,
+        )
+        # Cookies set on intermediate redirect hops live in the curl_cffi session jar,
+        # not on the final response object.
+        got: Dict[str, str] = {}
+        for source in (getattr(self._session.cookies, "jar", None), getattr(r.cookies, "jar", None)):
             try:
-                raw_cookies = dict(cffi_resp.cookies)
-                self.cookies.update(raw_cookies)
+                for c in source or ():
+                    got[c.name] = c.value
             except Exception:
                 pass
+        self.cookies.update(got)
+        common = dict(
+            status_code=r.status_code,
+            headers=dict(r.headers),
+            url=str(r.url),
+            encoding=r.encoding or "utf-8",
+            elapsed=getattr(r, "elapsed", 0.0),
+            cookies=got,
+        )
+        if stream:
+            return Response(content=None, raw_chunks=iter(r.iter_content()), closer=r.close, **common)
+        return Response(content=r.content, text=r.text, **common)
+
+    def _request_rust(self, method, url, params, headers, cookies, data, json, timeout,
+                      verify, proxy, redirects, stream) -> Response:
+        if isinstance(verify, str):
+            raise ValueError("Per-request CA bundle is not supported by the Rust engine; pass verify=path to Session()")
+        if isinstance(data, dict):
+            from urllib.parse import urlencode
+            data = urlencode(data, doseq=True)
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        body = data.encode("utf-8") if isinstance(data, str) else data
+        call = self._session.request_stream if stream else self._session.request
+        native = call(
+            method=method,
+            url=url,
+            params={k: str(v) for k, v in params.items()} if params else None,
+            headers=headers,
+            cookies=cookies,
+            data=body,
+            json=_json.dumps(json) if json is not None else None,
+            timeout=timeout,
+            proxy=proxy,
+            allow_redirects=redirects,
+            verify=None if verify is None else bool(verify),
+        )
+        self.cookies.update(native.cookies)
+        common = dict(
+            status_code=native.status_code,
+            headers=native.headers,
+            url=native.url,
+            elapsed=native.elapsed,
+            cookies=native.cookies,
+        )
+        if stream:
             return Response(
-                status_code=cffi_resp.status_code,
-                headers=dict(cffi_resp.headers),
-                url=str(cffi_resp.url),
-                content=cffi_resp.content,
-                text=cffi_resp.text,
-                encoding=cffi_resp.encoding or "utf-8",
-                elapsed=getattr(cffi_resp, "elapsed", 0.0),
-                cookies=raw_cookies,
+                content=None,
+                encoding=native.encoding or "utf-8",
+                raw_chunks=_native_chunks(native),
+                closer=native.close,
+                **common,
             )
-        else:
-            data_bytes = data.encode("utf-8") if isinstance(data, str) else data
-            json_str = _json.dumps(json) if json is not None else None
-            native_res = self._session.request(
-                method=method,
-                url=url,
-                params=params,
-                headers=req_headers,
-                cookies=req_cookies,
-                data=data_bytes,
-                json=json_str,
-                timeout=actual_timeout,
-                _proxy=actual_proxy,
-            )
-            self.cookies.update(native_res.cookies)
-            return Response(
-                status_code=native_res.status_code,
-                headers=native_res.headers,
-                url=native_res.url,
-                content=bytes(native_res.content),
-                text=native_res.text,
-                encoding=native_res.encoding,
-                elapsed=native_res.elapsed,
-                cookies=native_res.cookies,
-            )
+        return Response(content=native.content, text=native.text, encoding=native.encoding, **common)
 
     def get(self, url: str, **kwargs: Any) -> Response:
         return self.request("GET", url, **kwargs)
@@ -390,53 +644,29 @@ class Session:
         return self.request("PATCH", url, **kwargs)
 
     def head(self, url: str, **kwargs: Any) -> Response:
+        kwargs.setdefault("allow_redirects", False)
         return self.request("HEAD", url, **kwargs)
 
     def options(self, url: str, **kwargs: Any) -> Response:
         return self.request("OPTIONS", url, **kwargs)
 
-    def __enter__(self) -> Session:
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    def close(self) -> None:
         if hasattr(self._session, "close"):
             self._session.close()
 
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
 
 class AsyncSession:
-    """Asynchronous HTTP Session with requests and curl_cffi compatibility."""
+    """Asynchronous Session (requests / curl_cffi compatible). Requests run on worker threads;
+    the Rust engine releases the GIL for the whole network round-trip."""
 
-    def __init__(
-        self,
-        impersonate: Union[str, BrowserType] = "chrome_152",
-        timeout: float = 30.0,
-        verify: bool = True,
-        verify_ssl: bool = True,
-        proxies: Optional[Dict[str, str]] = None,
-        proxy: Optional[str] = None,
-        allow_redirects: bool = True,
-        follow_redirects: bool = True,
-        max_redirects: int = 10,
-        headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        engine: str = "auto",
-        **kwargs: Any,
-    ) -> None:
-        self._sync_session = Session(
-            impersonate=impersonate,
-            timeout=timeout,
-            verify=verify,
-            verify_ssl=verify_ssl,
-            proxies=proxies,
-            proxy=proxy,
-            allow_redirects=allow_redirects,
-            follow_redirects=follow_redirects,
-            max_redirects=max_redirects,
-            headers=headers,
-            cookies=cookies,
-            engine=engine,
-            **kwargs,
-        )
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._sync_session = Session(*args, **kwargs)
 
     @property
     def headers(self) -> CaseInsensitiveDict:
@@ -470,52 +700,41 @@ class AsyncSession:
     async def options(self, url: str, **kwargs: Any) -> Response:
         return await self.request("OPTIONS", url, **kwargs)
 
-    async def __aenter__(self) -> AsyncSession:
+    async def close(self) -> None:
+        self._sync_session.close()
+
+    async def __aenter__(self) -> "AsyncSession":
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self._sync_session.__exit__(exc_type, exc_val, exc_tb)
+        self._sync_session.close()
 
 
-def request(
-    method: str,
-    url: str,
-    impersonate: Union[str, BrowserType] = "chrome_152",
-    params: Optional[Dict[str, str]] = None,
-    data: Optional[Union[bytes, str]] = None,
-    json: Optional[Any] = None,
-    headers: Optional[Dict[str, str]] = None,
-    cookies: Optional[Dict[str, str]] = None,
-    timeout: Optional[float] = None,
-    verify: bool = True,
-    proxies: Optional[Dict[str, str]] = None,
-    proxy: Optional[str] = None,
-    allow_redirects: bool = True,
-    auth: Optional[Tuple[str, str]] = None,
-    engine: str = "auto",
-    **kwargs: Any,
-) -> Response:
-    with Session(
-        impersonate=impersonate,
-        timeout=timeout or 30.0,
-        verify=verify,
-        proxies=proxies,
-        proxy=proxy,
-        allow_redirects=allow_redirects,
-        auth=auth,
-        engine=engine,
-    ) as s:
-        return s.request(
-            method=method,
-            url=url,
-            params=params,
-            data=data,
-            json=json,
-            headers=headers,
-            cookies=cookies,
-            timeout=timeout,
-            **kwargs,
-        )
+_SESSION_KEYS = ("timeout", "verify", "proxies", "proxy", "allow_redirects", "auth", "cert", "engine")
+
+
+def request(method: str, url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+    """One-shot request. With stream=True the session stays open until the response is closed."""
+    session_kw = {k: kwargs[k] for k in _SESSION_KEYS if k in kwargs and kwargs[k] is not None}
+    s = Session(impersonate=impersonate, **session_kw)
+    stream = bool(kwargs.get("stream"))
+    try:
+        resp = s.request(method, url, **{k: v for k, v in kwargs.items() if k not in ("engine", "cert")})
+    except BaseException:
+        s.close()
+        raise
+    if stream:
+        inner = resp._closer
+        def _close_both() -> None:
+            try:
+                if inner:
+                    inner()
+            finally:
+                s.close()
+        resp._closer = _close_both
+    else:
+        s.close()
+    return resp
 
 
 def get(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
@@ -539,6 +758,7 @@ def patch(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwarg
 
 
 def head(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+    kwargs.setdefault("allow_redirects", False)
     return request("HEAD", url, impersonate=impersonate, **kwargs)
 
 

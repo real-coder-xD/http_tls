@@ -1,6 +1,6 @@
 [package]
 name = "http_tls"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Rust native core for http_tls Python library"
 license = "MIT"
@@ -18,10 +18,12 @@ reqwest = { version = "0.13", default-features = false, features = [
     "gzip",
     "brotli",
     "deflate",
+    "zstd",
     "socks",
     "json",
     "http2"
 ] }
+bytes = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 encoding_rs = "0.8"
@@ -31,5 +33,6 @@ url = "2.5"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# unwind (default) so an unexpected panic surfaces as a Python exception
+# instead of aborting the interpreter.
 strip = true
