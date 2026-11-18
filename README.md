@@ -45,6 +45,18 @@ Tested against `https://tls.peet.ws/api/all` (the canonical TLS fingerprint diag
 | **Throughput (10 reqs)**| ~520 ms/req | ~437 ms/req | **~296 ms/req (32% faster)**| ⚡ **FASTEST** |
 | **Memory Safety** | Python Managed | C Pointers (Manual) | **Rust RAII (Safe)** | 🛡️ **SAFE** |
 
+### 🏆 Complete Feature Comparison Matrix
+
+| Feature | **`http_tls`** | `requests` | `httpx` | `curl_cffi` | `tls-client` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **TLS Fingerprinting** | ✅ **50+ (Chrome 152)** | ❌ | ❌ | ✅ | ✅ |
+| **Async Support** | ✅ **Native Tokio (No GIL)** | ❌ | ✅ | ✅ | ❌ |
+| **HTTP/2 Fingerprint** | ✅ **`m,a,s,p` + Frames** | ❌ | ✅ | ✅ | ✅ |
+| **`httpx`-like API** | ✅ **`Client` / `AsyncClient`** | ❌ | ✅ | ❌ | ❌ |
+| **Cookie `clear()` Works** | ✅ **Deep Sync (Core + Memory)**| ✅ | ✅ | ✅ | ❌ |
+| **No Memory Leaks** | ✅ **Rust RAII (Zero GC Lag)** | ✅ | ✅ | ✅ | ❌ |
+| **Auto-download Binary** | ✅ **Prebuilt ABI3 Wheels** | N/A | N/A | ✅ | ❌ |
+
 ---
 
 ## 🚀 Quick Start
@@ -113,7 +125,32 @@ print("CF-Ray:", resp.headers.get("cf-ray"))
 
 ---
 
-### Mode 3: Native High-Performance Async (`asyncio`)
+### Mode 3: 100% Drop-in for `httpx`
+
+Use standard `httpx` conventions (`Client`, `AsyncClient`, `follow_redirects`, `resp.is_success`, `resp.read()`):
+
+```python
+import http_tls as httpx
+
+with httpx.Client(follow_redirects=True, impersonate="chrome_152") as client:
+    resp = client.get("https://httpbin.org/get")
+    print("Success:", resp.is_success)  # True
+    print("Content bytes:", len(resp.read()))
+
+# Async Client
+import asyncio
+
+async def fetch():
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        r = await client.get("https://httpbin.org/status/200")
+        print("Async Status:", r.status_code, "| is_success:", r.is_success)
+
+asyncio.run(fetch())
+```
+
+---
+
+### Mode 4: Native High-Performance Async (`asyncio`)
 
 Crawl hundreds of protected endpoints concurrently:
 
@@ -213,6 +250,25 @@ session = requests.Session(cert="client_combined.pem")
 
 ---
 
+### Mode 8: True Session Cookie Reset (`session.cookies.clear()`)
+
+Unlike other libraries where clearing cookies leaves underlying session engine cookies intact, `http_tls` performs deep synchronization, wiping cookies from both Python memory and the native Rust/C core:
+
+```python
+import http_tls as requests
+
+session = requests.Session()
+session.get("https://site.com/login")  # Sets session cookies
+
+# Deep-clear: resets cookies across Python dict, libcurl, and Rust Tokio Jar
+session.cookies.clear()  # or session.clear_cookies()
+
+# Subsequent requests will be sent as a completely clean, anonymous session
+resp = session.get("https://site.com/profile")
+```
+
+---
+
 ## 🎯 Supported Browser Presets (Updated to Nov 2026)
 
 - **Chrome (Default `chrome_152`):** `chrome_152`, `chrome_152_macos`, `chrome_151`, `chrome_150`, `chrome_146`, `chrome_145`, `chrome_142`, `chrome_136`, `chrome_133`, `chrome_131`, `chrome_130`, `chrome_128`, `chrome_124`
@@ -252,7 +308,14 @@ session = requests.Session(cert="client_combined.pem")
    from http_tls import requests, BrowserType
    resp = requests.get("https://target.com", impersonate=BrowserType.chrome152)
    ```
-3. **Tải file lớn tiết kiệm RAM (Streaming):**
+3. **Thay thế `httpx` (Hỗ trợ Async & Client):**
+   ```python
+   import http_tls as httpx
+   with httpx.Client(follow_redirects=True) as client:
+       resp = client.get("https://httpbin.org/get")
+       print(resp.is_success, resp.status_code)
+   ```
+4. **Tải file lớn tiết kiệm RAM (Streaming):**
    ```python
    import http_tls as requests
    with requests.get("https://httpbin.org/stream/10", stream=True) as resp:
@@ -260,14 +323,19 @@ session = requests.Session(cert="client_combined.pem")
            if line:
                print(line.decode("utf-8"))
    ```
-4. **Tự động nhận diện rào chắn Anti-Bot:**
+5. **Tự động nhận diện rào chắn Anti-Bot:**
    ```python
    import http_tls as requests
    resp = requests.get("https://target.com", impersonate="chrome_152")
    if resp.challenge:
        print("Bị chặn bởi:", resp.challenge)  # 'cloudflare', 'datadome', 'ddos-guard'...
    ```
-5. **Cào dữ liệu Async đa luồng:**
+6. **Xóa sạch phiên và Cookie (Deep Clear):**
+   ```python
+   session = requests.Session()
+   session.cookies.clear()  # Xóa sạch cả Python dict lẫn session ngầm của Rust và libcurl
+   ```
+7. **Cào dữ liệu Async đa luồng:**
    ```python
    import asyncio, http_tls
    async def main():
