@@ -513,7 +513,7 @@ type ClientKey = (Option<String>, bool, bool);
 
 #[pyclass(name = "Session")]
 pub struct NativeSession {
-    jar: Arc<Jar>,
+    jar: Mutex<Arc<Jar>>,
     clients: Mutex<HashMap<ClientKey, Client>>,
     default_headers: HeaderMap,
     timeout: Duration,
@@ -533,9 +533,10 @@ impl NativeSession {
             return Ok(c.clone());
         }
         let (proxy, follow, verify) = &key;
+        let jar = self.jar.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
         let mut b = Client::builder()
-            .cookie_provider(Arc::clone(&self.jar))
+            .cookie_provider(jar)
             .default_headers(self.default_headers.clone())
             .timeout(self.timeout)
             .tls_danger_accept_invalid_certs(!*verify)
@@ -595,8 +596,9 @@ impl NativeSession {
 
         // Caller cookies go into the shared jar, scoped to this host and "/",
         // so redirects and later requests carry them exactly once.
+        let jar = self.jar.lock().unwrap_or_else(|p| p.into_inner()).clone();
         for (k, v) in dict_pairs(cookies)? {
-            self.jar.add_cookie_str(&format!("{k}={v}; Path=/"), &final_url);
+            jar.add_cookie_str(&format!("{k}={v}; Path=/"), &final_url);
         }
 
         let key: ClientKey = (
@@ -694,7 +696,7 @@ impl NativeSession {
         runtime()?;
 
         Ok(NativeSession {
-            jar: Arc::new(Jar::default()),
+            jar: Mutex::new(Arc::new(Jar::default())),
             clients: Mutex::new(HashMap::new()),
             default_headers,
             timeout: Duration::from_secs_f64(timeout.max(0.1)),
@@ -732,7 +734,7 @@ impl NativeSession {
             method, url, params, headers, cookies, data, json, timeout, proxy, allow_redirects, verify,
         )?;
         let rt = runtime()?;
-        let jar = Arc::clone(&self.jar);
+        let jar = self.jar.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
         py.allow_threads(move || {
             rt.block_on(async move {
@@ -783,7 +785,7 @@ impl NativeSession {
             method, url, params, headers, cookies, data, json, timeout, proxy, allow_redirects, verify,
         )?;
         let rt = runtime()?;
-        let jar = Arc::clone(&self.jar);
+        let jar = self.jar.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
         py.allow_threads(move || {
             rt.block_on(async move {
@@ -810,7 +812,16 @@ impl NativeSession {
     /// All cookies the jar would send to `url`.
     pub fn cookies_for(&self, url: &str) -> PyResult<HashMap<String, String>> {
         let u = url::Url::parse(url).map_err(|e| PyValueError::new_err(format!("Invalid URL: {e}")))?;
-        Ok(collect_cookies(&self.jar, &u, &HeaderMap::new()))
+        let jar = self.jar.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        Ok(collect_cookies(&jar, &u, &HeaderMap::new()))
+    }
+
+    /// Reset the internal cookie jar and purge pooled clients.
+    pub fn clear_cookies(&self) {
+        let mut j = self.jar.lock().unwrap_or_else(|p| p.into_inner());
+        *j = Arc::new(Jar::default());
+        let mut cache = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        cache.clear();
     }
 
     #[getter]

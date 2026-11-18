@@ -229,6 +229,29 @@ def _identity_pem(cert: Union[str, Tuple[str, str], None]) -> Optional[bytes]:
     return _read_file(cert)
 
 
+class Cookies(dict):
+    """Dictionary of cookies with session synchronization and httpx/requests compatibility."""
+
+    def __init__(self, initial: Optional[Dict[str, str]] = None, on_clear: Optional[Callable[[], None]] = None) -> None:
+        super().__init__(initial or {})
+        self._on_clear = on_clear
+
+    def clear(self) -> None:
+        super().clear()
+        if self._on_clear is not None:
+            self._on_clear()
+
+    def set(self, name: str, value: str, domain: Optional[str] = None, path: Optional[str] = None) -> None:
+        self[name] = value
+
+    def get(self, name: str, default: Any = None) -> Any:
+        return super().get(name, default)
+
+    def delete(self, name: str) -> None:
+        if name in self:
+            del self[name]
+
+
 class _OkDescriptor:
     def __init__(self, is_ok: bool):
         self._is_ok = is_ok
@@ -366,6 +389,45 @@ class Response:
     def ok(self) -> _OkDescriptor:
         return _OkDescriptor(200 <= self.status_code < 400)
 
+    # -- httpx compatibility properties ----------------------------------
+    @property
+    def is_success(self) -> bool:
+        """2xx status code (httpx compatible)."""
+        return 200 <= self.status_code < 300
+
+    @property
+    def is_informational(self) -> bool:
+        """1xx status code (httpx compatible)."""
+        return 100 <= self.status_code < 200
+
+    @property
+    def is_redirect(self) -> bool:
+        """3xx status code (httpx compatible)."""
+        return 300 <= self.status_code < 400
+
+    @property
+    def is_client_error(self) -> bool:
+        """4xx status code (httpx compatible)."""
+        return 400 <= self.status_code < 500
+
+    @property
+    def is_server_error(self) -> bool:
+        """5xx status code (httpx compatible)."""
+        return 500 <= self.status_code < 600
+
+    @property
+    def is_error(self) -> bool:
+        """4xx or 5xx status code (httpx compatible)."""
+        return 400 <= self.status_code < 600
+
+    def read(self) -> bytes:
+        """Read and return response bytes (httpx compatible)."""
+        return self.content
+
+    async def aread(self) -> bytes:
+        """Asynchronously read response bytes (httpx compatible)."""
+        return self.content
+
     @property
     def reason(self) -> str:
         try:
@@ -456,7 +518,7 @@ class Session:
         self.auth = auth
 
         self.headers = CaseInsensitiveDict(headers or {})
-        self.cookies = dict(cookies or {})
+        self.cookies = Cookies(cookies, on_clear=self._clear_backend_cookies)
         p_val = _extract_proxy(proxy, proxies)
         self.proxies = dict(proxies) if proxies else ({"all": proxy, "http": proxy, "https": proxy} if proxy else {})
 
@@ -490,6 +552,18 @@ class Session:
     def mode(self) -> str:
         """Engine actually in use: "impersonate" (curl_cffi) or "rust"."""
         return self._mode
+
+    def _clear_backend_cookies(self) -> None:
+        if self._mode == "rust":
+            if hasattr(self._session, "clear_cookies"):
+                self._session.clear_cookies()
+        elif self._mode == "impersonate":
+            if hasattr(self._session, "cookies") and hasattr(self._session.cookies, "clear"):
+                self._session.cookies.clear()
+
+    def clear_cookies(self) -> None:
+        """Clear all session cookies from memory and backend engine."""
+        self.cookies.clear()
 
     def request(
         self,
@@ -764,3 +838,8 @@ def head(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs
 
 def options(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
     return request("OPTIONS", url, impersonate=impersonate, **kwargs)
+
+
+# httpx-compatible aliases
+Client = Session
+AsyncClient = AsyncSession

@@ -20,8 +20,11 @@ from http_tls.exceptions import (
     TooManyRedirects,
 )
 from http_tls.requests import (
+    AsyncClient,
     AsyncSession,
     BrowserType,
+    Client,
+    Cookies,
     Response,
     Session,
     delete,
@@ -41,7 +44,7 @@ from http_tls.structures import CaseInsensitiveDict
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "0.3.0"
+    __version__ = "0.3.1"
 
 # Register module alias in sys.modules so `import http_tls.requests as requests` works
 sys.modules["http_tls.requests"] = requests
@@ -65,6 +68,9 @@ __all__ = [
     "Response",
     "Session",
     "AsyncSession",
+    "Client",
+    "AsyncClient",
+    "Cookies",
     "BrowserType",
     "request",
     "get",
