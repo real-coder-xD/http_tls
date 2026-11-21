@@ -1,17 +1,31 @@
-# http_tls — Rust & BoringSSL TLS (JA3/JA4) and HTTP/2 Impersonating HTTP Client for Python
+<div align="center">
+
+# 🔐 http_tls
+
+**Rust & BoringSSL TLS (JA3/JA4) and HTTP/2 Impersonating HTTP Client for Python**
+
+[![CI & Release Wheels](https://github.com/real-coder-xD/http_tls/actions/workflows/release.yml/badge.svg)](https://github.com/real-coder-xD/http_tls/actions)
+[![PyPI version](https://img.shields.io/pypi/v/http-tls.svg)](https://pypi.org/project/http-tls/)
+[![Python versions](https://img.shields.io/badge/python-3.8%20--%203.14-blue.svg)](https://pypi.org/project/http-tls/)
+[![Downloads](https://img.shields.io/pypi/dm/http-tls.svg)](https://pypi.org/project/http-tls/)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+[Installation](#-installation) • [Quick Start](#-migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client) • [Benchmarks](#-verified-benchmarks--live-ja4--http2-fingerprint-audit) • [API Reference](#-api-reference-summary) • [FAQ](#-frequently-asked-questions-faq) • [Changelog](CHANGELOG.md)
+
+</div>
 
 `http_tls` (`pip install http-tls`) is a high-performance, standalone **Rust + BoringSSL (`btls`) HTTP client for Python** that reproduces byte-exact **TLS (JA3, JA4, GREASE, ALPS, Post-Quantum `X25519MLKEM768`)** and **HTTP/2 (Akamai)** browser fingerprints for over 100 Chrome, Safari, Firefox, Edge, Opera, OkHttp, and Tor profiles.
 
 Built on Rust PyO3 (`abi3-py38`), Tokio, `wreq`, and Hickory async DNS, `http_tls` ships as a self-contained ~4.3 MB wheel with zero external C or Go dependencies and works as a drop-in replacement for **`requests`**, **`httpx`**, and **`curl_cffi`**.
 
-[![CI & Release Wheels](https://github.com/real-coder-xD/http_tls/actions/workflows/release.yml/badge.svg)](https://github.com/real-coder-xD/http_tls/actions)
-[![PyPI version](https://img.shields.io/pypi/v/http-tls.svg)](https://pypi.org/project/http-tls/)
-[![Python versions](https://img.shields.io/badge/python-3.8%20--%203.14-blue.svg)](https://pypi.org/project/http-tls/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+```bash
+pip install http-tls
+```
 
 ---
 
-## Key Facts (At a Glance)
+## 📌 Key Facts (At a Glance)
 
 | Property | Value |
 | :--- | :--- |
@@ -29,30 +43,30 @@ Built on Rust PyO3 (`abi3-py38`), Tokio, `wreq`, and Hickory async DNS, `http_tl
 
 ---
 
-## Table of Contents
+## 📑 Table of Contents
 
-- [Why `http_tls`?](#why-http_tls)
-- [Comparison: `http_tls` vs `curl_cffi`, `primp`, `tls-client`, `httpx`, and `requests`](#comparison-http_tls-vs-curl_cffi-primp-tls-client-httpx-and-requests)
-- [Verified Benchmarks & Live JA4 / HTTP/2 Fingerprint Audit](#verified-benchmarks--live-ja4--http2-fingerprint-audit)
-- [Installation](#installation)
-- [Migration & Drop-in Quick Start (`requests`, `httpx`, `curl_cffi`, `tls-client`)](#migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client)
-- [High-Concurrency Execution: Native Tokio Async & Sync `gather()`](#high-concurrency-execution-native-tokio-async--sync-gather)
-- [Streaming Responses & Multipart File Uploads](#streaming-responses--multipart-file-uploads)
-- [TLS-Impersonated WebSockets (Sync & Async)](#tls-impersonated-websockets-sync--async)
-- [Custom JA3, BoringSSL `tls_options`, HTTP/2 Settings & Wire Header Order](#custom-ja3-boringssl-tls_options-http2-settings--wire-header-order)
-- [Proxies, Custom DNS (`resolve`), IPv6 `/64` Binding & Hickory DNS](#proxies-custom-dns-resolve-ipv6-64-binding--hickory-dns)
-- [Authentication (`Basic`, `Bearer`, `Digest`), Custom CA Bundles & Mutual TLS (mTLS)](#authentication-basic-bearer-digest-custom-ca-bundles--mutual-tls-mtls)
-- [WAF Challenge Detection, Retries, Playwright `storage_state.json` & Solver Bridge](#waf-challenge-detection-retries-playwright-storage_statejson--solver-bridge)
-- [Traffic Inspection: Wireshark KeyLog & HAR 1.2 Export](#traffic-inspection-wireshark-keylog--har-12-export)
-- [Supported Browser Impersonation Presets (100+ Profiles)](#supported-browser-impersonation-presets-100-profiles)
-- [API Reference Summary](#api-reference-summary)
-- [Frequently Asked Questions (FAQ)](#frequently-asked-questions-faq)
-- [Testing & Development](#testing--development)
-- [License](#license)
+- [Why `http_tls`?](#-why-http_tls)
+- [Comparison: `http_tls` vs `curl_cffi`, `primp`, `tls-client`, `httpx`, and `requests`](#-comparison-http_tls-vs-curl_cffi-primp-tls-client-httpx-and-requests)
+- [Verified Benchmarks & Live JA4 / HTTP/2 Fingerprint Audit](#-verified-benchmarks--live-ja4--http2-fingerprint-audit)
+- [Installation](#-installation)
+- [Migration & Drop-in Quick Start (`requests`, `httpx`, `curl_cffi`, `tls-client`)](#-migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client)
+- [High-Concurrency Execution: Native Tokio Async & Sync `gather()`](#-high-concurrency-execution-native-tokio-async--sync-gather)
+- [Streaming Responses & Multipart File Uploads](#-streaming-responses--multipart-file-uploads)
+- [TLS-Impersonated WebSockets (Sync & Async)](#-tls-impersonated-websockets-sync--async)
+- [Custom JA3, BoringSSL `tls_options`, HTTP/2 Settings & Wire Header Order](#-custom-ja3-boringssl-tls_options-http2-settings--wire-header-order)
+- [Proxies, Custom DNS (`resolve`), IPv6 `/64` Binding & Hickory DNS](#-proxies-custom-dns-resolve-ipv6-64-binding--hickory-dns)
+- [Authentication (`Basic`, `Bearer`, `Digest`), Custom CA Bundles & Mutual TLS (mTLS)](#-authentication-basic-bearer-digest-custom-ca-bundles--mutual-tls-mtls)
+- [WAF Challenge Detection, Retries, Playwright `storage_state.json` & Solver Bridge](#-waf-challenge-detection-retries-playwright-storage_statejson--solver-bridge)
+- [Traffic Inspection: Wireshark KeyLog & HAR 1.2 Export](#-traffic-inspection-wireshark-keylog--har-12-export)
+- [Supported Browser Impersonation Presets (100+ Profiles)](#-supported-browser-impersonation-presets-100-profiles)
+- [API Reference Summary](#-api-reference-summary)
+- [Frequently Asked Questions (FAQ)](#-frequently-asked-questions-faq)
+- [Testing & Development](#-testing--development)
+- [License](#-license)
 
 ---
 
-## Why `http_tls`?
+## 💡 Why `http_tls`?
 
 Standard Python HTTP clients (`requests`, `urllib3`, `aiohttp`, `httpx`) rely on the system OpenSSL stack. Their TLS `ClientHello` cipher suites, extensions, elliptic curves, and HTTP/2 `SETTINGS` frames produce non-browser JA3/JA4 signatures that are immediately flagged or throttled by Cloudflare, Akamai, DataDome, PerimeterX, Imperva, and Fastly.
 
@@ -69,30 +83,32 @@ Existing Python TLS-impersonating alternatives each carry architectural trade-of
 
 ---
 
-## Comparison: `http_tls` vs `curl_cffi`, `primp`, `tls-client`, `httpx`, and `requests`
+## 🆚 Comparison: `http_tls` vs `curl_cffi`, `primp`, `tls-client`, `httpx`, and `requests`
+
+✅ Supported &nbsp;&nbsp; 🟡 Partial &nbsp;&nbsp; ❌ Not supported
 
 | Capability | `http_tls` | `curl_cffi` | `primp` / `rnet` | `tls-client` | `httpx` | `requests` |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| Standalone BoringSSL TLS / JA4 | Yes (100+ presets) | Yes | Yes | Go `utls` | No | No |
-| Custom JA3, TLS & H2 Options | Yes | Yes | Partial | Yes | No | No |
-| Exact Wire Header Order (`OrigHeaderMap`) | Yes | Partial | Yes | Yes | No | No |
-| Native Event-Loop Async | Yes (Tokio) | Yes (libcurl) | Yes (Tokio) | No | Yes | No |
-| Sync Parallel `gather()` (No `async/await`) | Yes (Rust Tokio) | No | No | No | No | No |
-| `requests` + `httpx` + `curl_cffi` Drop-in | Yes | Partial | No | No | `httpx` only | `requests` only |
-| Async Hickory DNS & Custom `resolve` | Yes | `resolve` only | Partial | No | No | No |
-| Outbound IPv4 / IPv6 `/64` Socket Binding | Yes | Yes | Partial | No | Partial | No |
-| TLS-Impersonated WebSockets (Sync & Async) | Yes | Yes | Yes | No | No | No |
-| Streaming, Multipart, Custom CA, mTLS | Yes | Yes | Partial | Partial | Yes | Yes |
-| RFC 7616 `DigestAuth` (MD5/SHA-256/512) | Yes | No | No | No | Yes | Yes |
-| Deep `cookies.clear()` Sync Across FFI | Yes | Yes | Yes | Broken | Yes | Yes |
-| Built-in WAF `resp.challenge` Detector | Yes | No | No | No | No | No |
-| Playwright `storage_state.json` & Solver Bridge | Yes | No | No | No | No | No |
-| Wireshark `keylog_file` & HAR 1.2 Export | Yes | No | No | No | No | No |
-| Memory Safety (No CGo / Manual Free) | Rust RAII | C/CFFI | Rust RAII | Go CGo leaks | Python | Python |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Standalone BoringSSL TLS / JA4 | ✅ 100+ presets | ✅ | ✅ | 🟡 Go `utls` | ❌ | ❌ |
+| Custom JA3, TLS & H2 Options | ✅ | ✅ | 🟡 | ✅ | ❌ | ❌ |
+| Exact Wire Header Order (`OrigHeaderMap`) | ✅ | 🟡 | ✅ | ✅ | ❌ | ❌ |
+| Native Event-Loop Async | ✅ Tokio | ✅ libcurl | ✅ Tokio | ❌ | ✅ | ❌ |
+| Sync Parallel `gather()` (No `async/await`) | ✅ Rust Tokio | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `requests` + `httpx` + `curl_cffi` Drop-in | ✅ | 🟡 | ❌ | ❌ | 🟡 `httpx` only | 🟡 `requests` only |
+| Async Hickory DNS & Custom `resolve` | ✅ | 🟡 `resolve` only | 🟡 | ❌ | ❌ | ❌ |
+| Outbound IPv4 / IPv6 `/64` Socket Binding | ✅ | ✅ | 🟡 | ❌ | 🟡 | ❌ |
+| TLS-Impersonated WebSockets (Sync & Async) | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Streaming, Multipart, Custom CA, mTLS | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ |
+| RFC 7616 `DigestAuth` (MD5/SHA-256/512) | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Deep `cookies.clear()` Sync Across FFI | ✅ | ✅ | ✅ | ❌ Broken | ✅ | ✅ |
+| Built-in WAF `resp.challenge` Detector | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Playwright `storage_state.json` & Solver Bridge | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Wireshark `keylog_file` & HAR 1.2 Export | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Memory Safety (No CGo / Manual Free) | ✅ Rust RAII | 🟡 C/CFFI | ✅ Rust RAII | ❌ Go CGo leaks | ✅ Python | ✅ Python |
 
 ---
 
-## Verified Benchmarks & Live JA4 / HTTP/2 Fingerprint Audit
+## 📊 Verified Benchmarks & Live JA4 / HTTP/2 Fingerprint Audit
 
 ### 1. Live Multi-Browser Fingerprint Audit (`https://tls.peet.ws/api/all`)
 
@@ -132,7 +148,7 @@ In concurrent workloads, `http_tls` delivers **1.64x higher throughput than `cur
 
 ---
 
-## Installation
+## 📦 Installation
 
 Prebuilt ABI3 wheels (~4.3 MB) are published on PyPI for Windows (`x86_64`), Linux (`manylinux_2_28` `x86_64` and `aarch64`), and macOS (`x86_64` and `arm64`), supporting Python 3.8 through 3.14+:
 
@@ -160,7 +176,7 @@ pip install dist/*.whl
 
 ---
 
-## Migration & Drop-in Quick Start (`requests`, `httpx`, `curl_cffi`, `tls-client`)
+## 🚀 Migration & Drop-in Quick Start (`requests`, `httpx`, `curl_cffi`, `tls-client`)
 
 ### 1. Drop-in Replacement for `requests`
 
@@ -246,7 +262,7 @@ with http_tls.Session(impersonate="chrome_149") as session:
 
 ---
 
-## High-Concurrency Execution: Native Tokio Async & Sync `gather()`
+## ⚡ High-Concurrency Execution: Native Tokio Async & Sync `gather()`
 
 ### Native Tokio Async (`AsyncSession` / `AsyncClient`)
 
@@ -289,7 +305,7 @@ with http_tls.Session(base_url="https://httpbin.org", impersonate="chrome_149") 
 
 ---
 
-## Streaming Responses & Multipart File Uploads
+## 📥 Streaming Responses & Multipart File Uploads
 
 ### Sync & Async Streaming
 
@@ -331,7 +347,7 @@ with http_tls.Session() as s:
 
 ---
 
-## TLS-Impersonated WebSockets (Sync & Async)
+## 🔌 TLS-Impersonated WebSockets (Sync & Async)
 
 Both synchronous and native async WebSocket connections inherit the session's BoringSSL TLS fingerprint, proxy settings, cookies, and custom headers:
 
@@ -360,7 +376,7 @@ asyncio.run(ws_async())
 
 ---
 
-## Custom JA3, BoringSSL `tls_options`, HTTP/2 Settings & Wire Header Order
+## 🧬 Custom JA3, BoringSSL `tls_options`, HTTP/2 Settings & Wire Header Order
 
 For custom mobile clients, non-standard APIs, or fingerprint research, override TLS parameters, HTTP/2 settings, and exact wire header casing and ordering (`OrigHeaderMap`):
 
@@ -394,7 +410,7 @@ with http_tls.Session(
 
 ---
 
-## Proxies, Custom DNS (`resolve`), IPv6 `/64` Binding & Hickory DNS
+## 🌐 Proxies, Custom DNS (`resolve`), IPv6 `/64` Binding & Hickory DNS
 
 `http_tls` uses **Hickory async DNS** by default (eliminating OS resolver thread contention), supports HTTP/HTTPS/SOCKS5 proxies with round-robin pools, overrides DNS resolution per hostname without breaking TLS SNI, and binds outbound IPv4/IPv6 addresses for proxy-less IPv6 `/64` rotation:
 
@@ -418,7 +434,7 @@ with http_tls.Session(
 
 ---
 
-## Authentication (`Basic`, `Bearer`, `Digest`), Custom CA Bundles & Mutual TLS (mTLS)
+## 🔑 Authentication (`Basic`, `Bearer`, `Digest`), Custom CA Bundles & Mutual TLS (mTLS)
 
 ```python
 import http_tls
@@ -440,7 +456,7 @@ with http_tls.Session(cert=("client.crt", "client.key")) as s:
 
 ---
 
-## WAF Challenge Detection, Retries, Playwright `storage_state.json` & Solver Bridge
+## 🧱 WAF Challenge Detection, Retries, Playwright `storage_state.json` & Solver Bridge
 
 ### 1. Automatic Anti-Bot Interstitial Detection & Resilient Retries
 
@@ -503,7 +519,7 @@ with http_tls.Client(event_hooks={"request": [sign_request], "response": [log_re
 
 ---
 
-## Traffic Inspection: Wireshark KeyLog & HAR 1.2 Export
+## 🔍 Traffic Inspection: Wireshark KeyLog & HAR 1.2 Export
 
 Inspect TLS-encrypted HTTP/2 frames in Wireshark or replay full request/response waterfalls in Chrome DevTools:
 
@@ -522,7 +538,7 @@ with http_tls.Session(
 
 ---
 
-## Supported Browser Impersonation Presets (100+ Profiles)
+## 🧩 Supported Browser Impersonation Presets (100+ Profiles)
 
 Query the full list programmatically with `http_tls.supported_presets()`:
 
@@ -536,7 +552,7 @@ Query the full list programmatically with `http_tls.supported_presets()`:
 
 ---
 
-## API Reference Summary
+## 📘 API Reference Summary
 
 ### `Session` / `Client` / `AsyncSession` / `AsyncClient` Parameters
 
@@ -576,7 +592,7 @@ Compatible with `requests`, `httpx`, and `curl_cffi` exception names:
 
 ---
 
-## Frequently Asked Questions (FAQ)
+## ❓ Frequently Asked Questions (FAQ)
 
 ### How does `http_tls` differ from `curl_cffi`?
 `http_tls` is compiled in Rust against BoringSSL (`btls`) and Tokio rather than wrapping `libcurl` via CFFI. In live benchmarks against Cloudflare, `http_tls` achieves higher sync and async throughput (346 req/s vs 211 req/s at 30-way concurrency), adds GIL-free parallel `session.gather()` for synchronous code, and includes built-in WAF challenge detection, RFC 7616 Digest Auth, HAR 1.2 export, Wireshark `keylog_file`, and Playwright `storage_state.json` support.
@@ -598,7 +614,7 @@ Pass `keylog_file="sslkeys.log"` to `Session(...)` (or set the `SSLKEYLOGFILE` e
 
 ---
 
-## Testing & Development
+## 🧪 Testing & Development
 
 Run the full pytest suite (23 integration and unit tests covering TLS/JA4, HTTP/2, sync/async streaming, `gather()`, WebSockets, Digest Auth, custom CA/mTLS, `storage_state.json`, HAR export, and `httpx`/`requests` parity):
 
@@ -617,6 +633,6 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete version history.
 
 ---
 
-## License
+## 📄 License
 
 Released under the [MIT License](LICENSE).
