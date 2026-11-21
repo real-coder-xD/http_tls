@@ -1,5 +1,8 @@
 from typing import Any, AsyncContextManager, AsyncIterator, Callable, ContextManager, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from http_tls import auth, challenge, exceptions, requests, solvers, status_codes, structures
 from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
+from http_tls.requests import BrowserType
+from http_tls.status_codes import codes
 from http_tls.exceptions import (
     ConnectError,
     ConnectTimeout,
@@ -82,6 +85,26 @@ class Response:
     peer_certificate: Optional[bytes]
     history: List["Response"]
 
+    def __init__(
+        self,
+        status_code: int,
+        headers: Dict[str, str],
+        url: str,
+        content: Optional[bytes] = b"",
+        text: Optional[str] = None,
+        encoding: Optional[str] = "utf-8",
+        elapsed: float = 0.0,
+        cookies: Optional[Dict[str, str]] = None,
+        http_version: str = "HTTP/1.1",
+        remote_addr: Optional[str] = None,
+        peer_certificate: Optional[bytes] = None,
+        history: Optional[List["Response"]] = None,
+        *,
+        raw_chunks: Optional[Iterator[bytes]] = None,
+        async_stream: Optional[Any] = None,
+        closer: Optional[Callable[[], None]] = None,
+    ) -> None: ...
+
     @property
     def ok(self) -> bool: ...
     @property
@@ -162,13 +185,16 @@ class AsyncWebSocket:
 
 class Session:
     impersonate: str
+    timeout: float
     base_url: str
     headers: CaseInsensitiveDict
+    params: Dict[str, Any]
     cookies: Cookies
     proxies: Dict[str, str]
     proxies_pool: List[str]
     event_hooks: Dict[str, List[Callable[..., Any]]]
     mode: str
+    _session: Any
 
     def __init__(
         self,
@@ -282,6 +308,7 @@ class AsyncSession:
     cookies: Cookies
     params: Dict[str, Any]
     mode: str
+    _sync_session: Session
 
     def __init__(self, *args: Any, **kwargs: Any) -> None: ...
     @property
