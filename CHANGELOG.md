@@ -2,6 +2,16 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [0.7.0] - 2026-11-21
+
+### Fingerprint Fidelity & Production Hardening
+- **Verified Native Default (`chrome_149`):** Changed default `impersonate` from extrapolated `"chrome_152"` to verified native `"chrome_149"` (100% byte-exact BoringSSL + HTTP/2 + Client Hints from `wreq-util`). Removed extrapolated future versions from `supported_presets()` and added `is_verified_preset(name)` for programmatic auditing.
+- **Authentic Chromium GREASE Algorithm:** Implemented Chromium's exact `GetUserAgentBrandList` permutation & GREASE brand generator for callers who explicitly request forward-version aliases.
+- **Full Low-Level BoringSSL & Akamai HTTP/2 Control:** Exposed `alps_protocols`, `record_size_limit`, `delegated_credentials`, `psk_skip_session_ticket`, `psk_dhe_ke`, `renegotiation`, `aes_hw_override`, `random_aes_hw_override`, `certificate_compressors` (`brotli`/`zlib`/`zstd`), `extension_permutation` in `tls_options`; and `settings_order`, `headers_pseudo_order`, `headers_stream_dependency`, `priorities`, `enable_connect_protocol`, `no_rfc7540_priorities`, `initial_stream_id`, `adaptive_window`, `keep_alive_*`, `max_send_buf_size` in `http2_options`. Added 1-line `akamai_h2="..."` & `parse_akamai_h2_to_http2_options()`.
+- **Connection Pool Hygiene & `httpx`/`requests` Parity:** Added `NativeSession::close()` immediately releasing pooled sockets, bounded internal sub-client cache (max 16 entries) to prevent dynamic CA memory leaks, `tcp_nodelay`, `tcp_keepalive`, `TimeoutConfig` + `(connect, read)` tuple timeouts, `Limits`, and offline `MockTransport` (sync & async).
+- **Behavioral Anti-Bot & Browser Solver Bridges:** Added `auto_referer`, `fetch_mode` (`navigate`/`cors`/`same-origin`/`no-cors`), symmetric `AsyncSession` auto-solving during retries, and `http_tls.solvers` (`BestDriverSolver`, `PlaywrightSolver`, `FlareSolverrSolver`).
+- **Soak & Leak Verification:** Added `tests/test_production_readiness.py` and `benchmarks/soak_test.py`.
+
 ## [0.6.3] - 2026-11-21
 
 ### Documentation

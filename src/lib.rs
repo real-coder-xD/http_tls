@@ -13,14 +13,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wreq::cookie::Jar;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
-use wreq::http2::Http2Options;
+use wreq::http2::{
+    Http2Options, Priorities, Priority, PseudoId, PseudoOrder, SettingId, SettingsOrder,
+    StreamDependency, StreamId,
+};
 use wreq::multipart::{Form, Part};
 use wreq::redirect::{History, Policy};
+use wreq::tls::compress::CertificateCompressor;
 use wreq::tls::keylog::KeyLog;
 use wreq::tls::trust::{CertStore, Identity};
-use wreq::tls::{AlpnProtocol, TlsInfo, TlsOptions, TlsVersion};
+use wreq::tls::{AlpnProtocol, AlpsProtocol, ExtensionType, TlsInfo, TlsOptions, TlsVersion};
 use wreq::ws::message::{CloseCode, Message};
 use wreq::{Client, Method, Proxy, RequestBuilder, Version};
+use wreq_util::emulate::compress::{BrotliCompressor, ZlibCompressor, ZstdCompressor};
 use wreq_util::{Emulation, Platform, Profile};
 
 type BodyStream = Pin<Box<dyn Stream<Item = wreq::Result<Bytes>> + Send + 'static>>;
@@ -91,6 +96,39 @@ fn platform_from_name(lower: &str) -> Platform {
     } else {
         Platform::Windows
     }
+}
+
+/// Deterministic Chromium `GetUserAgentBrandList` GREASE + brand permutation algorithm.
+/// Used only when a caller explicitly requests a forward-aliased major version beyond native profiles.
+fn chromium_sec_ch_ua(major: u32, brand: &str) -> String {
+    const GREASE_CHARS: [&str; 11] = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
+    const GREASE_VERSIONS: [&str; 3] = ["8", "99", "24"];
+    const ORDERS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    let seed = major as usize;
+    let grease_brand = format!("Not{}A{}Brand", GREASE_CHARS[seed % 11], GREASE_CHARS[(seed + 1) % 11]);
+    let grease_ver = GREASE_VERSIONS[seed % 3];
+    let major_s = major.to_string();
+    let brands = [
+        (grease_brand.as_str(), grease_ver),
+        ("Chromium", major_s.as_str()),
+        (brand, major_s.as_str()),
+    ];
+    let order = ORDERS[seed % 6];
+    let mut ordered = [("", ""); 3];
+    for (i, &pos) in order.iter().enumerate() {
+        ordered[pos] = brands[i];
+    }
+    format!(
+        "\"{}\";v=\"{}\", \"{}\";v=\"{}\", \"{}\";v=\"{}\"",
+        ordered[0].0, ordered[0].1, ordered[1].0, ordered[1].1, ordered[2].0, ordered[2].1
+    )
 }
 
 fn resolve_emulation(preset: &str) -> ResolvedEmulation {
@@ -176,8 +214,7 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
                 Platform::Android => format!("Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Mobile Safari/537.36"),
                 _ => format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"),
             };
-            let grease = if ver.is_multiple_of(2) { "24" } else { "99" };
-            let ch = format!("\"Google Chrome\";v=\"{ver}\", \"Chromium\";v=\"{ver}\", \"Not)A;Brand\";v=\"{grease}\"");
+            let ch = chromium_sec_ch_ua(ver, "Google Chrome");
             (Some(ua), Some(ch))
         } else {
             (None, None)
@@ -215,7 +252,7 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
         };
         let (ua_ov, ch_ov) = if ver > 148 {
             let ua = format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36 Edg/{ver}.0.0.0");
-            let ch = format!("\"Microsoft Edge\";v=\"{ver}\", \"Chromium\";v=\"{ver}\", \"Not)A;Brand\";v=\"24\"");
+            let ch = chromium_sec_ch_ua(ver, "Microsoft Edge");
             (Some(ua), Some(ch))
         } else {
             (None, None)
@@ -443,7 +480,121 @@ fn parse_tls_options(d: &Bound<'_, PyDict>) -> PyResult<TlsOptions> {
     if let Some(v) = d.get_item("preserve_tls13_cipher_list")? {
         b = b.preserve_tls13_cipher_list(v.extract::<bool>()?);
     }
+    if let Some(v) = d.get_item("alps_protocols")? {
+        let items: Vec<String> = v.extract()?;
+        let mut protos = Vec::with_capacity(items.len());
+        for p in items {
+            match p.trim().to_ascii_lowercase().as_str() {
+                "h2" | "http2" | "http/2" => protos.push(AlpsProtocol::HTTP2),
+                "http/1.1" | "http1" | "h1" => protos.push(AlpsProtocol::HTTP1),
+                "h3" | "http3" | "http/3" => protos.push(AlpsProtocol::HTTP3),
+                other => return Err(PyValueError::new_err(format!("Unsupported ALPS protocol '{other}'"))),
+            }
+        }
+        b = b.alps_protocols(protos);
+    }
+    if let Some(v) = d.get_item("record_size_limit")? {
+        b = b.record_size_limit(v.extract::<u16>()?);
+    }
+    if let Some(v) = d.get_item("delegated_credentials")? {
+        b = b.delegated_credentials(v.extract::<String>()?);
+    }
+    if let Some(v) = d.get_item("psk_skip_session_ticket")? {
+        b = b.psk_skip_session_ticket(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("psk_dhe_ke")? {
+        b = b.psk_dhe_ke(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("renegotiation")? {
+        b = b.renegotiation(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("aes_hw_override")? {
+        b = b.aes_hw_override(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("random_aes_hw_override")? {
+        b = b.random_aes_hw_override(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("certificate_compressors")? {
+        let items: Vec<String> = v.extract()?;
+        let mut comps: Vec<&'static dyn CertificateCompressor> = Vec::with_capacity(items.len());
+        for c in items {
+            match c.trim().to_ascii_lowercase().as_str() {
+                "brotli" | "br" => comps.push(&BrotliCompressor),
+                "zlib" | "deflate" => comps.push(&ZlibCompressor),
+                "zstd" => comps.push(&ZstdCompressor),
+                other => return Err(PyValueError::new_err(format!("Unsupported certificate compressor '{other}'"))),
+            }
+        }
+        b = b.certificate_compressors(comps);
+    }
+    if let Some(v) = d.get_item("extension_permutation")? {
+        let ids: Vec<u16> = v.extract()?;
+        let exts: Vec<ExtensionType> = ids.into_iter().map(ExtensionType::from).collect();
+        b = b.extension_permutation(exts);
+    }
     Ok(b.build())
+}
+
+fn parse_setting_id(item: &Bound<'_, PyAny>) -> PyResult<SettingId> {
+    if let Ok(num) = item.extract::<u16>() {
+        return match num {
+            1 => Ok(SettingId::HeaderTableSize),
+            2 => Ok(SettingId::EnablePush),
+            3 => Ok(SettingId::MaxConcurrentStreams),
+            4 => Ok(SettingId::InitialWindowSize),
+            5 => Ok(SettingId::MaxFrameSize),
+            6 => Ok(SettingId::MaxHeaderListSize),
+            8 => Ok(SettingId::EnableConnectProtocol),
+            9 => Ok(SettingId::NoRfc7540Priorities),
+            other => Err(PyValueError::new_err(format!("Unsupported HTTP/2 setting id {other}"))),
+        };
+    }
+    let name = item.extract::<String>()?;
+    match name.trim().to_ascii_lowercase().as_str() {
+        "1" | "header_table_size" => Ok(SettingId::HeaderTableSize),
+        "2" | "enable_push" => Ok(SettingId::EnablePush),
+        "3" | "max_concurrent_streams" => Ok(SettingId::MaxConcurrentStreams),
+        "4" | "initial_window_size" => Ok(SettingId::InitialWindowSize),
+        "5" | "max_frame_size" => Ok(SettingId::MaxFrameSize),
+        "6" | "max_header_list_size" => Ok(SettingId::MaxHeaderListSize),
+        "8" | "enable_connect_protocol" => Ok(SettingId::EnableConnectProtocol),
+        "9" | "no_rfc7540_priorities" => Ok(SettingId::NoRfc7540Priorities),
+        other => Err(PyValueError::new_err(format!("Unsupported HTTP/2 setting '{other}'"))),
+    }
+}
+
+fn parse_pseudo_id(name: &str) -> PyResult<PseudoId> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "m" | "method" | ":method" => Ok(PseudoId::Method),
+        "a" | "authority" | ":authority" => Ok(PseudoId::Authority),
+        "s" | "scheme" | ":scheme" => Ok(PseudoId::Scheme),
+        "p" | "path" | ":path" => Ok(PseudoId::Path),
+        other => Err(PyValueError::new_err(format!("Unsupported HTTP/2 pseudo-header '{other}'"))),
+    }
+}
+
+fn parse_stream_dependency(v: &Bound<'_, PyAny>) -> PyResult<StreamDependency> {
+    if let Ok(d) = v.downcast::<PyDict>() {
+        let dep_id: u32 = d
+            .get_item("stream_id")?
+            .or(d.get_item("dependency_id")?)
+            .map(|x| x.extract())
+            .transpose()?
+            .unwrap_or(0);
+        let weight: u8 = d
+            .get_item("weight")?
+            .map(|x| x.extract())
+            .transpose()?
+            .unwrap_or(219);
+        let exclusive: bool = d
+            .get_item("exclusive")?
+            .map(|x| x.extract())
+            .transpose()?
+            .unwrap_or(true);
+        return Ok(StreamDependency::new(StreamId::from(dep_id), weight, exclusive));
+    }
+    let (dep_id, weight, exclusive): (u32, u8, bool) = v.extract()?;
+    Ok(StreamDependency::new(StreamId::from(dep_id), weight, exclusive))
 }
 
 fn parse_http2_options(d: &Bound<'_, PyDict>) -> PyResult<Http2Options> {
@@ -468,6 +619,80 @@ fn parse_http2_options(d: &Bound<'_, PyDict>) -> PyResult<Http2Options> {
     }
     if let Some(v) = d.get_item("max_header_list_size")? {
         b = b.max_header_list_size(v.extract::<u32>()?);
+    }
+    if let Some(v) = d.get_item("enable_connect_protocol")? {
+        b = b.enable_connect_protocol(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("no_rfc7540_priorities")? {
+        b = b.no_rfc7540_priorities(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("initial_stream_id")? {
+        b = b.initial_stream_id(v.extract::<u32>()?);
+    }
+    if let Some(v) = d.get_item("adaptive_window")? {
+        b = b.adaptive_window(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("max_send_buf_size")? {
+        b = b.max_send_buf_size(v.extract::<usize>()?);
+    }
+    if let Some(v) = d.get_item("keep_alive_interval")? {
+        b = b.keep_alive_interval(Duration::from_secs_f64(v.extract::<f64>()?.max(0.1)));
+    }
+    if let Some(v) = d.get_item("keep_alive_timeout")? {
+        b = b.keep_alive_timeout(Duration::from_secs_f64(v.extract::<f64>()?.max(0.1)));
+    }
+    if let Some(v) = d.get_item("keep_alive_while_idle")? {
+        b = b.keep_alive_while_idle(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("settings_order")? {
+        let seq = v.downcast::<PyList>()?;
+        let mut ids = Vec::with_capacity(seq.len());
+        for item in seq.iter() {
+            ids.push(parse_setting_id(&item)?);
+        }
+        b = b.settings_order(SettingsOrder::builder().extend(ids).build());
+    }
+    if let Some(v) = d.get_item("headers_pseudo_order")? {
+        let names: Vec<String> = v.extract()?;
+        let mut ids = Vec::with_capacity(names.len());
+        for name in names {
+            ids.push(parse_pseudo_id(&name)?);
+        }
+        b = b.headers_pseudo_order(PseudoOrder::builder().extend(ids).build());
+    }
+    if let Some(v) = d.get_item("headers_stream_dependency")? {
+        b = b.headers_stream_dependency(parse_stream_dependency(&v)?);
+    }
+    if let Some(v) = d.get_item("priorities")? {
+        let seq = v.downcast::<PyList>()?;
+        let mut pb = Priorities::builder();
+        for item in seq.iter() {
+            let pd = item.downcast::<PyDict>()?;
+            let sid: u32 = pd
+                .get_item("stream_id")?
+                .ok_or_else(|| PyValueError::new_err("priority entry requires 'stream_id'"))?
+                .extract()?;
+            let dep_id: u32 = pd
+                .get_item("dependency_id")?
+                .map(|x| x.extract())
+                .transpose()?
+                .unwrap_or(0);
+            let weight: u8 = pd
+                .get_item("weight")?
+                .map(|x| x.extract())
+                .transpose()?
+                .unwrap_or(0);
+            let exclusive: bool = pd
+                .get_item("exclusive")?
+                .map(|x| x.extract())
+                .transpose()?
+                .unwrap_or(false);
+            pb = pb.push(Priority::new(
+                StreamId::from(sid),
+                StreamDependency::new(StreamId::from(dep_id), weight, exclusive),
+            ));
+        }
+        b = b.priorities(pb.build());
     }
     Ok(b.build())
 }
@@ -969,6 +1194,8 @@ pub struct NativeSession {
     read_timeout: Option<Duration>,
     pool_max_idle_per_host: Option<usize>,
     pool_idle_timeout: Option<Duration>,
+    tcp_nodelay: Option<bool>,
+    tcp_keepalive: Option<Duration>,
     max_redirects: usize,
     ca_bundle: Option<Vec<u8>>,
     identity_pair: Option<(Vec<u8>, Vec<u8>)>,
@@ -1015,6 +1242,12 @@ impl NativeSession {
         }
         if let Some(it) = self.pool_idle_timeout {
             b = b.pool_idle_timeout(it);
+        }
+        if let Some(nd) = self.tcp_nodelay {
+            b = b.tcp_nodelay(nd);
+        }
+        if let Some(ka) = self.tcp_keepalive {
+            b = b.tcp_keepalive(ka);
         }
         if let Some(ref opts) = self.tls_options {
             b = b.tls_options(opts.clone());
@@ -1066,6 +1299,10 @@ impl NativeSession {
         let client = b
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("[builder] {}", error_chain(&e))))?;
+        // Bound cached sub-clients so dynamic CA bundle churn cannot grow memory unboundedly.
+        if cache.len() >= 16 {
+            cache.clear();
+        }
         cache.insert(key, client.clone());
         Ok(client)
     }
@@ -1266,7 +1503,7 @@ async fn start_stream(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeStrea
 impl NativeSession {
     #[new]
     #[pyo3(signature = (
-        impersonate = "chrome_152",
+        impersonate = "chrome_149",
         timeout = 30.0,
         follow_redirects = true,
         max_redirects = 10,
@@ -1290,7 +1527,9 @@ impl NativeSession {
         pool_max_idle_per_host = None,
         pool_idle_timeout = None,
         keylog_file = None,
-        system_dns = false
+        system_dns = false,
+        tcp_nodelay = None,
+        tcp_keepalive = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1319,6 +1558,8 @@ impl NativeSession {
         pool_idle_timeout: Option<f64>,
         keylog_file: Option<String>,
         system_dns: bool,
+        tcp_nodelay: Option<bool>,
+        tcp_keepalive: Option<f64>,
     ) -> PyResult<Self> {
         let mut default_headers = HeaderMap::new();
         for (k, v) in dict_pairs(headers)? {
@@ -1393,6 +1634,8 @@ impl NativeSession {
             read_timeout: read_timeout.map(|t| Duration::from_secs_f64(t.max(0.05))),
             pool_max_idle_per_host,
             pool_idle_timeout: pool_idle_timeout.map(|t| Duration::from_secs_f64(t.max(0.05))),
+            tcp_nodelay,
+            tcp_keepalive: tcp_keepalive.map(|t| Duration::from_secs_f64(t.max(1.0))),
             max_redirects,
             ca_bundle,
             identity_pair,
@@ -1725,6 +1968,15 @@ impl NativeSession {
         self.jar.clear();
     }
 
+    pub fn close(&self) {
+        let mut cache = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        cache.clear();
+    }
+
+    pub fn client_cache_len(&self) -> usize {
+        self.clients.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
     #[getter]
     pub fn impersonate(&self) -> String {
         self.impersonate.clone()
@@ -1734,31 +1986,47 @@ impl NativeSession {
 #[pyfunction]
 pub fn supported_presets() -> Vec<&'static str> {
     vec![
-        "chrome_152", "chrome_152_macos", "chrome_151", "chrome_151_macos", "chrome_150",
-        "chrome_149", "chrome_148", "chrome_147", "chrome_146", "chrome_145", "chrome_144",
-        "chrome_143", "chrome_142", "chrome_141", "chrome_140", "chrome_139", "chrome_138",
-        "chrome_137", "chrome_136", "chrome_135", "chrome_134", "chrome_133", "chrome_132",
-        "chrome_131", "chrome_131_android", "chrome_130", "chrome_129", "chrome_128",
+        // Verified native BoringSSL + HTTP/2 profiles from wreq-util (zero header extrapolation)
+        "chrome_149", "chrome_149_macos", "chrome_148", "chrome_147", "chrome_146", "chrome_145",
+        "chrome_144", "chrome_143", "chrome_142", "chrome_141", "chrome_140", "chrome_139",
+        "chrome_138", "chrome_137", "chrome_136", "chrome_135", "chrome_134", "chrome_133",
+        "chrome_132", "chrome_131", "chrome_131_android", "chrome_130", "chrome_129", "chrome_128",
         "chrome_127", "chrome_126", "chrome_124", "chrome_123", "chrome_120", "chrome_119",
         "chrome_116", "chrome_114", "chrome_110", "chrome_107", "chrome_104", "chrome_100",
-        "edge_152", "edge_148", "edge_147", "edge_146", "edge_145", "edge_142", "edge_136",
+        "edge_148", "edge_147", "edge_146", "edge_145", "edge_144", "edge_143", "edge_142",
+        "edge_141", "edge_140", "edge_139", "edge_138", "edge_137", "edge_136", "edge_135",
         "edge_134", "edge_131", "edge_127", "edge_122", "edge_101",
-        "safari_27", "safari_26_4", "safari_26_3", "safari_26_2", "safari_26_1", "safari_26",
-        "safari_ios_26_2", "safari_ios_26", "safari_ipad_26",
-        "safari_18_5", "safari_18_4", "safari_18_3", "safari_18_2", "safari_18",
+        "safari_26_4", "safari_26_3", "safari_26_2", "safari_26_1", "safari_26",
+        "safari_ios_26_2", "safari_ios_26", "safari_ipad_26_2", "safari_ipad_26",
+        "safari_18_5", "safari_18_3_1", "safari_18_3", "safari_18_2", "safari_18",
         "safari_ios_18_1_1", "safari_ipad_18",
-        "safari_17_6", "safari_17_5", "safari_17_4_1", "safari_17_2_1", "safari_17",
-        "safari_16_5", "safari_16", "safari_15_5", "safari_15_3",
-        "firefox_155", "firefox_154", "firefox_153", "firefox_151", "firefox_150",
-        "firefox_149", "firefox_148", "firefox_147", "firefox_146", "firefox_145",
-        "firefox_144", "firefox_143", "firefox_142", "firefox_139", "firefox_136",
-        "firefox_135", "firefox_android_135", "firefox_private_136", "firefox_133",
-        "firefox_128", "firefox_117", "firefox_109",
+        "safari_17_6", "safari_17_5", "safari_17_4_1", "safari_17_2_1", "safari_17_0",
+        "safari_ios_17_4_1", "safari_ios_17_2",
+        "safari_16_5", "safari_ios_16_5", "safari_16", "safari_15_6_1", "safari_15_5", "safari_15_3",
+        "firefox_151", "firefox_150", "firefox_149", "firefox_148", "firefox_147", "firefox_146",
+        "firefox_145", "firefox_144", "firefox_143", "firefox_142", "firefox_139", "firefox_136",
+        "firefox_private_136", "firefox_135", "firefox_private_135", "firefox_android_135",
+        "firefox_133", "firefox_128", "firefox_117", "firefox_109",
         "opera_131", "opera_130", "opera_129", "opera_128", "opera_127", "opera_126",
-        "opera_124", "opera_120", "opera_116",
-        "okhttp_5", "okhttp_4_12", "okhttp_4_10", "okhttp_4_9", "okhttp_3_14", "okhttp_3_11",
+        "opera_125", "opera_124", "opera_123", "opera_122", "opera_121", "opera_120",
+        "opera_119", "opera_118", "opera_117", "opera_116",
+        "okhttp_5", "okhttp_4_12", "okhttp_4_10", "okhttp_4_9", "okhttp_3_14", "okhttp_3_13",
+        "okhttp_3_11", "okhttp_3_9",
         "tor_14_5", "random", "weighted_random",
     ]
+}
+
+#[pyfunction]
+pub fn is_verified_preset(preset: &str) -> bool {
+    let lower = preset.trim().to_lowercase().replace('-', "_");
+    if matches!(lower.as_str(), "random" | "weighted_random" | "auto" | "chrome" | "default") {
+        return true;
+    }
+    let resolved = resolve_emulation(&lower);
+    resolved.ua_override.is_none()
+        && resolved.sec_ch_ua_override.is_none()
+        && !lower.starts_with("safari_27")
+        && !lower.starts_with("safari27")
 }
 
 #[pymodule]
@@ -1768,6 +2036,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeWebSocket>()?;
     m.add_class::<NativeSession>()?;
     m.add_function(wrap_pyfunction!(supported_presets, m)?)?;
+    m.add_function(wrap_pyfunction!(is_verified_preset, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

@@ -46,15 +46,19 @@ try:
         Session as _RustSession,
         WebSocket as _NativeWebSocket,
         __version__,
+        is_verified_preset as _rust_is_verified_preset,
         supported_presets as _rust_presets,
     )
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.6.3"
+    __version__ = "0.7.0"
 
     def _rust_presets() -> List[str]:
         return []
+
+    def _rust_is_verified_preset(preset: str) -> bool:
+        return False
 
 
 # Optional legacy curl_cffi backend (only used when explicitly requested via engine="curl_cffi")
@@ -173,7 +177,255 @@ class BrowserType(str, Enum):
 
 
 def supported_presets() -> List[str]:
+    """Return all verified native BoringSSL + HTTP/2 browser profiles (zero header extrapolation)."""
     return list(_rust_presets()) or [b.value for b in BrowserType]
+
+
+def is_verified_preset(preset: Union[str, BrowserType]) -> bool:
+    """Return True if `preset` resolves to a native byte-exact BoringSSL/H2 profile without header extrapolation."""
+    return bool(_rust_is_verified_preset(str(preset)))
+
+
+class TimeoutConfig:
+    """Granular timeout configuration (`httpx.Timeout`-compatible without colliding with `http_tls.Timeout` exception)."""
+
+    def __init__(
+        self,
+        timeout: Optional[float] = 30.0,
+        *,
+        connect: Optional[float] = None,
+        read: Optional[float] = None,
+        write: Optional[float] = None,
+        pool: Optional[float] = None,
+    ) -> None:
+        self.timeout = timeout
+        self.connect = connect if connect is not None else timeout
+        self.read = read if read is not None else timeout
+        self.write = write if write is not None else timeout
+        self.pool = pool if pool is not None else timeout
+
+    def total(self) -> float:
+        vals = [v for v in (self.timeout, self.read, self.connect) if v is not None]
+        return float(max(vals)) if vals else 30.0
+
+    def __repr__(self) -> str:
+        return (
+            f"TimeoutConfig(timeout={self.timeout!r}, connect={self.connect!r}, "
+            f"read={self.read!r}, write={self.write!r}, pool={self.pool!r})"
+        )
+
+
+class Limits:
+    """Connection pool limits (`httpx.Limits`-compatible) mapped directly to Rust connection pooling."""
+
+    def __init__(
+        self,
+        max_connections: Optional[int] = None,
+        max_keepalive_connections: Optional[int] = None,
+        keepalive_expiry: Optional[float] = 5.0,
+    ) -> None:
+        self.max_connections = max_connections
+        self.max_keepalive_connections = max_keepalive_connections
+        self.keepalive_expiry = keepalive_expiry
+
+    def __repr__(self) -> str:
+        return (
+            f"Limits(max_connections={self.max_connections!r}, "
+            f"max_keepalive_connections={self.max_keepalive_connections!r}, "
+            f"keepalive_expiry={self.keepalive_expiry!r})"
+        )
+
+
+class MockTransport:
+    """Offline mock transport (`httpx.MockTransport`-compatible) for deterministic unit testing.
+
+    `handler` receives a dict `{"method", "url", "headers", "params", "cookies", "data", "json"}`
+    and returns either a `Response`, a `(status_code, body)` tuple, or a dict
+    `{"status_code": 200, "json": {...}, "headers": {...}}`.
+    """
+
+    def __init__(self, handler: Callable[[Dict[str, Any]], Any]) -> None:
+        self.handler = handler
+
+    def _coerce(self, url: str, result: Any) -> "Response":
+        if isinstance(result, Response):
+            return result
+        if isinstance(result, tuple) and len(result) >= 2:
+            status = int(result[0])
+            body = result[1]
+            hdrs = dict(result[2]) if len(result) >= 3 and isinstance(result[2], dict) else {}
+            raw = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
+            return Response(status_code=status, headers=hdrs, content=bytes(raw), url=url)
+        if isinstance(result, dict):
+            status = int(result.get("status_code", 200))
+            hdrs = dict(result.get("headers") or {})
+            if "json" in result:
+                raw = _json.dumps(result["json"]).encode("utf-8")
+                hdrs.setdefault("Content-Type", "application/json")
+            elif "content" in result:
+                c = result["content"]
+                raw = c if isinstance(c, (bytes, bytearray)) else str(c).encode("utf-8")
+            else:
+                raw = str(result.get("text", "")).encode("utf-8")
+            return Response(
+                status_code=status,
+                headers=hdrs,
+                content=bytes(raw),
+                url=str(result.get("url", url)),
+                cookies=result.get("cookies"),
+                http_version=str(result.get("http_version", "HTTP/2")),
+            )
+        raise TypeError("MockTransport handler must return Response, (status, body), or dict")
+
+    def handle_request(self, request_ctx: Dict[str, Any]) -> "Response":
+        res = self.handler(request_ctx)
+        if inspect.isawaitable(res):
+            raise RuntimeError("Async MockTransport handler must be used with AsyncSession / AsyncClient")
+        return self._coerce(request_ctx["url"], res)
+
+    async def handle_async_request(self, request_ctx: Dict[str, Any]) -> "Response":
+        res = self.handler(request_ctx)
+        if inspect.isawaitable(res):
+            res = await res
+        return self._coerce(request_ctx["url"], res)
+
+
+def _unpack_timeout(
+    timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig, None],
+    connect_timeout: Optional[float] = None,
+    read_timeout: Optional[float] = None,
+) -> Tuple[float, Optional[float], Optional[float]]:
+    if isinstance(timeout, TimeoutConfig):
+        ct = connect_timeout if connect_timeout is not None else timeout.connect
+        rt = read_timeout if read_timeout is not None else timeout.read
+        return timeout.total(), ct, rt
+    if isinstance(timeout, tuple) and len(timeout) == 2:
+        t_conn, t_read = timeout
+        ct = connect_timeout if connect_timeout is not None else (float(t_conn) if t_conn is not None else None)
+        rt = read_timeout if read_timeout is not None else (float(t_read) if t_read is not None else None)
+        vals = [v for v in (ct, rt) if v is not None]
+        total = max(vals) if vals else 30.0
+        return total, ct, rt
+    total = float(timeout) if timeout is not None else 30.0
+    return total, connect_timeout, read_timeout
+
+
+_AKAMAI_SETTING_KEYS: Dict[int, str] = {
+    1: "header_table_size",
+    2: "enable_push",
+    3: "max_concurrent_streams",
+    4: "initial_window_size",
+    5: "max_frame_size",
+    6: "max_header_list_size",
+    8: "enable_connect_protocol",
+    9: "no_rfc7540_priorities",
+}
+
+
+def parse_akamai_h2_to_http2_options(akamai_fp: str) -> Dict[str, Any]:
+    """Parse an Akamai HTTP/2 fingerprint string into `http2_options`.
+
+    Format: `<SETTINGS>|<WINDOW_UPDATE>|<PRIORITIES>|<PSEUDO_ORDER>`
+    Example: `"1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"`
+    """
+    parts = akamai_fp.strip().split("|")
+    if len(parts) != 4:
+        raise ValueError(
+            "Invalid Akamai HTTP/2 fingerprint: expected 4 pipe-separated fields "
+            "(SETTINGS|WINDOW_UPDATE|PRIORITIES|PSEUDO_ORDER)"
+        )
+    settings_s, win_s, prio_s, pseudo_s = parts
+    opts: Dict[str, Any] = {}
+
+    if settings_s:
+        order: List[int] = []
+        for pair in settings_s.split(";"):
+            pair = pair.strip()
+            if not pair or ":" not in pair:
+                continue
+            sid_s, val_s = pair.split(":", 1)
+            sid, val = int(sid_s.strip()), int(val_s.strip())
+            key = _AKAMAI_SETTING_KEYS.get(sid)
+            if key is None:
+                continue
+            order.append(sid)
+            if key in ("enable_push", "enable_connect_protocol", "no_rfc7540_priorities"):
+                opts[key] = bool(val)
+            else:
+                opts[key] = val
+        if order:
+            opts["settings_order"] = order
+
+    if win_s and win_s.strip() not in ("0", "00"):
+        win_update = int(win_s.strip())
+        # Akamai's WINDOW_UPDATE field is (initial_connection_window_size - 65535)
+        opts["initial_connection_window_size"] = win_update + 65535
+
+    if prio_s and prio_s.strip() != "0":
+        prios: List[Dict[str, Any]] = []
+        for entry in prio_s.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            fields = entry.split(":")
+            if len(fields) == 4:
+                sid_i, excl_i, dep_i, weight_i = (int(x) for x in fields)
+                prios.append(
+                    {
+                        "stream_id": sid_i,
+                        "exclusive": bool(excl_i),
+                        "dependency_id": dep_i,
+                        "weight": max(0, min(255, weight_i - 1 if weight_i > 0 else 0)),
+                    }
+                )
+        if prios:
+            opts["priorities"] = prios
+
+    if pseudo_s:
+        pseudo = [p.strip() for p in pseudo_s.split(",") if p.strip()]
+        if pseudo:
+            opts["headers_pseudo_order"] = pseudo
+
+    return opts
+
+
+def _apply_fetch_headers(req_headers: Dict[str, str], fetch_mode: Optional[str], referer: Optional[str]) -> None:
+    existing_lower = {k.lower() for k in req_headers}
+    if referer and "referer" not in existing_lower:
+        req_headers["Referer"] = referer
+    if not fetch_mode:
+        return
+    mode = fetch_mode.strip().lower()
+    if mode == "navigate":
+        defaults = {
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin" if referer else "none",
+            "Sec-Fetch-User": "?1",
+        }
+    elif mode in ("cors", "xhr", "fetch", "api"):
+        defaults = {
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site" if referer else "cross-site",
+        }
+    elif mode == "same-origin":
+        defaults = {
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+    elif mode == "no-cors":
+        defaults = {
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
+    else:
+        raise ValueError(f"Unsupported fetch_mode '{fetch_mode}': expected navigate, cors, same-origin, or no-cors")
+    for k, v in defaults.items():
+        if k.lower() not in existing_lower:
+            req_headers[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -854,8 +1106,8 @@ class Session:
 
     def __init__(
         self,
-        impersonate: Union[str, BrowserType] = "chrome_152",
-        timeout: float = 30.0,
+        impersonate: Union[str, BrowserType] = "chrome_149",
+        timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig] = 30.0,
         connect_timeout: Optional[float] = None,
         read_timeout: Optional[float] = None,
         verify: Union[bool, str] = True,
@@ -876,6 +1128,7 @@ class Session:
         tls_options: Optional[Dict[str, Any]] = None,
         ja3: Optional[str] = None,
         http2_options: Optional[Dict[str, Any]] = None,
+        akamai_h2: Optional[str] = None,
         http1_only: bool = False,
         http2_only: bool = False,
         resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
@@ -890,6 +1143,12 @@ class Session:
         storage_state: Optional[Union[str, Dict[str, Any]]] = None,
         pool_max_idle_per_host: Optional[int] = None,
         pool_idle_timeout: Optional[float] = None,
+        limits: Optional[Limits] = None,
+        tcp_nodelay: Optional[bool] = None,
+        tcp_keepalive: Optional[float] = None,
+        auto_referer: bool = False,
+        fetch_mode: Optional[str] = None,
+        transport: Optional[MockTransport] = None,
         retries: int = 0,
         retry_backoff: float = 0.5,
         retry_statuses: Sequence[int] = (429, 500, 502, 503, 504),
@@ -902,9 +1161,18 @@ class Session:
         if engine not in ("auto", "rust", "boring", "impersonate", "curl_cffi"):
             raise ValueError("engine must be 'auto', 'rust', 'boring', 'impersonate', or 'curl_cffi'")
 
+        total_timeout, eff_connect_timeout, eff_read_timeout = _unpack_timeout(
+            timeout, connect_timeout, read_timeout
+        )
+        if limits is not None:
+            if pool_max_idle_per_host is None:
+                pool_max_idle_per_host = limits.max_keepalive_connections or limits.max_connections
+            if pool_idle_timeout is None and limits.keepalive_expiry is not None:
+                pool_idle_timeout = limits.keepalive_expiry
+
         verify_flag, ca_path = _split_verify(verify)
         self.impersonate = str(impersonate)
-        self.timeout = timeout
+        self.timeout = total_timeout
         self.verify: Union[bool, str] = ca_path if ca_path else (verify_flag and verify_ssl)
         self.cert = cert
         self.base_url = base_url
@@ -923,6 +1191,10 @@ class Session:
         self.har_entries: List[Dict[str, Any]] = []
         self.flare_solverr_url = flare_solverr_url
         self.solver = solver
+        self.auto_referer = bool(auto_referer)
+        self.fetch_mode = fetch_mode
+        self.transport = transport
+        self._last_url: Optional[str] = None
         self.proxies_pool: List[str] = list(proxies_pool) if proxies_pool else []
         self._proxy_idx = 0
         self.event_hooks: Dict[str, List[Callable[..., Any]]] = {
@@ -945,13 +1217,21 @@ class Session:
             if tls_options:
                 merged_tls.update(tls_options)
 
+        merged_h2: Optional[Dict[str, Any]] = None
+        if akamai_h2 or http2_options:
+            merged_h2 = {}
+            if akamai_h2:
+                merged_h2.update(parse_akamai_h2_to_http2_options(akamai_h2))
+            if http2_options:
+                merged_h2.update(http2_options)
+
         if engine == "curl_cffi":
             if not _HAS_CFFI:
                 raise RuntimeError('engine="curl_cffi" requires curl_cffi: pip install "http-tls[curl_cffi]"')
             self._mode = "curl_cffi"
             self._session = _CffiSession(
                 impersonate=self.impersonate.replace("_", ""),
-                timeout=timeout,
+                timeout=total_timeout,
                 max_redirects=max_redirects,
                 verify=self.verify,
                 proxies={"all": p_val, "http": p_val, "https": p_val} if p_val else None,
@@ -963,7 +1243,7 @@ class Session:
             client_cert, client_key = _split_identity(cert)
             self._session = _RustSession(
                 impersonate=self.impersonate,
-                timeout=timeout,
+                timeout=total_timeout,
                 follow_redirects=self.allow_redirects,
                 max_redirects=max_redirects,
                 verify_ssl=bool(self.verify),
@@ -973,19 +1253,21 @@ class Session:
                 client_key=client_key,
                 header_order=list(header_order) if header_order else None,
                 tls_options=merged_tls,
-                http2_options=dict(http2_options) if http2_options else None,
+                http2_options=merged_h2,
                 http1_only=http1_only,
                 http2_only=http2_only,
                 resolve=dict(resolve) if resolve else None,
                 local_address=local_address,
                 interface=interface,
                 tls_info=tls_info,
-                connect_timeout=connect_timeout,
-                read_timeout=read_timeout,
+                connect_timeout=eff_connect_timeout,
+                read_timeout=eff_read_timeout,
                 pool_max_idle_per_host=pool_max_idle_per_host,
                 pool_idle_timeout=pool_idle_timeout,
                 keylog_file=keylog_file,
                 system_dns=self.system_dns,
+                tcp_nodelay=tcp_nodelay,
+                tcp_keepalive=tcp_keepalive,
             )
         if storage_state is not None:
             self.load_storage_state(storage_state)
@@ -1266,7 +1548,7 @@ class Session:
         data: Optional[Union[bytes, str, Dict[str, Any]]],
         json: Optional[Any],
         files: Any,
-        timeout: Optional[float],
+        timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig, None],
         verify: Optional[Union[bool, str]],
         proxies: Optional[Dict[str, str]],
         proxy: Optional[str],
@@ -1295,7 +1577,10 @@ class Session:
             auth_obj.apply(req_headers)
 
         actual_proxy = _extract_proxy(proxy, proxies) or _extract_proxy(None, self.proxies)
-        actual_timeout = timeout if timeout is not None else self.timeout
+        if timeout is None:
+            actual_timeout = self.timeout
+        else:
+            actual_timeout, _, _ = _unpack_timeout(timeout)
         redirects = self.allow_redirects if allow_redirects is None else allow_redirects
 
         mp_files = _normalize_files(files)
@@ -1391,7 +1676,7 @@ class Session:
         data: Optional[Union[bytes, str, Dict[str, Any]]] = None,
         json: Optional[Any] = None,
         files: Any = None,
-        timeout: Optional[float] = None,
+        timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig, None] = None,
         verify: Optional[Union[bool, str]] = None,
         proxies: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
@@ -1401,6 +1686,7 @@ class Session:
         header_order: Optional[Sequence[str]] = None,
         impersonate: Optional[Union[str, BrowserType]] = None,
         local_address: Optional[str] = None,
+        fetch_mode: Optional[str] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response:
@@ -1409,12 +1695,38 @@ class Session:
         full_url = self._resolve_url(url)
         auth_obj = _coerce_auth(auth if auth is not None else self.auth)
         req_headers = dict(headers) if headers else {}
+        _apply_fetch_headers(
+            req_headers,
+            fetch_mode if fetch_mode is not None else self.fetch_mode,
+            self._last_url if self.auto_referer else None,
+        )
 
         # Request hooks receive a mutable context dict
         if self.event_hooks["request"]:
             ctx = {"method": method, "url": full_url, "headers": req_headers, "params": params}
             self._run_sync_hooks("request", ctx)
             method, full_url, req_headers, params = ctx["method"], ctx["url"], ctx["headers"], ctx["params"]
+
+        if self.transport is not None:
+            merged_hdrs = dict(self.headers.items())
+            merged_hdrs.update(req_headers)
+            resp = self.transport.handle_request(
+                {
+                    "method": method.upper(),
+                    "url": full_url,
+                    "headers": merged_hdrs,
+                    "params": {**self.params, **(params or {})} or None,
+                    "cookies": {**dict(self.cookies), **(cookies or {})} or None,
+                    "data": data,
+                    "json": json,
+                }
+            )
+            self.cookies.update(resp.cookies)
+            self._last_url = resp.url or full_url
+            self._record_har_entry(method, full_url, req_headers, resp)
+            if self.event_hooks["response"]:
+                self._run_sync_hooks("response", resp)
+            return resp
 
         max_attempts = 1 if stream else (1 + self.retries)
         last_exc: Optional[BaseException] = None
@@ -1483,6 +1795,7 @@ class Session:
                 raise
 
         assert resp is not None, last_exc
+        self._last_url = resp.url or full_url
         self._record_har_entry(method, full_url, req_headers, resp)
         if self.event_hooks["response"]:
             self._run_sync_hooks("response", resp)
@@ -1653,7 +1966,46 @@ class AsyncSession:
 
     async def solve_challenge(self, url_or_resp: Union[str, Response]) -> bool:
         """Asynchronously attempt to solve an anti-bot challenge and inject clearance into this AsyncSession."""
-        return await asyncio.to_thread(self._sync_session.solve_challenge, url_or_resp)
+        s = self._sync_session
+        if isinstance(url_or_resp, Response):
+            resp = url_or_resp
+            target_url = resp.url
+        else:
+            target_url = s._resolve_url(url_or_resp)
+            resp = await self.get(target_url)
+
+        inline = _try_extract_inline_cookie(resp.text)
+        if inline:
+            s.cookies.update(inline)
+            if s._mode == "rust":
+                for k, v in inline.items():
+                    s._session.add_raw_cookie(f"{k}={v}; Path=/", target_url)
+            return True
+
+        if s.solver is not None:
+            asolve = getattr(s.solver, "asolve", None)
+            if callable(asolve):
+                state = await asolve(target_url, resp)
+            else:
+                state = s.solver(target_url, resp)
+                if inspect.isawaitable(state):
+                    state = await state
+            if isinstance(state, dict):
+                s.load_storage_state(state)
+                return True
+
+        if s.flare_solverr_url:
+            fs_resp = await self.post(
+                s.flare_solverr_url,
+                json={"cmd": "request.get", "url": target_url, "maxTimeout": 60000},
+            )
+            if fs_resp.status_code == 200:
+                sol = fs_resp.json().get("solution", {})
+                s.load_storage_state(
+                    {"cookies": sol.get("cookies", []), "user_agent": sol.get("userAgent")}
+                )
+                return True
+        return False
 
     def load_storage_state(self, state: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         return self._sync_session.load_storage_state(state)
@@ -1683,7 +2035,7 @@ class AsyncSession:
         data: Optional[Union[bytes, str, Dict[str, Any]]] = None,
         json: Optional[Any] = None,
         files: Any = None,
-        timeout: Optional[float] = None,
+        timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig, None] = None,
         verify: Optional[Union[bool, str]] = None,
         proxies: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
@@ -1693,28 +2045,55 @@ class AsyncSession:
         header_order: Optional[Sequence[str]] = None,
         impersonate: Optional[Union[str, BrowserType]] = None,
         local_address: Optional[str] = None,
+        fetch_mode: Optional[str] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response:
         if allow_redirects is None and follow_redirects is not None:
             allow_redirects = follow_redirects
         s = self._sync_session
-        if s._mode != "rust":
+        if s._mode != "rust" and s.transport is None:
             return await asyncio.to_thread(
                 s.request, method, url, params=params, headers=headers, cookies=cookies,
                 data=data, json=json, files=files, timeout=timeout, verify=verify,
                 proxies=proxies, proxy=proxy, allow_redirects=allow_redirects,
-                auth=auth, stream=stream, **kwargs,
+                auth=auth, fetch_mode=fetch_mode, stream=stream, **kwargs,
             )
 
         full_url = s._resolve_url(url)
         auth_obj = _coerce_auth(auth if auth is not None else s.auth)
         req_headers = dict(headers) if headers else {}
+        _apply_fetch_headers(
+            req_headers,
+            fetch_mode if fetch_mode is not None else s.fetch_mode,
+            s._last_url if s.auto_referer else None,
+        )
 
         if s.event_hooks["request"]:
             ctx = {"method": method, "url": full_url, "headers": req_headers, "params": params}
             await self._run_async_hooks("request", ctx)
             method, full_url, req_headers, params = ctx["method"], ctx["url"], ctx["headers"], ctx["params"]
+
+        if s.transport is not None:
+            merged_hdrs = dict(s.headers.items())
+            merged_hdrs.update(req_headers)
+            resp = await s.transport.handle_async_request(
+                {
+                    "method": method.upper(),
+                    "url": full_url,
+                    "headers": merged_hdrs,
+                    "params": {**s.params, **(params or {})} or None,
+                    "cookies": {**dict(s.cookies), **(cookies or {})} or None,
+                    "data": data,
+                    "json": json,
+                }
+            )
+            s.cookies.update(resp.cookies)
+            s._last_url = resp.url or full_url
+            s._record_har_entry(method, full_url, req_headers, resp)
+            if s.event_hooks["response"]:
+                await self._run_async_hooks("response", resp)
+            return resp
 
         max_attempts = 1 if stream else (1 + s.retries)
         resp: Optional[Response] = None
@@ -1748,6 +2127,11 @@ class AsyncSession:
                         resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
 
                 if attempt + 1 < max_attempts and s._should_retry_resp(resp):
+                    if resp.challenge is not None or _try_extract_inline_cookie(resp.text):
+                        try:
+                            await self.solve_challenge(resp)
+                        except Exception:
+                            pass
                     await asyncio.sleep(s._backoff_delay(attempt))
                     continue
                 break
@@ -1764,6 +2148,7 @@ class AsyncSession:
                 raise mapped from exc
 
         assert resp is not None
+        s._last_url = resp.url or full_url
         s._record_har_entry(method, full_url, req_headers, resp)
         if s.event_hooks["response"]:
             await self._run_async_hooks("response", resp)
@@ -1845,19 +2230,21 @@ class AsyncSession:
 _SESSION_KEYS = (
     "timeout", "connect_timeout", "read_timeout", "verify", "proxies", "proxy", "proxies_pool",
     "allow_redirects", "follow_redirects", "auth", "cert", "header_order", "tls_options", "ja3",
-    "http2_options", "http1_only", "http2_only", "resolve", "local_address", "interface",
-    "tls_info", "retries", "retry_backoff", "retry_statuses", "retry_on_challenge",
-    "rotate_impersonate", "event_hooks", "engine",
+    "http2_options", "akamai_h2", "http1_only", "http2_only", "resolve", "local_address", "interface",
+    "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay", "tcp_keepalive",
+    "auto_referer", "fetch_mode", "transport", "retries", "retry_backoff", "retry_statuses",
+    "retry_on_challenge", "rotate_impersonate", "event_hooks", "engine",
 )
 _REQ_SKIP_KEYS = {
-    "engine", "cert", "tls_options", "ja3", "http2_options", "http1_only", "http2_only",
-    "resolve", "interface", "tls_info", "connect_timeout", "read_timeout", "proxies_pool",
+    "engine", "cert", "tls_options", "ja3", "http2_options", "akamai_h2", "http1_only", "http2_only",
+    "resolve", "interface", "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay",
+    "tcp_keepalive", "auto_referer", "transport", "connect_timeout", "read_timeout", "proxies_pool",
     "retries", "retry_backoff", "retry_statuses", "retry_on_challenge", "rotate_impersonate",
     "event_hooks",
 }
 
 
-def request(method: str, url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+def request(method: str, url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any) -> Response:
     session_kw = {k: kwargs[k] for k in _SESSION_KEYS if k in kwargs and kwargs[k] is not None}
     s = Session(impersonate=impersonate, **session_kw)
     stream = bool(kwargs.get("stream"))
@@ -1882,38 +2269,38 @@ def request(method: str, url: str, impersonate: Union[str, BrowserType] = "chrom
     return resp
 
 
-def get(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+def get(url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any) -> Response:
     return request("GET", url, impersonate=impersonate, **kwargs)
 
 
-def post(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+def post(url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any) -> Response:
     return request("POST", url, impersonate=impersonate, **kwargs)
 
 
-def put(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+def put(url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any) -> Response:
     return request("PUT", url, impersonate=impersonate, **kwargs)
 
 
-def delete(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+def delete(url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any) -> Response:
     return request("DELETE", url, impersonate=impersonate, **kwargs)
 
 
-def patch(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+def patch(url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any) -> Response:
     return request("PATCH", url, impersonate=impersonate, **kwargs)
 
 
-def head(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+def head(url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any) -> Response:
     kwargs.setdefault("allow_redirects", False)
     return request("HEAD", url, impersonate=impersonate, **kwargs)
 
 
-def options(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
+def options(url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any) -> Response:
     return request("OPTIONS", url, impersonate=impersonate, **kwargs)
 
 
 @contextmanager
 def stream(
-    method: str, url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any
+    method: str, url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any
 ) -> Iterator[Response]:
     """Top-level context-manager streaming request (httpx.stream compatible)."""
     kwargs["stream"] = True
@@ -1932,7 +2319,7 @@ def session(**kwargs: Any) -> Session:
 def gather(
     urls_or_specs: Sequence[Union[str, Dict[str, Any]]],
     concurrency: int = 50,
-    impersonate: Union[str, BrowserType] = "chrome_152",
+    impersonate: Union[str, BrowserType] = "chrome_149",
     **kwargs: Any,
 ) -> List[Response]:
     """Execute a batch of requests in parallel on the Rust Tokio runtime without async/await."""

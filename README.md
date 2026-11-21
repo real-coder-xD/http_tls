@@ -370,20 +370,28 @@ import http_tls
 with http_tls.Session(
     # Standard 5-field JA3 string
     ja3="771,4865-4866-4867-49195-49199,0-23-65281,29-23-24,0",
+    # 1-line Akamai HTTP/2 fingerprint override (SETTINGS|WINDOW_UPDATE|PRIORITIES|PSEUDO_ORDER)
+    akamai_h2="1:65536;2:0;4:2097152;6:262144|10420225|0|m,s,a,p",
     # Fine-grained BoringSSL configuration
     tls_options={
         "alpn": ["h2", "http/1.1"],
+        "alps_protocols": ["h2"],
         "grease_enabled": True,
         "permute_extensions": True,
         "enable_ech_grease": True,
         "enable_ocsp_stapling": True,
+        "certificate_compressors": ["brotli", "zlib", "zstd"],
+        "extension_permutation": [0, 23, 65281, 10, 11, 35, 16, 5, 13, 51, 45, 43, 27],
     },
-    # Custom HTTP/2 SETTINGS frame parameters
+    # Full HTTP/2 frame control (or override individual fields parsed from akamai_h2)
     http2_options={
         "header_table_size": 65536,
         "enable_push": False,
         "initial_window_size": 6291456,
         "max_header_list_size": 262144,
+        "settings_order": [1, 2, 4, 6],
+        "headers_pseudo_order": ["m", "a", "s", "p"],
+        "headers_stream_dependency": {"stream_id": 0, "weight": 219, "exclusive": True},
     },
     # Enforce exact wire header order and casing
     header_order=["Host", "Connection", "User-Agent", "Accept", "Accept-Language"],
@@ -465,23 +473,29 @@ with http_tls.Session(
         print("Challenge provider detected:", resp.challenge)
 ```
 
-### 2. Playwright / Camoufox `storage_state.json` & Solver Bridge
+### 2. Browser Solver Bridges (`BestDriverSolver`, `PlaywrightSolver`, `FlareSolverrSolver`) & `storage_state.json`
 
-Reuse clearance sessions (`cf_clearance`, session cookies, and `User-Agent`) exported by Playwright or Camoufox, or attach FlareSolverr / a custom browser solver callback:
+`http_tls` is a pure HTTP client (no embedded V8 engine). For L4/L7 TLS + HTTP/2 fingerprinting it handles traffic natively in Rust; when a target serves a JavaScript proof-of-work or Turnstile challenge (`resp.challenge is not None`), bridge directly to a stealth browser solver or reuse Playwright / Camoufox `storage_state.json`:
 
 ```python
 import http_tls
+from http_tls import BestDriverSolver, FlareSolverrSolver
 
 # Load cookies + User-Agent from Playwright context.storage_state(path="state.json")
-with http_tls.Session(storage_state="state.json", impersonate="firefox_151") as s:
+with http_tls.Session(
+    storage_state="state.json",
+    impersonate="firefox_151",
+    auto_referer=True,        # Chains Referer across navigations like a real browser
+    fetch_mode="same-origin", # Emits coherent Sec-Fetch-Mode / Site / Dest headers
+) as s:
     resp = s.get("https://protected.example.com/api/data")
     s.save_storage_state("state.json")
 
-# Automatic FlareSolverr or custom solver callback when a JS challenge is returned
+# Automatic stealth Chromium bridge (best-driver) on JS challenges — works in both sync & async
 with http_tls.Session(
     retries=1,
     retry_on_challenge=True,
-    flare_solverr_url="http://localhost:8191/v1",
+    solver=BestDriverSolver(headless=True),  # or PlaywrightSolver() / FlareSolverrSolver()
 ) as s:
     resp = s.get("https://protected.example.com")
 ```
@@ -524,14 +538,14 @@ with http_tls.Session(
 
 ## Supported Browser Impersonation Presets (100+ Profiles)
 
-Query the full list programmatically with `http_tls.supported_presets()`:
+Every preset returned by `http_tls.supported_presets()` is a **verified native BoringSSL + HTTP/2 profile** with zero header extrapolation (auditable at runtime via `http_tls.is_verified_preset(name)`). The default preset is `chrome_149`:
 
-- `▸` **Google Chrome (`chrome_100` – `chrome_152`)**: Desktop Windows/Linux, macOS (`chrome_152_macos`, `chrome_151_macos`), Android (`chrome_131_android`), and dynamic forward-version Client Hints patching.
-- `▸` **Microsoft Edge (`edge_101` – `edge_152`)**: `edge_152`, `edge_148`, `edge_147`, `edge_145`, `edge_142`, `edge_134`, `edge_131`, `edge_127`, `edge_122`, `edge_101`.
-- `▸` **Apple Safari (`safari_15_3` – `safari_27`)**: macOS (`safari_27`, `safari_26_4`, `safari_18_5`, `safari_18`, `safari_17`), iOS (`safari_ios_26_2`, `safari_ios_26`, `safari_ios_18_1_1`), and iPadOS (`safari_ipad_26`, `safari_ipad_18`).
-- `▸` **Mozilla Firefox (`firefox_109` – `firefox_155`)**: Desktop, private browsing (`firefox_private_136`), and Android (`firefox_android_135`).
+- `▸` **Google Chrome (`chrome_100` – `chrome_149`)**: Desktop Windows/Linux, macOS (`chrome_149_macos`), and Android (`chrome_131_android`).
+- `▸` **Microsoft Edge (`edge_101` – `edge_148`)**: `edge_148`, `edge_147`, `edge_146`, `edge_145`, `edge_142`, `edge_134`, `edge_131`, `edge_127`, `edge_122`, `edge_101`.
+- `▸` **Apple Safari (`safari_15_3` – `safari_26_4`)**: macOS (`safari_26_4`, `safari_26_3`, `safari_26_2`, `safari_26_1`, `safari_26`, `safari_18_5`, `safari_18`, `safari_17_6`), iOS (`safari_ios_26_2`, `safari_ios_26`, `safari_ios_18_1_1`), and iPadOS (`safari_ipad_26_2`, `safari_ipad_26`, `safari_ipad_18`).
+- `▸` **Mozilla Firefox (`firefox_109` – `firefox_151`)**: Desktop, private browsing (`firefox_private_136`, `firefox_private_135`), and Android (`firefox_android_135`).
 - `▸` **Opera (`opera_116` – `opera_131`)**: `opera_131`, `opera_130`, `opera_128`, `opera_124`, `opera_120`, `opera_116`.
-- `▸` **OkHttp (Android)**: `okhttp_5`, `okhttp_4_12`, `okhttp_4_10`, `okhttp_4_9`, `okhttp_3_14`, `okhttp_3_11`.
+- `▸` **OkHttp (Android)**: `okhttp_5`, `okhttp_4_12`, `okhttp_4_10`, `okhttp_4_9`, `okhttp_3_14`, `okhttp_3_11`, `okhttp_3_9`.
 - `▸` **Tor & Automatic Rotation**: `tor_14_5`, `random`, and `weighted_random` (market-share weighted browser + OS selection).
 
 ---
@@ -582,6 +596,7 @@ Query the full list programmatically with `http_tls.supported_presets()`:
 | `python/http_tls/requests.py` | Public API: `Session`, `AsyncSession`, `Client`, `AsyncClient`, `Response`, `Cookies`, retries, proxy pool, HAR recorder, `storage_state`, solver bridge, `event_hooks`. |
 | `python/http_tls/auth.py` | `AuthBase`, `BasicAuth`, `BearerAuth`, RFC 7616 `DigestAuth` (sync & async). |
 | `python/http_tls/challenge.py` | Interstitial detector for Cloudflare, DDoS-Guard, DataDome, PerimeterX, Imperva, Sucuri, Vercel, Akamai. |
+| `python/http_tls/solvers.py` | Optional browser challenge solver bridges (`BestDriverSolver`, `PlaywrightSolver`, `FlareSolverrSolver`). |
 | `python/http_tls/exceptions.py` | Unified `requests` / `httpx` / `curl_cffi` exception hierarchy. |
 | `python/http_tls/__init__.pyi` | PEP 561 type stubs (shipped with `py.typed`). |
 
@@ -593,25 +608,28 @@ Query the full list programmatically with `http_tls.supported_presets()`:
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `impersonate` | `str \| BrowserType` | `"chrome_152"` | Browser TLS + HTTP/2 + header profile |
+| `impersonate` | `str \| BrowserType` | `"chrome_149"` | Verified native browser TLS + HTTP/2 + header profile |
 | `base_url` | `str` | `""` | Base URL prepended to relative request paths |
-| `timeout` / `connect_timeout` / `read_timeout` | `float \| None` | `30.0` | Request, connect, and read timeouts in seconds |
+| `timeout` / `connect_timeout` / `read_timeout` | `float \| tuple \| TimeoutConfig` | `30.0` | Total, `(connect, read)` tuple, or granular `TimeoutConfig` |
+| `limits` / `pool_max_idle_per_host` / `pool_idle_timeout` | `Limits \| int \| float` | `None` | Connection pool limits (`httpx.Limits`-compatible) |
+| `tcp_nodelay` / `tcp_keepalive` | `bool \| float` | `None` | Low-level TCP socket tuning |
 | `verify` | `bool \| str` | `True` | `True`, `False`, or path to a custom CA `.pem`/`.der` bundle |
 | `cert` | `str \| tuple[str, str]` | `None` | Client mTLS certificate (`combined.pem` or `(crt, key)`) |
 | `proxy` / `proxies` / `proxies_pool` | `str \| dict \| list` | `None` | HTTP/HTTPS/SOCKS5 proxy or round-robin proxy list |
 | `headers` / `header_order` | `dict \| list[str]` | `None` | Default headers and exact wire header order/casing |
 | `params` / `cookies` | `dict` | `None` | Default query parameters and session cookies |
 | `auth` | `tuple \| AuthBase` | `None` | `(user, pass)`, `BasicAuth`, `BearerAuth`, or `DigestAuth` |
-| `ja3` / `tls_options` / `http2_options` | `str \| dict` | `None` | Custom JA3 string and low-level BoringSSL / H2 overrides |
+| `ja3` / `akamai_h2` / `tls_options` / `http2_options` | `str \| dict` | `None` | Custom JA3, Akamai H2 string, and full BoringSSL / H2 overrides |
 | `http1_only` / `http2_only` | `bool` | `False` | Force HTTP/1.1 or HTTP/2 transport |
 | `resolve` | `dict[str, str \| list]` | `None` | Custom DNS / origin IP mapping (`{"host": "ip"}`) |
 | `local_address` / `interface` | `str` | `None` | Bind outbound IPv4/IPv6 address or network interface |
 | `system_dns` | `bool` | `False` | Disable built-in Hickory async DNS and use OS resolver |
+| `auto_referer` / `fetch_mode` | `bool \| str` | `False` / `None` | Chain `Referer` and emit coherent `Sec-Fetch-*` headers |
 | `retries` / `retry_backoff` / `retry_statuses` | `int \| float \| tuple` | `0` | Automatic retry count, exponential backoff base, and status codes |
 | `retry_on_challenge` / `rotate_impersonate` | `bool` | `False` | Auto-retry and rotate preset/proxy on WAF challenge |
-| `storage_state` / `flare_solverr_url` / `solver` | `str \| dict \| callable` | `None` | Playwright `storage_state.json` loader and JS challenge bridge |
+| `storage_state` / `flare_solverr_url` / `solver` | `str \| dict \| callable` | `None` | Playwright `storage_state.json`, `BestDriverSolver`, or FlareSolverr |
 | `tls_info` / `keylog_file` / `record_har` | `bool \| str` | `False` | Capture peer cert DER, write Wireshark keylog, record HAR 1.2 |
-| `event_hooks` | `dict[str, list]` | `None` | Sync or async `{"request": [...], "response": [...]}` hooks |
+| `transport` / `event_hooks` | `MockTransport \| dict` | `None` | Offline `MockTransport` for unit tests and sync/async event hooks |
 
 ### Key `Response` Attributes & Methods
 
@@ -651,11 +669,17 @@ Pass `keylog_file="sslkeys.log"` to `Session(...)` (or set the `SSLKEYLOGFILE` e
 
 ## Testing & Development
 
-Run the full pytest suite (23 integration and unit tests covering TLS/JA4, HTTP/2, sync/async streaming, `gather()`, WebSockets, Digest Auth, custom CA/mTLS, `storage_state.json`, HAR export, and `httpx`/`requests` parity):
+Run the full pytest suite (30 integration, fingerprint, production-readiness, and soak tests covering TLS/JA4, custom Akamai HTTP/2, sync/async streaming, `gather()`, WebSockets, Digest Auth, custom CA/mTLS, `storage_state.json`, `MockTransport`, HAR export, pool cleanup, and bounded memory):
 
 ```bash
 pip install -e ".[test]"
 pytest -v tests/
+```
+
+Run the standalone high-volume soak test (default 6,000 requests across `gather()` and native Tokio `AsyncSession` tracking throughput, Python heap, and OS RSS):
+
+```bash
+python benchmarks/soak_test.py --requests 3000 --concurrency 50
 ```
 
 Run the live throughput and memory benchmark against `curl_cffi`:

@@ -16,12 +16,49 @@ from http_tls.exceptions import (
     TimeoutException,
     TooManyRedirects,
 )
+from http_tls.solvers import BestDriverSolver, FlareSolverrSolver, PlaywrightSolver
 from http_tls.structures import CaseInsensitiveDict
 
 __version__: str
 
 def supported_presets() -> List[str]: ...
+def is_verified_preset(preset: str) -> bool: ...
 def parse_ja3_to_tls_options(ja3: str) -> Dict[str, Any]: ...
+def parse_akamai_h2_to_http2_options(akamai_fp: str) -> Dict[str, Any]: ...
+
+class TimeoutConfig:
+    timeout: Optional[float]
+    connect: Optional[float]
+    read: Optional[float]
+    write: Optional[float]
+    pool: Optional[float]
+    def __init__(
+        self,
+        timeout: Optional[float] = 30.0,
+        *,
+        connect: Optional[float] = None,
+        read: Optional[float] = None,
+        write: Optional[float] = None,
+        pool: Optional[float] = None,
+    ) -> None: ...
+    def total(self) -> float: ...
+
+class Limits:
+    max_connections: Optional[int]
+    max_keepalive_connections: Optional[int]
+    keepalive_expiry: Optional[float]
+    def __init__(
+        self,
+        max_connections: Optional[int] = None,
+        max_keepalive_connections: Optional[int] = None,
+        keepalive_expiry: Optional[float] = 5.0,
+    ) -> None: ...
+
+class MockTransport:
+    handler: Callable[[Dict[str, Any]], Any]
+    def __init__(self, handler: Callable[[Dict[str, Any]], Any]) -> None: ...
+    def handle_request(self, request_ctx: Dict[str, Any]) -> "Response": ...
+    async def handle_async_request(self, request_ctx: Dict[str, Any]) -> "Response": ...
 
 class Cookies(dict):
     def __init__(self, initial: Optional[Dict[str, str]] = None, on_clear: Optional[Callable[[], None]] = None) -> None: ...
@@ -135,8 +172,8 @@ class Session:
 
     def __init__(
         self,
-        impersonate: str = "chrome_152",
-        timeout: float = 30.0,
+        impersonate: str = "chrome_149",
+        timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig] = 30.0,
         connect_timeout: Optional[float] = None,
         read_timeout: Optional[float] = None,
         verify: Union[bool, str] = True,
@@ -157,6 +194,7 @@ class Session:
         tls_options: Optional[Dict[str, Any]] = None,
         ja3: Optional[str] = None,
         http2_options: Optional[Dict[str, Any]] = None,
+        akamai_h2: Optional[str] = None,
         http1_only: bool = False,
         http2_only: bool = False,
         resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
@@ -171,6 +209,12 @@ class Session:
         storage_state: Optional[Union[str, Dict[str, Any]]] = None,
         pool_max_idle_per_host: Optional[int] = None,
         pool_idle_timeout: Optional[float] = None,
+        limits: Optional[Limits] = None,
+        tcp_nodelay: Optional[bool] = None,
+        tcp_keepalive: Optional[float] = None,
+        auto_referer: bool = False,
+        fetch_mode: Optional[str] = None,
+        transport: Optional[MockTransport] = None,
         retries: int = 0,
         retry_backoff: float = 0.5,
         retry_statuses: Sequence[int] = (429, 500, 502, 503, 504),
@@ -197,7 +241,7 @@ class Session:
         data: Optional[Union[bytes, str, Dict[str, Any]]] = None,
         json: Optional[Any] = None,
         files: Any = None,
-        timeout: Optional[float] = None,
+        timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig, None] = None,
         verify: Optional[Union[bool, str]] = None,
         proxies: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
@@ -207,6 +251,7 @@ class Session:
         header_order: Optional[Sequence[str]] = None,
         impersonate: Optional[str] = None,
         local_address: Optional[str] = None,
+        fetch_mode: Optional[str] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response: ...
@@ -272,14 +317,14 @@ class AsyncSession:
 Client = Session
 AsyncClient = AsyncSession
 
-def request(method: str, url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...
-def get(url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...
-def post(url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...
-def put(url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...
-def delete(url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...
-def patch(url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...
-def head(url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...
-def options(url: str, impersonate: str = "chrome_152", **kwargs: Any) -> Response: ...
-def stream(method: str, url: str, impersonate: str = "chrome_152", **kwargs: Any) -> ContextManager[Response]: ...
+def request(method: str, url: str, impersonate: str = "chrome_149", **kwargs: Any) -> Response: ...
+def get(url: str, impersonate: str = "chrome_149", **kwargs: Any) -> Response: ...
+def post(url: str, impersonate: str = "chrome_149", **kwargs: Any) -> Response: ...
+def put(url: str, impersonate: str = "chrome_149", **kwargs: Any) -> Response: ...
+def delete(url: str, impersonate: str = "chrome_149", **kwargs: Any) -> Response: ...
+def patch(url: str, impersonate: str = "chrome_149", **kwargs: Any) -> Response: ...
+def head(url: str, impersonate: str = "chrome_149", **kwargs: Any) -> Response: ...
+def options(url: str, impersonate: str = "chrome_149", **kwargs: Any) -> Response: ...
+def stream(method: str, url: str, impersonate: str = "chrome_149", **kwargs: Any) -> ContextManager[Response]: ...
 def session(**kwargs: Any) -> Session: ...
-def gather(urls_or_specs: Sequence[Union[str, Dict[str, Any]]], concurrency: int = 50, impersonate: str = "chrome_152", **kwargs: Any) -> List[Response]: ...
+def gather(urls_or_specs: Sequence[Union[str, Dict[str, Any]]], concurrency: int = 50, impersonate: str = "chrome_149", **kwargs: Any) -> List[Response]: ...
