@@ -1,16 +1,18 @@
-// Language: Rust 2021 | File: src/lib.rs | Target: Python PyO3 ABI3 Extension | Runtime: Tokio + wreq (BoringSSL)
-use bytes::Bytes;
+// Language: Rust 2021 | File: src/lib.rs | Target: Python PyO3 ABI3 Extension | Runtime: Tokio + wreq (BoringSSL) + quinn/h3 (UDP QUIC)
+use bytes::{Buf, Bytes};
 use encoding_rs::{Encoding, UTF_8};
 use futures_util::{Stream, StreamExt};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::lookup_host;
 use wreq::cookie::Jar;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq::http2::{
@@ -858,6 +860,675 @@ fn build_identity(cert_pem: &[u8], key_pem: &[u8]) -> PyResult<Identity> {
 }
 
 // ---------------------------------------------------------------------------
+// Native UDP QUIC / HTTP/3 Engine (quinn + h3 + h3-quinn + Chromium profile)
+// ---------------------------------------------------------------------------
+#[derive(Debug)]
+struct NoCertVerifier(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[derive(Clone)]
+struct H3RequestSpec {
+    method: String,
+    url: url::Url,
+    headers: Vec<(String, String)>,
+    header_order: Option<Vec<String>>,
+    body: Option<Vec<u8>>,
+    timeout: Duration,
+    connect_timeout: Duration,
+    allow_redirects: bool,
+    max_redirects: usize,
+    verify: bool,
+    ca_bundle: Option<Vec<u8>>,
+    identity_pair: Option<(Vec<u8>, Vec<u8>)>,
+    resolve_entries: Vec<(String, Vec<SocketAddr>)>,
+    local_address: Option<IpAddr>,
+    tls_info: bool,
+    enable_keylog: bool,
+    preset: String,
+    ua_override: Option<String>,
+    sec_ch_ua_override: Option<String>,
+    alt_svc_port: Option<u16>,
+    strict_h3: bool,
+}
+
+fn default_h3_browser_headers(
+    preset: &str,
+    ua_ov: Option<&str>,
+    ch_ov: Option<&str>,
+) -> Vec<(String, String)> {
+    let lower = preset.trim().to_lowercase().replace('-', "_");
+    let platform = platform_from_name(&lower);
+    let digits: String = lower.chars().filter(|c| c.is_ascii_digit()).collect();
+
+    if lower.starts_with("firefox") || lower.starts_with("tor") {
+        let ver: u32 = if lower.starts_with("tor") { 128 } else { digits.parse().unwrap_or(151) };
+        let ua = ua_ov.map(|s| s.to_string()).unwrap_or_else(|| match platform {
+            Platform::MacOS => format!("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"),
+            Platform::Linux => format!("Mozilla/5.0 (X11; Linux x86_64; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"),
+            Platform::Android => format!("Mozilla/5.0 (Android 14; Mobile; rv:{ver}.0) Gecko/{ver}.0 Firefox/{ver}.0"),
+            _ => format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"),
+        });
+        return vec![
+            ("user-agent".to_string(), ua),
+            ("accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string()),
+            ("accept-language".to_string(), "en-US,en;q=0.5".to_string()),
+            ("accept-encoding".to_string(), "gzip, deflate, br, zstd".to_string()),
+            ("sec-fetch-dest".to_string(), "document".to_string()),
+            ("sec-fetch-mode".to_string(), "navigate".to_string()),
+            ("sec-fetch-site".to_string(), "none".to_string()),
+            ("sec-fetch-user".to_string(), "?1".to_string()),
+            ("priority".to_string(), "u=0, i".to_string()),
+        ];
+    }
+
+    if lower.starts_with("safari") {
+        let ua = ua_ov.map(|s| s.to_string()).unwrap_or_else(|| {
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15".to_string()
+        });
+        return vec![
+            ("sec-fetch-dest".to_string(), "document".to_string()),
+            ("user-agent".to_string(), ua),
+            ("accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string()),
+            ("sec-fetch-site".to_string(), "none".to_string()),
+            ("sec-fetch-mode".to_string(), "navigate".to_string()),
+            ("accept-language".to_string(), "en-US,en;q=0.9".to_string()),
+            ("priority".to_string(), "u=0, i".to_string()),
+            ("accept-encoding".to_string(), "gzip, deflate, br".to_string()),
+        ];
+    }
+
+    if lower.starts_with("okhttp") {
+        let ua = ua_ov.map(|s| s.to_string()).unwrap_or_else(|| "okhttp/5.0.0".to_string());
+        return vec![
+            ("accept-encoding".to_string(), "gzip".to_string()),
+            ("user-agent".to_string(), ua),
+        ];
+    }
+
+    let (ver, brand) = if lower.starts_with("edge") {
+        (digits.parse::<u32>().unwrap_or(148), "Microsoft Edge")
+    } else if lower.starts_with("opera") {
+        (digits.parse::<u32>().unwrap_or(131), "Opera")
+    } else {
+        (digits.parse::<u32>().unwrap_or(149), "Google Chrome")
+    };
+
+    let ch = ch_ov
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| chromium_sec_ch_ua(ver, brand));
+    let mobile = if matches!(platform, Platform::Android) { "?1" } else { "?0" };
+    let plat_str = match platform {
+        Platform::MacOS => "\"macOS\"",
+        Platform::Linux => "\"Linux\"",
+        Platform::Android => "\"Android\"",
+        _ => "\"Windows\"",
+    };
+    let ua = ua_ov.map(|s| s.to_string()).unwrap_or_else(|| {
+        let base = match platform {
+            Platform::MacOS => format!("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"),
+            Platform::Linux => format!("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"),
+            Platform::Android => format!("Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Mobile Safari/537.36"),
+            _ => format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"),
+        };
+        if brand == "Microsoft Edge" {
+            format!("{base} Edg/{ver}.0.0.0")
+        } else {
+            base
+        }
+    });
+
+    vec![
+        ("sec-ch-ua".to_string(), ch),
+        ("sec-ch-ua-mobile".to_string(), mobile.to_string()),
+        ("sec-ch-ua-platform".to_string(), plat_str.to_string()),
+        ("upgrade-insecure-requests".to_string(), "1".to_string()),
+        ("user-agent".to_string(), ua),
+        ("accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".to_string()),
+        ("sec-fetch-site".to_string(), "none".to_string()),
+        ("sec-fetch-mode".to_string(), "navigate".to_string()),
+        ("sec-fetch-user".to_string(), "?1".to_string()),
+        ("sec-fetch-dest".to_string(), "document".to_string()),
+        ("accept-encoding".to_string(), "gzip, deflate, br, zstd".to_string()),
+        ("accept-language".to_string(), "en-US,en;q=0.9".to_string()),
+        ("priority".to_string(), "u=0, i".to_string()),
+    ]
+}
+
+fn decompress_h3_body(raw: Vec<u8>, content_encoding: Option<&str>) -> Vec<u8> {
+    let enc = match content_encoding {
+        Some(s) => s.trim().to_ascii_lowercase(),
+        None => return raw,
+    };
+    if enc == "gzip" || enc == "x-gzip" {
+        let mut dec = flate2::read::GzDecoder::new(&raw[..]);
+        let mut out = Vec::new();
+        if dec.read_to_end(&mut out).is_ok() {
+            return out;
+        }
+    } else if enc == "deflate" {
+        let mut dec = flate2::read::ZlibDecoder::new(&raw[..]);
+        let mut out = Vec::new();
+        if dec.read_to_end(&mut out).is_ok() {
+            return out;
+        }
+        let mut raw_dec = flate2::read::DeflateDecoder::new(&raw[..]);
+        out.clear();
+        if raw_dec.read_to_end(&mut out).is_ok() {
+            return out;
+        }
+    } else if enc == "br" {
+        let mut dec = brotli::Decompressor::new(&raw[..], 4096);
+        let mut out = Vec::new();
+        if dec.read_to_end(&mut out).is_ok() {
+            return out;
+        }
+    } else if enc == "zstd" {
+        if let Ok(out) = zstd::stream::decode_all(&raw[..]) {
+            return out;
+        }
+    }
+    raw
+}
+
+fn build_h3_client_config(
+    verify: bool,
+    ca_bundle: Option<&[u8]>,
+    identity_pair: Option<&(Vec<u8>, Vec<u8>)>,
+    enable_keylog: bool,
+) -> PyResult<quinn::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| PyRuntimeError::new_err(format!("[builder] QUIC TLS 1.3 init failed: {e}")))?;
+
+    let mut tls_config = if verify {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(ca_raw) = ca_bundle {
+            let mut reader = std::io::BufReader::new(ca_raw);
+            let mut added = false;
+            for cert in rustls_pemfile::certs(&mut reader).flatten() {
+                let _ = roots.add(cert);
+                added = true;
+            }
+            if !added {
+                let _ = roots.add(rustls::pki_types::CertificateDer::from(ca_raw.to_vec()));
+            }
+        }
+        let want_verifier = builder.with_root_certificates(roots);
+        if let Some((cert_pem, key_pem)) = identity_pair {
+            let mut creader = std::io::BufReader::new(&cert_pem[..]);
+            let certs: Vec<_> = rustls_pemfile::certs(&mut creader).flatten().collect();
+            let mut kreader = std::io::BufReader::new(&key_pem[..]);
+            let key = rustls_pemfile::private_key(&mut kreader)
+                .ok()
+                .flatten()
+                .ok_or_else(|| PyValueError::new_err("Invalid client private key PEM for HTTP/3"))?;
+            want_verifier
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| PyValueError::new_err(format!("HTTP/3 client auth rejected: {e}")))?
+        } else {
+            want_verifier.with_no_client_auth()
+        }
+    } else {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertVerifier(provider)))
+            .with_no_client_auth()
+    };
+
+    tls_config.alpn_protocols = vec![b"h3".to_vec()];
+    tls_config.enable_early_data = true;
+    if enable_keylog {
+        tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
+
+    let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        .map_err(|e| PyRuntimeError::new_err(format!("[builder] QUIC crypto config failed: {e}")))?;
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_tls));
+
+    // Chromium QUIC transport parameters (0x0039)
+    let mut transport = quinn::TransportConfig::default();
+    if let Ok(idle) = Duration::from_secs(30).try_into() {
+        transport.max_idle_timeout(Some(idle));
+    }
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    transport.receive_window(15_728_640u32.into());
+    transport.stream_receive_window(6_291_456u32.into());
+    transport.send_window(15_728_640);
+    transport.max_concurrent_bidi_streams(100u32.into());
+    transport.max_concurrent_uni_streams(103u32.into());
+    transport.send_fairness(false);
+    client_cfg.transport_config(Arc::new(transport));
+
+    Ok(client_cfg)
+}
+
+async fn resolve_h3_target(
+    host: &str,
+    port: u16,
+    resolve_entries: &[(String, Vec<SocketAddr>)],
+    prefer_ipv6: Option<bool>,
+) -> PyResult<SocketAddr> {
+    for (dom, addrs) in resolve_entries {
+        if dom.eq_ignore_ascii_case(host) {
+            if let Some(&first) = addrs.first() {
+                let p = if first.port() == 0 { port } else { first.port() };
+                return Ok(SocketAddr::new(first.ip(), p));
+            }
+        }
+    }
+    if let Ok(ip) = IpAddr::from_str(host.trim_matches(|c| c == '[' || c == ']')) {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let lookup_target = format!("{host}:{port}");
+    let addrs: Vec<SocketAddr> = lookup_host(&lookup_target)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("[connect] DNS lookup failed for '{lookup_target}': {e}")))?
+        .collect();
+    if let Some(want_v6) = prefer_ipv6 {
+        if let Some(&matched) = addrs.iter().find(|a| a.is_ipv6() == want_v6) {
+            return Ok(matched);
+        }
+    }
+    // Prefer IPv4 first when local_address is unspecified to avoid dual-stack UDP routing blackholes
+    if let Some(&v4) = addrs.iter().find(|a| a.is_ipv4()) {
+        return Ok(v4);
+    }
+    addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| PyRuntimeError::new_err(format!("[connect] No addresses resolved for '{lookup_target}'")))
+}
+
+async fn execute_h3_single_hop(
+    spec: &H3RequestSpec,
+    current_url: &url::Url,
+    method_str: &str,
+    body_opt: Option<&[u8]>,
+    jar: &Arc<Jar>,
+    port_override: Option<u16>,
+) -> PyResult<(
+    u16,
+    HeaderMap,
+    HashMap<String, String>,
+    Vec<u8>,
+    Option<String>,
+    Option<Vec<u8>>,
+)> {
+    if current_url.scheme() != "https" {
+        return Err(PyRuntimeError::new_err(
+            "[connect] HTTP/3 (QUIC) requires an https:// URL",
+        ));
+    }
+    let host = current_url
+        .host_str()
+        .ok_or_else(|| PyValueError::new_err("HTTP/3 URL missing host"))?
+        .to_string();
+    let port = port_override.or_else(|| current_url.port()).unwrap_or(443);
+
+    let prefer_v6 = spec.local_address.map(|ip| ip.is_ipv6());
+    let remote_sa = resolve_h3_target(&host, port, &spec.resolve_entries, prefer_v6).await?;
+
+    let bind_addr = match spec.local_address {
+        Some(ip) => SocketAddr::new(ip, 0),
+        None => {
+            if remote_sa.is_ipv6() {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+            } else {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            }
+        }
+    };
+
+    let client_cfg = build_h3_client_config(
+        spec.verify,
+        spec.ca_bundle.as_deref(),
+        spec.identity_pair.as_ref(),
+        spec.enable_keylog,
+    )?;
+
+    let mut endpoint = quinn::Endpoint::client(bind_addr)
+        .map_err(|e| PyRuntimeError::new_err(format!("[connect] UDP socket bind failed on {bind_addr}: {e}")))?;
+    endpoint.set_default_client_config(client_cfg);
+
+    let clean_sni = host.trim_matches(|c| c == '[' || c == ']');
+    let connecting = endpoint
+        .connect(remote_sa, clean_sni)
+        .map_err(|e| PyRuntimeError::new_err(format!("[connect] QUIC connect init failed: {e}")))?;
+
+    let conn = match tokio::time::timeout(spec.connect_timeout, connecting).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            let low = e.to_string().to_lowercase();
+            let tag = if low.contains("certificate") || low.contains("tls") || low.contains("crypto") {
+                "ssl"
+            } else {
+                "connect"
+            };
+            return Err(PyRuntimeError::new_err(format!("[{tag}] QUIC handshake failed: {e}")));
+        }
+        Err(_) => {
+            return Err(PyRuntimeError::new_err(
+                "[connect_timeout] QUIC UDP handshake timed out",
+            ))
+        }
+    };
+
+    let remote_addr_str = Some(conn.remote_address().to_string());
+    let peer_cert_der = if spec.tls_info {
+        conn.peer_identity()
+            .and_then(|any| any.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
+            .and_then(|certs| certs.into_iter().next().map(|c| c.as_ref().to_vec()))
+    } else {
+        None
+    };
+
+    let quinn_conn = h3_quinn::Connection::new(conn);
+    let (mut driver, mut send_request) = h3::client::new(quinn_conn)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("[connect] HTTP/3 session init failed: {e}")))?;
+
+    let driver_handle = tokio::spawn(async move {
+        let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    // Assemble request URI & browser-accurate headers
+    let path_and_query = match current_url.query() {
+        Some(q) => format!("{}?{}", current_url.path(), q),
+        None => current_url.path().to_string(),
+    };
+    let authority = match current_url.port() {
+        Some(p) if p != 443 => format!("{host}:{p}"),
+        _ => host.clone(),
+    };
+    let uri = http::Uri::builder()
+        .scheme("https")
+        .authority(authority.as_str())
+        .path_and_query(if path_and_query.is_empty() { "/" } else { &path_and_query })
+        .build()
+        .map_err(|e| PyValueError::new_err(format!("Invalid HTTP/3 URI: {e}")))?;
+
+    let method = http::Method::from_bytes(method_str.as_bytes())
+        .map_err(|e| PyValueError::new_err(format!("Invalid HTTP method '{method_str}': {e}")))?;
+
+    // Merge browser defaults + session/caller headers + cookie jar
+    let defaults = default_h3_browser_headers(
+        &spec.preset,
+        spec.ua_override.as_deref(),
+        spec.sec_ch_ua_override.as_deref(),
+    );
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (dk, dv) in defaults {
+        if !spec.headers.iter().any(|(ck, _)| ck.eq_ignore_ascii_case(&dk)) {
+            merged.push((dk, dv));
+        }
+    }
+    for (ck, cv) in &spec.headers {
+        if let Some(pos) = merged.iter().position(|(k, _)| k.eq_ignore_ascii_case(ck)) {
+            merged[pos] = (ck.clone(), cv.clone());
+        } else {
+            merged.push((ck.clone(), cv.clone()));
+        }
+    }
+
+    // Attach cookies from shared RFC 6265 Jar
+    let jar_cookies: Vec<String> = jar
+        .matches(current_url.as_str())
+        .into_iter()
+        .map(|c| format!("{}={}", c.name(), c.value()))
+        .collect();
+    if !jar_cookies.is_empty() {
+        let jar_hdr = jar_cookies.join("; ");
+        if let Some(pos) = merged.iter().position(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+            let existing = merged[pos].1.trim().to_string();
+            if existing.is_empty() {
+                merged[pos].1 = jar_hdr;
+            } else {
+                merged[pos].1 = format!("{jar_hdr}; {existing}");
+            }
+        } else {
+            merged.push(("cookie".to_string(), jar_hdr));
+        }
+    }
+
+    if let Some(ref order) = spec.header_order {
+        merged.sort_by_key(|(k, _)| {
+            order
+                .iter()
+                .position(|o| o.eq_ignore_ascii_case(k))
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    let mut req_builder = http::Request::builder().method(method).uri(uri);
+    for (k, v) in &merged {
+        if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            http::header::HeaderName::from_bytes(k.as_bytes()),
+            http::header::HeaderValue::from_str(v),
+        ) {
+            req_builder = req_builder.header(hn, hv);
+        }
+    }
+    let req = req_builder
+        .body(())
+        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 request build error: {e}")))?;
+
+    let mut stream = send_request
+        .send_request(req)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 send_request failed: {e}")))?;
+
+    if let Some(body_bytes) = body_opt {
+        if !body_bytes.is_empty() {
+            stream
+                .send_data(Bytes::copy_from_slice(body_bytes))
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 send_data failed: {e}")))?;
+        }
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 stream finish failed: {e}")))?;
+
+    let resp = stream
+        .recv_response()
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_response failed: {e}")))?;
+
+    let status_code = resp.status().as_u16();
+    let mut wreq_headers = HeaderMap::new();
+    let mut headers_map: HashMap<String, String> = HashMap::new();
+    let mut content_encoding: Option<String> = None;
+
+    for (name, value) in resp.headers() {
+        let name_s = name.as_str().to_string();
+        let val_s = String::from_utf8_lossy(value.as_bytes()).into_owned();
+        if name_s.eq_ignore_ascii_case("set-cookie") {
+            jar.add(val_s.clone(), current_url.as_str());
+        }
+        if name_s.eq_ignore_ascii_case("content-encoding") {
+            content_encoding = Some(val_s.clone());
+        }
+        if let (Ok(wn), Ok(wv)) = (
+            HeaderName::from_str(&name_s),
+            HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            wreq_headers.append(wn, wv);
+        }
+        match headers_map.get_mut(&name_s) {
+            Some(existing) => {
+                existing.push_str(", ");
+                existing.push_str(&val_s);
+            }
+            None => {
+                headers_map.insert(name_s, val_s);
+            }
+        }
+    }
+
+    let mut raw_body = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_data failed: {e}")))?
+    {
+        while chunk.has_remaining() {
+            let slice = chunk.chunk();
+            raw_body.extend_from_slice(slice);
+            let len = slice.len();
+            chunk.advance(len);
+        }
+    }
+
+    driver_handle.abort();
+    endpoint.close(0u32.into(), b"done");
+
+    let decoded_bytes = decompress_h3_body(raw_body, content_encoding.as_deref());
+    Ok((
+        status_code,
+        wreq_headers,
+        headers_map,
+        decoded_bytes,
+        remote_addr_str,
+        peer_cert_der,
+    ))
+}
+
+async fn execute_h3_request(spec: H3RequestSpec, jar: Arc<Jar>) -> PyResult<NativeResponse> {
+    let start = Instant::now();
+    let fut = async {
+        let mut current_url = spec.url.clone();
+        let mut current_method = spec.method.to_uppercase();
+        let mut current_body = spec.body.clone();
+        let mut history: Vec<HistoryTuple> = Vec::new();
+        let mut hop_port = spec.alt_svc_port;
+
+        for hop in 0..=spec.max_redirects {
+            let (status_code, wreq_hdrs, headers_map, body_bytes, remote_addr, peer_certificate) =
+                execute_h3_single_hop(
+                    &spec,
+                    &current_url,
+                    &current_method,
+                    current_body.as_deref(),
+                    &jar,
+                    hop_port,
+                )
+                .await?;
+            hop_port = None;
+
+            let is_redir = matches!(status_code, 301 | 302 | 303 | 307 | 308);
+            if spec.allow_redirects && is_redir {
+                if let Some(loc) = wreq_hdrs
+                    .get(wreq::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    if hop >= spec.max_redirects {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "[redirect] Too many redirects (max {})",
+                            spec.max_redirects
+                        )));
+                    }
+                    let next_url = current_url.join(loc).map_err(|e| {
+                        PyValueError::new_err(format!("Invalid redirect URL '{loc}': {e}"))
+                    })?;
+                    history.push((
+                        status_code,
+                        current_url.to_string(),
+                        next_url.to_string(),
+                        headers_map,
+                    ));
+                    if status_code == 303
+                        || ((status_code == 301 || status_code == 302)
+                            && current_method != "GET"
+                            && current_method != "HEAD")
+                    {
+                        current_method = "GET".to_string();
+                        current_body = None;
+                    }
+                    current_url = next_url;
+                    continue;
+                }
+            }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let final_url_str = current_url.to_string();
+            let (text, encoding) = decode_body(&body_bytes, &wreq_hdrs);
+            let cookies = collect_cookies(&jar, &final_url_str, &wreq_hdrs);
+            return Ok(NativeResponse {
+                status_code,
+                headers: headers_map,
+                cookies,
+                url: final_url_str,
+                content: body_bytes,
+                text,
+                encoding,
+                elapsed,
+                http_version: "HTTP/3".to_string(),
+                remote_addr,
+                peer_certificate,
+                history,
+            });
+        }
+        Err(PyRuntimeError::new_err("[redirect] Too many redirects"))
+    };
+
+    match tokio::time::timeout(spec.timeout, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(PyRuntimeError::new_err("[timeout] HTTP/3 request timed out")),
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Response & Stream & WebSocket types
 // ---------------------------------------------------------------------------
 #[pyclass(name = "Response")]
@@ -1187,6 +1858,8 @@ pub struct NativeSession {
     http2_options: Option<Http2Options>,
     http1_only: bool,
     http2_only: bool,
+    http3: bool,
+    http3_only: bool,
     resolve_entries: Vec<(String, Vec<SocketAddr>)>,
     local_address: Option<IpAddr>,
     #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
@@ -1447,6 +2120,206 @@ impl NativeSession {
 
         Ok(rb)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_h3(
+        &self,
+        method: &str,
+        url: &str,
+        params: Option<&Bound<'_, PyDict>>,
+        headers: Option<&Bound<'_, PyDict>>,
+        cookies: Option<&Bound<'_, PyDict>>,
+        data: Option<Vec<u8>>,
+        json: Option<&str>,
+        files: Option<&Bound<'_, PyList>>,
+        timeout: Option<f64>,
+        proxy: Option<String>,
+        allow_redirects: Option<bool>,
+        verify: Option<bool>,
+        ca_bundle: Option<Vec<u8>>,
+        header_order: Option<Vec<String>>,
+        impersonate_override: Option<String>,
+        local_address_override: Option<String>,
+        http3_override: Option<bool>,
+        alt_svc_port: Option<u16>,
+    ) -> PyResult<Option<H3RequestSpec>> {
+        let want_h3 = http3_override.unwrap_or(self.http3 || self.http3_only);
+        if !want_h3 || self.http1_only || self.http2_only {
+            return Ok(None);
+        }
+        let has_proxy = proxy.is_some() || self.default_proxy.is_some();
+        if has_proxy {
+            if self.http3_only {
+                return Err(PyRuntimeError::new_err(
+                    "[connect] http3_only=True cannot be used with an HTTP/SOCKS TCP proxy",
+                ));
+            }
+            return Ok(None);
+        }
+        if files.map(|f| !f.is_empty()).unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let mut final_url =
+            url::Url::parse(url).map_err(|e| PyValueError::new_err(format!("Invalid URL '{url}': {e}")))?;
+        if final_url.scheme() != "https" {
+            if self.http3_only {
+                return Err(PyRuntimeError::new_err(
+                    "[connect] HTTP/3 (QUIC) requires an https:// URL",
+                ));
+            }
+            return Ok(None);
+        }
+
+        let qp = dict_pairs(params)?;
+        if !qp.is_empty() {
+            let mut pairs = final_url.query_pairs_mut();
+            for (k, v) in &qp {
+                pairs.append_pair(k, v);
+            }
+        }
+
+        let uri_str = final_url.as_str();
+        for (k, v) in dict_pairs(cookies)? {
+            self.jar.add(format!("{k}={v}; Path=/"), uri_str);
+        }
+
+        let (preset_name, ua_ov, ch_ov) = if let Some(ref preset) = impersonate_override {
+            let res = resolve_emulation(preset);
+            (preset.clone(), res.ua_override, res.sec_ch_ua_override)
+        } else {
+            let st = self.emu_state.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                st.impersonate.clone(),
+                st.ua_override.clone(),
+                st.sec_ch_ua_override.clone(),
+            )
+        };
+
+        let mut merged_hdrs: Vec<(String, String)> = Vec::new();
+        for (k, v) in &self.default_headers {
+            merged_hdrs.push((
+                k.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            ));
+        }
+        for (k, v) in dict_pairs(headers)? {
+            if let Some(pos) = merged_hdrs.iter().position(|(ek, _)| ek.eq_ignore_ascii_case(&k)) {
+                merged_hdrs[pos] = (k, v);
+            } else {
+                merged_hdrs.push((k, v));
+            }
+        }
+
+        let body = if let Some(b) = data {
+            Some(b)
+        } else if let Some(j) = json {
+            if !merged_hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                merged_hdrs.push(("content-type".to_string(), "application/json".to_string()));
+            }
+            Some(j.as_bytes().to_vec())
+        } else {
+            None
+        };
+
+        if let Some(ref b) = body {
+            if !merged_hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+                merged_hdrs.push(("content-length".to_string(), b.len().to_string()));
+            }
+        }
+
+        let eff_local_addr = match local_address_override {
+            Some(ref la) => Some(
+                IpAddr::from_str(la)
+                    .map_err(|e| PyValueError::new_err(format!("Invalid local_address '{la}': {e}")))?,
+            ),
+            None => self.local_address,
+        };
+
+        let eff_timeout = timeout
+            .map(|t| Duration::from_secs_f64(t.max(0.05)))
+            .unwrap_or(self.timeout);
+        let eff_connect_timeout = self
+            .connect_timeout
+            .unwrap_or_else(|| eff_timeout.min(Duration::from_secs(10)));
+        let enable_keylog = self.keylog_file.is_some()
+            || std::env::var("SSLKEYLOGFILE")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+
+        Ok(Some(H3RequestSpec {
+            method: method.to_uppercase(),
+            url: final_url,
+            headers: merged_hdrs,
+            header_order: header_order.or_else(|| self.header_order.clone()),
+            body,
+            timeout: eff_timeout,
+            connect_timeout: eff_connect_timeout,
+            allow_redirects: allow_redirects.unwrap_or(self.follow_redirects),
+            max_redirects: self.max_redirects,
+            verify: verify.unwrap_or(self.verify),
+            ca_bundle: ca_bundle.or_else(|| self.ca_bundle.clone()),
+            identity_pair: self.identity_pair.clone(),
+            resolve_entries: self.resolve_entries.clone(),
+            local_address: eff_local_addr,
+            tls_info: self.tls_info,
+            enable_keylog,
+            preset: preset_name,
+            ua_override: ua_ov,
+            sec_ch_ua_override: ch_ov,
+            alt_svc_port,
+            strict_h3: self.http3_only,
+        }))
+    }
+}
+
+async fn finish_dual_response(
+    rb: RequestBuilder,
+    h3_spec: Option<H3RequestSpec>,
+    jar: Arc<Jar>,
+) -> PyResult<NativeResponse> {
+    if let Some(spec) = h3_spec {
+        let strict = spec.strict_h3;
+        match execute_h3_request(spec, Arc::clone(&jar)).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) if strict => return Err(e),
+            Err(_) => {}
+        }
+    }
+    finish_response(rb, jar).await
+}
+
+async fn start_dual_stream(
+    rb: RequestBuilder,
+    h3_spec: Option<H3RequestSpec>,
+    jar: Arc<Jar>,
+) -> PyResult<NativeStream> {
+    if let Some(spec) = h3_spec {
+        let strict = spec.strict_h3;
+        match execute_h3_request(spec, Arc::clone(&jar)).await {
+            Ok(resp) => {
+                let body_bytes = Bytes::from(resp.content);
+                let stream: BodyStream =
+                    Box::pin(futures_util::stream::once(async move { Ok(body_bytes) }));
+                return Ok(NativeStream {
+                    status_code: resp.status_code,
+                    headers: resp.headers,
+                    cookies: resp.cookies,
+                    encoding: resp.encoding,
+                    url: resp.url,
+                    elapsed: resp.elapsed,
+                    http_version: resp.http_version,
+                    remote_addr: resp.remote_addr,
+                    peer_certificate: resp.peer_certificate,
+                    history: resp.history,
+                    inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
+                });
+            }
+            Err(e) if strict => return Err(e),
+            Err(_) => {}
+        }
+    }
+    start_stream(rb, jar).await
 }
 
 async fn finish_response(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeResponse> {
@@ -1530,6 +2403,8 @@ impl NativeSession {
         http2_options = None,
         http1_only = false,
         http2_only = false,
+        http3 = false,
+        http3_only = false,
         resolve = None,
         local_address = None,
         interface = None,
@@ -1560,6 +2435,8 @@ impl NativeSession {
         http2_options: Option<&Bound<'_, PyDict>>,
         http1_only: bool,
         http2_only: bool,
+        http3: bool,
+        http3_only: bool,
         resolve: Option<&Bound<'_, PyDict>>,
         local_address: Option<String>,
         interface: Option<String>,
@@ -1637,6 +2514,8 @@ impl NativeSession {
             http2_options: parsed_h2,
             http1_only,
             http2_only,
+            http3,
+            http3_only,
             resolve_entries,
             local_address: parsed_local_addr,
             #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
@@ -1664,7 +2543,7 @@ impl NativeSession {
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
         verify = None, ca_bundle = None, header_order = None, impersonate = None,
-        local_address = None
+        local_address = None, http3 = None, alt_svc_port = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn request(
@@ -1686,20 +2565,42 @@ impl NativeSession {
         header_order: Option<Vec<String>>,
         impersonate: Option<String>,
         local_address: Option<String>,
+        http3: Option<bool>,
+        alt_svc_port: Option<u16>,
     ) -> PyResult<NativeResponse> {
+        let h3_spec = self.prepare_h3(
+            method,
+            url,
+            params,
+            headers,
+            cookies,
+            data.clone(),
+            json,
+            files,
+            timeout,
+            proxy.clone(),
+            allow_redirects,
+            verify,
+            ca_bundle.clone(),
+            header_order.clone(),
+            impersonate.clone(),
+            local_address.clone(),
+            http3,
+            alt_svc_port,
+        )?;
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
-        py.allow_threads(move || runtime().block_on(finish_response(rb, jar)))
+        py.allow_threads(move || runtime().block_on(finish_dual_response(rb, h3_spec, jar)))
     }
 
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
         verify = None, ca_bundle = None, header_order = None, impersonate = None,
-        local_address = None
+        local_address = None, http3 = None, alt_svc_port = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn async_request<'py>(
@@ -1721,20 +2622,42 @@ impl NativeSession {
         header_order: Option<Vec<String>>,
         impersonate: Option<String>,
         local_address: Option<String>,
+        http3: Option<bool>,
+        alt_svc_port: Option<u16>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let h3_spec = self.prepare_h3(
+            method,
+            url,
+            params,
+            headers,
+            cookies,
+            data.clone(),
+            json,
+            files,
+            timeout,
+            proxy.clone(),
+            allow_redirects,
+            verify,
+            ca_bundle.clone(),
+            header_order.clone(),
+            impersonate.clone(),
+            local_address.clone(),
+            http3,
+            alt_svc_port,
+        )?;
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
-        pyo3_async_runtimes::tokio::future_into_py(py, finish_response(rb, jar))
+        pyo3_async_runtimes::tokio::future_into_py(py, finish_dual_response(rb, h3_spec, jar))
     }
 
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
         verify = None, ca_bundle = None, header_order = None, impersonate = None,
-        local_address = None
+        local_address = None, http3 = None, alt_svc_port = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn request_stream(
@@ -1756,20 +2679,42 @@ impl NativeSession {
         header_order: Option<Vec<String>>,
         impersonate: Option<String>,
         local_address: Option<String>,
+        http3: Option<bool>,
+        alt_svc_port: Option<u16>,
     ) -> PyResult<NativeStream> {
+        let h3_spec = self.prepare_h3(
+            method,
+            url,
+            params,
+            headers,
+            cookies,
+            data.clone(),
+            json,
+            files,
+            timeout,
+            proxy.clone(),
+            allow_redirects,
+            verify,
+            ca_bundle.clone(),
+            header_order.clone(),
+            impersonate.clone(),
+            local_address.clone(),
+            http3,
+            alt_svc_port,
+        )?;
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
-        py.allow_threads(move || runtime().block_on(start_stream(rb, jar)))
+        py.allow_threads(move || runtime().block_on(start_dual_stream(rb, h3_spec, jar)))
     }
 
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
         verify = None, ca_bundle = None, header_order = None, impersonate = None,
-        local_address = None
+        local_address = None, http3 = None, alt_svc_port = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn async_request_stream<'py>(
@@ -1791,13 +2736,35 @@ impl NativeSession {
         header_order: Option<Vec<String>>,
         impersonate: Option<String>,
         local_address: Option<String>,
+        http3: Option<bool>,
+        alt_svc_port: Option<u16>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let h3_spec = self.prepare_h3(
+            method,
+            url,
+            params,
+            headers,
+            cookies,
+            data.clone(),
+            json,
+            files,
+            timeout,
+            proxy.clone(),
+            allow_redirects,
+            verify,
+            ca_bundle.clone(),
+            header_order.clone(),
+            impersonate.clone(),
+            local_address.clone(),
+            http3,
+            alt_svc_port,
+        )?;
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
-        pyo3_async_runtimes::tokio::future_into_py(py, start_stream(rb, jar))
+        pyo3_async_runtimes::tokio::future_into_py(py, start_dual_stream(rb, h3_spec, jar))
     }
 
     #[pyo3(signature = (url, headers = None, proxy = None, verify = None))]
@@ -2016,7 +2983,29 @@ impl NativeSession {
             let header_order: Option<Vec<String>> = d.get_item("header_order")?.and_then(|v| v.extract().ok());
             let impersonate: Option<String> = d.get_item("impersonate")?.and_then(|v| v.extract().ok());
             let local_address: Option<String> = d.get_item("local_address")?.and_then(|v| v.extract().ok());
+            let http3: Option<bool> = d.get_item("http3")?.and_then(|v| v.extract().ok());
+            let alt_svc_port: Option<u16> = d.get_item("alt_svc_port")?.and_then(|v| v.extract().ok());
 
+            let h3_spec = self.prepare_h3(
+                &method,
+                &url,
+                params,
+                headers,
+                cookies,
+                data.clone(),
+                json_str.as_deref(),
+                files,
+                timeout,
+                proxy.clone(),
+                allow_redirects,
+                verify,
+                ca_bundle.clone(),
+                header_order.clone(),
+                impersonate.clone(),
+                local_address.clone(),
+                http3,
+                alt_svc_port,
+            )?;
             let rb = self.prepare(
                 &method,
                 &url,
@@ -2035,7 +3024,7 @@ impl NativeSession {
                 impersonate,
                 local_address,
             )?;
-            builders.push(rb);
+            builders.push((rb, h3_spec));
         }
 
         let jar = Arc::clone(&self.jar);
@@ -2045,7 +3034,7 @@ impl NativeSession {
                 let results: Vec<PyResult<NativeResponse>> = futures_util::stream::iter(
                     builders
                         .into_iter()
-                        .map(|rb| finish_response(rb, Arc::clone(&jar))),
+                        .map(|(rb, h3_spec)| finish_dual_response(rb, h3_spec, Arc::clone(&jar))),
                 )
                 .buffered(limit)
                 .collect()

@@ -503,6 +503,29 @@ def test_warm_solver_proxy_isolation_cdp_context_and_alt_svc():
     assert sent_cdp[1] == ("Target.createTarget", {"url": "https://target.test/challenge", "browserContextId": "ctx-proxy-1"})
 
 
+def test_http3_udp_quic_wire_transport_and_alt_svc_auto_upgrade():
+    # 1. Explicit http3=True: first request goes straight over UDP QUIC (HTTP/3)
+    with Session(impersonate="chrome_149", http3=True, tls_info=True, timeout=10.0) as s3:
+        r3 = s3.get("https://www.cloudflare.com/cdn-cgi/trace")
+        assert r3.status_code == 200
+        assert r3.http_version == "HTTP/3"
+        assert "http=http/3" in r3.text
+        assert r3.peer_certificate is not None and len(r3.peer_certificate) > 100
+
+    # 2. Automatic Alt-Svc: h3=":443" upgrade on default Session()
+    with Session(impersonate="chrome_149", timeout=10.0) as s:
+        r1 = s.head("https://www.cloudflare.com/")
+        assert r1.status_code == 200
+        assert r1.http_version == "HTTP/2"
+        assert "h3" in s.alt_svc_cache.get("www.cloudflare.com", {})
+
+        # Second request to the same host automatically upgrades to UDP QUIC HTTP/3
+        r2 = s.get("https://www.cloudflare.com/cdn-cgi/trace")
+        assert r2.status_code == 200
+        assert r2.http_version == "HTTP/3"
+        assert "http=http/3" in r2.text
+
+
 def test_soak_stability_pool_cleanup_and_bounded_memory(fast_server: str):
     """Run 600 requests (sync, gather, async, stream abort, cookie clear) and verify bounded heap & clean close."""
     def _run_cycle() -> None:

@@ -38,11 +38,11 @@ pip install http-tls
 | :--- | :--- |
 | **PyPI Package** | `http-tls` (`pip install http-tls`) |
 | **Python Import** | `import http_tls` |
-| **TLS / HTTP Engine** | Embedded Rust `wreq` + BoringSSL (`btls`), zero `libcurl` or Go CGo dependency |
+| **TLS / HTTP Engine** | Embedded Rust `wreq` + BoringSSL (`btls`) + `quinn`/`h3` UDP QUIC (HTTP/1.1, HTTP/2 & HTTP/3), zero `libcurl` or Go CGo dependency |
 | **Async & DNS Stack** | Native Rust Tokio runtime (`pyo3-async-runtimes`) + Hickory async DNS |
 | **Drop-in API Compatibility** | `requests`, `httpx` (`Client`, `AsyncClient`, `stream`), and `curl_cffi` (`BrowserType`, `impersonate`) |
 | **Sync Parallelism** | `session.gather(urls, concurrency=50)` — GIL-free multi-request batching without `async/await` |
-| **Fingerprinting** | 100+ browser presets, custom JA3, `tls_options`, `http2_options`, exact wire `header_order` |
+| **Fingerprinting & HTTP/3** | 100+ browser presets, custom JA3, `tls_options`, `http2_options` (`akamai_h2`), UDP QUIC `http3=True` + auto `Alt-Svc: h3=":443"` upgrade |
 | **WebSockets & Streaming** | TLS-impersonated sync/async WebSockets, sync/async streaming, multipart `files=` |
 | **Reverse Engineering & Ops** | Wireshark `SSLKEYLOGFILE` / `keylog_file`, HAR 1.2 export, Playwright `storage_state.json`, WAF `resp.challenge` detector |
 | **Python & Platform Support** | Python 3.8 – 3.14+ (ABI3 wheels) on Windows `x86_64`, Linux `manylinux_2_28` (`x86_64`, `aarch64`), macOS (`x86_64`, `arm64`) |

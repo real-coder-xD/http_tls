@@ -389,6 +389,9 @@ class Session:
     cookies: Cookies
     proxies: Dict[str, str]
     proxies_pool: List[str]
+    http3: bool
+    http3_only: bool
+    auto_upgrade_h3: bool
     alt_svc_cache: Dict[str, Dict[str, str]]
     har_entries: List[Dict[str, Any]]
     event_hooks: Dict[str, List[Callable[..., Any]]]
@@ -422,6 +425,9 @@ class Session:
         akamai_h2: Optional[str] = None,
         http1_only: bool = False,
         http2_only: bool = False,
+        http3: bool = False,
+        http3_only: bool = False,
+        auto_upgrade_h3: bool = True,
         resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
         local_address: Optional[str] = None,
         interface: Optional[str] = None,
@@ -478,6 +484,7 @@ class Session:
         impersonate: Optional[str] = None,
         local_address: Optional[str] = None,
         fetch_mode: Optional[str] = None,
+        http3: Optional[bool] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response: ...

@@ -53,7 +53,7 @@ try:
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.7.3"
+    __version__ = "0.8.0"
 
     def _rust_presets() -> List[str]:
         return []
@@ -1327,6 +1327,9 @@ class Session:
         akamai_h2: Optional[str] = None,
         http1_only: bool = False,
         http2_only: bool = False,
+        http3: bool = False,
+        http3_only: bool = False,
+        auto_upgrade_h3: bool = True,
         resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
         local_address: Optional[str] = None,
         interface: Optional[str] = None,
@@ -1391,6 +1394,17 @@ class Session:
         self.fetch_mode = fetch_mode
         self.transport = transport
         self._last_url: Optional[str] = None
+        self.http3 = http3 or http3_only
+        self.http3_only = http3_only
+        self.auto_upgrade_h3 = (
+            auto_upgrade_h3
+            and not http1_only
+            and not http2_only
+            and not akamai_h2
+            and not http2_options
+            and not ja3
+            and not tls_options
+        )
         self.alt_svc_cache: Dict[str, Dict[str, str]] = {}
         self.proxies_pool: List[str] = list(proxies_pool) if proxies_pool else []
         self._proxy_idx = 0
@@ -1459,6 +1473,8 @@ class Session:
                 http2_options=merged_h2,
                 http1_only=http1_only,
                 http2_only=http2_only,
+                http3=self.http3,
+                http3_only=self.http3_only,
                 resolve=dict(resolve) if resolve else None,
                 local_address=local_address,
                 interface=interface,
@@ -1491,6 +1507,24 @@ class Session:
             return url
         base = self.base_url if self.base_url.endswith("/") else self.base_url + "/"
         return urljoin(base, url.lstrip("/"))
+
+    def _lookup_alt_svc_h3(self, url: str) -> Tuple[bool, Optional[int]]:
+        if not self.alt_svc_cache or not url.startswith("https://"):
+            return False, None
+        host = (urlparse(url).hostname or "").lower()
+        if not host:
+            return False, None
+        alt = self.alt_svc_cache.get(host)
+        if not alt:
+            return False, None
+        authority = alt.get("h3") or alt.get("h3-29")
+        if not authority:
+            return False, None
+        if ":" in authority:
+            port_s = authority.rsplit(":", 1)[-1].strip()
+            if port_s.isdigit():
+                return True, int(port_s)
+        return True, 443
 
     def _clear_backend_cookies(self) -> None:
         if self._mode == "rust":
@@ -1781,6 +1815,7 @@ class Session:
                 header_order=spec.get("header_order"),
                 impersonate_override=spec.get("impersonate"),
                 local_address=spec.get("local_address"),
+                http3=spec.get("http3"),
             )
             native_specs.append(args)
             meta_list.append((method, full_url, args.get("headers")))
@@ -1818,6 +1853,7 @@ class Session:
         header_order: Optional[Sequence[str]],
         impersonate_override: Optional[str],
         local_address: Optional[str],
+        http3: Optional[bool] = None,
     ) -> Dict[str, Any]:
         req_headers = dict(self.headers.items())
         if headers:
@@ -1865,6 +1901,11 @@ class Session:
             if ca_path:
                 ca_bytes = _read_file(ca_path)
 
+        has_alt_h3, alt_port = self._lookup_alt_svc_h3(url)
+        eff_http3: Optional[bool] = http3
+        if eff_http3 is None and self.auto_upgrade_h3 and has_alt_h3 and not actual_proxy:
+            eff_http3 = True
+
         return dict(
             method=method,
             url=url,
@@ -1882,6 +1923,8 @@ class Session:
             header_order=list(header_order) if header_order else None,
             impersonate=impersonate_override if impersonate_override else None,
             local_address=local_address,
+            http3=eff_http3,
+            alt_svc_port=alt_port,
         )
 
     def _wrap_native(self, native: Any, stream: bool, is_async: bool = False) -> Response:
@@ -1905,7 +1948,7 @@ class Session:
             history=hist,
         )
         if stream:
-            return Response(
+            out_resp = Response(
                 content=None,
                 encoding=native.encoding or "utf-8",
                 raw_chunks=None if is_async else _native_chunks(native),
@@ -1913,7 +1956,18 @@ class Session:
                 closer=native.close,
                 **common,
             )
-        return Response(content=native.content, text=native.text, encoding=native.encoding, **common)
+        else:
+            out_resp = Response(content=native.content, text=native.text, encoding=native.encoding, **common)
+        for h_resp in (*hist, out_resp):
+            if "alt-svc" in h_resp.headers:
+                host = (urlparse(h_resp.url).hostname or "").lower()
+                if host:
+                    parsed_alt = h_resp.alt_svc
+                    if parsed_alt:
+                        self.alt_svc_cache[host] = parsed_alt
+                    else:
+                        self.alt_svc_cache.pop(host, None)
+        return out_resp
 
     def _should_retry_resp(self, resp: Response) -> bool:
         if resp.status_code in self.retry_statuses:
@@ -1951,6 +2005,7 @@ class Session:
         impersonate: Optional[Union[str, BrowserType]] = None,
         local_address: Optional[str] = None,
         fetch_mode: Optional[str] = None,
+        http3: Optional[bool] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response:
@@ -2015,7 +2070,7 @@ class Session:
                     args = self._build_native_args(
                         method, full_url, params, req_headers, cookies, data, json, files,
                         timeout, verify, proxies, attempt_proxy, allow_redirects, auth_obj,
-                        header_order, attempt_imp, local_address,
+                        header_order, attempt_imp, local_address, http3,
                     )
                     call = self._session.request_stream if stream else self._session.request
                     resp = self._wrap_native(call(**args), stream=stream, is_async=False)
@@ -2032,7 +2087,7 @@ class Session:
                         args = self._build_native_args(
                             method, full_url, params, digest_hdrs, cookies, data, json, files,
                             timeout, verify, proxies, attempt_proxy, allow_redirects, None,
-                            header_order, attempt_imp, local_address,
+                            header_order, attempt_imp, local_address, http3,
                         )
                         call = self._session.request_stream if stream else self._session.request
                         resp = self._wrap_native(call(**args), stream=stream, is_async=False)
@@ -2335,6 +2390,7 @@ class AsyncSession:
         impersonate: Optional[Union[str, BrowserType]] = None,
         local_address: Optional[str] = None,
         fetch_mode: Optional[str] = None,
+        http3: Optional[bool] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response:
@@ -2400,7 +2456,7 @@ class AsyncSession:
                 args = s._build_native_args(
                     method, full_url, params, req_headers, cookies, data, json, files,
                     timeout, verify, proxies, attempt_proxy, allow_redirects, auth_obj,
-                    header_order, attempt_imp, local_address,
+                    header_order, attempt_imp, local_address, http3,
                 )
                 call = s._session.async_request_stream if stream else s._session.async_request
                 resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
@@ -2415,7 +2471,7 @@ class AsyncSession:
                         args = s._build_native_args(
                             method, full_url, params, digest_hdrs, cookies, data, json, files,
                             timeout, verify, proxies, attempt_proxy, allow_redirects, None,
-                            header_order, attempt_imp, local_address,
+                            header_order, attempt_imp, local_address, http3,
                         )
                         call = s._session.async_request_stream if stream else s._session.async_request
                         resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
@@ -2532,13 +2588,15 @@ class AsyncSession:
 _SESSION_KEYS = (
     "timeout", "connect_timeout", "read_timeout", "verify", "proxies", "proxy", "proxies_pool",
     "allow_redirects", "follow_redirects", "auth", "cert", "header_order", "tls_options", "ja3",
-    "http2_options", "akamai_h2", "http1_only", "http2_only", "resolve", "local_address", "interface",
+    "http2_options", "akamai_h2", "http1_only", "http2_only", "http3", "http3_only", "auto_upgrade_h3",
+    "resolve", "local_address", "interface",
     "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay", "tcp_keepalive",
     "auto_referer", "fetch_mode", "transport", "retries", "retry_backoff", "retry_statuses",
     "retry_on_challenge", "rotate_impersonate", "event_hooks", "engine",
 )
 _REQ_SKIP_KEYS = {
     "engine", "cert", "tls_options", "ja3", "http2_options", "akamai_h2", "http1_only", "http2_only",
+    "http3_only", "auto_upgrade_h3",
     "resolve", "interface", "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay",
     "tcp_keepalive", "auto_referer", "transport", "connect_timeout", "read_timeout", "proxies_pool",
     "retries", "retry_backoff", "retry_statuses", "retry_on_challenge", "rotate_impersonate",
