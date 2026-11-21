@@ -51,7 +51,7 @@ try:
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.6.1"
+    __version__ = "0.6.2"
 
     def _rust_presets() -> List[str]:
         return []

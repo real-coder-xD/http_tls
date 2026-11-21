@@ -2,6 +2,12 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [0.6.2] - 2026-11-21
+
+### Documentation & Packaging
+- Rewrote `README.md` in full English with complete API guides, verified `tls.peet.ws` JA4/HTTP2 audits, Cloudflare sync/async throughput benchmarks, migration examples (`requests`, `httpx`, `curl_cffi`, `tls-client`), structured Key Facts table, and FAQ.
+- Enriched PyPI metadata in `pyproject.toml` with package keywords, full Python 3.8–3.14 and OS classifiers, and project documentation/changelog links.
+
 ## [0.6.1] - 2026-11-21
 
 ### Added
