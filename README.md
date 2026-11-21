@@ -17,7 +17,7 @@
 [![Downloads](https://img.shields.io/pypi/dm/http-tls?style=flat-square&color=blue)](https://pypi.org/project/http-tls/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](https://github.com/real-coder-xD/http_tls/blob/main/LICENSE)
 
-[Why](#why-http_tls) · [Comparison](#comparison-http_tls-vs-curl_cffi-primp-tls-client-httpx-and-requests) · [Benchmarks](#verified-benchmarks--live-ja4--http2-fingerprint-audit) · [Installation](#installation) · [Quick Start](#migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client) · [Concurrency](#high-concurrency-execution-native-tokio-async--sync-gather) · [Streaming](#streaming-responses--multipart-file-uploads) · [WebSockets](#tls-impersonated-websockets-sync--async) · [Fingerprint Tuning](#custom-ja3-boringssl-tls_options-http2-settings--wire-header-order)<br>
+[Why](#why-http_tls) · [Comparison](#comparison-http_tls-vs-curl_cffi-primp-rnet-and-tls-client) · [Benchmarks](#verified-benchmarks--live-ja4--http2-fingerprint-audit) · [Installation](#installation) · [Quick Start](#migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client) · [Concurrency](#high-concurrency-execution-native-tokio-async--sync-gather) · [Streaming](#streaming-responses--multipart-file-uploads) · [WebSockets](#tls-impersonated-websockets-sync--async) · [Fingerprint Tuning](#custom-ja3-boringssl-tls_options-http2-settings--wire-header-order)<br>
 [Proxies & DNS](#proxies-custom-dns-resolve-ipv6-64-binding--hickory-dns) · [Auth & mTLS](#authentication-basic-bearer-digest-custom-ca-bundles--mutual-tls-mtls) · [Anti-Bot](#waf-challenge-detection-retries-playwright-storage_statejson--solver-bridge) · [Traffic Inspection](#traffic-inspection-wireshark-keylog--har-12-export) · [Presets](#supported-browser-impersonation-presets-100-profiles) · [API Reference](#api-reference-summary) · [Architecture](#architecture-under-the-hood) · [FAQ](#frequently-asked-questions-faq) · [Changelog](CHANGELOG.md)
 
 </div>
@@ -67,26 +67,29 @@ Existing Python TLS-impersonating alternatives each carry architectural trade-of
 
 ---
 
-## Comparison: `http_tls` vs `curl_cffi`, `primp`, `tls-client`, `httpx`, and `requests`
+## Comparison: `http_tls` vs `curl_cffi`, `primp`, `rnet`, and `tls-client`
 
-| Capability | `http_tls` | `curl_cffi` | `primp` / `rnet` | `tls-client` | `httpx` | `requests` |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| Standalone BoringSSL TLS / JA4 | `✓` 100+ presets | `✓` | `✓` | `◐` Go `utls` | `✗` | `✗` |
-| Custom JA3, TLS & H2 Options | `✓` | `✓` | `◐` | `✓` | `✗` | `✗` |
-| Exact Wire Header Order (`OrigHeaderMap`) | `✓` | `◐` | `✓` | `✓` | `✗` | `✗` |
-| Native Event-Loop Async | `✓` Tokio | `✓` libcurl | `✓` Tokio | `✗` | `✓` | `✗` |
-| Sync Parallel `gather()` (No `async/await`) | `✓` Rust Tokio | `✗` | `✗` | `✗` | `✗` | `✗` |
-| `requests` + `httpx` + `curl_cffi` Drop-in | `✓` | `◐` | `✗` | `✗` | `◐` `httpx` only | `◐` `requests` only |
-| Async Hickory DNS & Custom `resolve` | `✓` | `◐` `resolve` only | `◐` | `✗` | `✗` | `✗` |
-| Outbound IPv4 / IPv6 `/64` Socket Binding | `✓` | `✓` | `◐` | `✗` | `◐` | `✗` |
-| TLS-Impersonated WebSockets (Sync & Async) | `✓` | `✓` | `✓` | `✗` | `✗` | `✗` |
-| Streaming, Multipart, Custom CA, mTLS | `✓` | `✓` | `◐` | `◐` | `✓` | `✓` |
-| RFC 7616 `DigestAuth` (MD5/SHA-256/512) | `✓` | `✗` | `✗` | `✗` | `✓` | `✓` |
-| Deep `cookies.clear()` Sync Across FFI | `✓` | `✓` | `✓` | `✗` Broken | `✓` | `✓` |
-| Built-in WAF `resp.challenge` Detector | `✓` | `✗` | `✗` | `✗` | `✗` | `✗` |
-| Playwright `storage_state.json` & Solver Bridge | `✓` | `✗` | `✗` | `✗` | `✗` | `✗` |
-| Wireshark `keylog_file` & HAR 1.2 Export | `✓` | `✗` | `✗` | `✗` | `✗` | `✗` |
-| Memory Safety (No CGo / Manual Free) | `✓` Rust RAII | `◐` C/CFFI | `✓` Rust RAII | `✗` Go CGo leaks | `✓` Python | `✓` Python |
+Head-to-head against Python HTTP clients that impersonate browser TLS (JA3/JA4) and HTTP/2 fingerprints. Plain clients such as `requests` and `httpx` are excluded because they expose an OpenSSL ClientHello and cannot impersonate a browser.
+
+| Capability | http_tls | curl_cffi | primp / rnet | tls-client |
+| :--- | :--- | :--- | :--- | :--- |
+| Fingerprint engine | Rust + BoringSSL (`wreq`) | libcurl-impersonate (C/CFFI) | Rust + BoringSSL | Go `utls` (CGo) |
+| Browser TLS / JA4 / HTTP/2 presets | `✓` 100+ incl. Safari iOS, OkHttp, Tor | `✓` | `✓` | `✓` |
+| Custom JA3, TLS & H2 Options | `✓` | `✓` | `◐` | `✓` |
+| Exact Wire Header Order (`OrigHeaderMap`) | `✓` | `◐` | `✓` | `✓` |
+| Native Event-Loop Async | `✓` Tokio | `✓` libcurl | `✓` Tokio | `✗` |
+| Sync Parallel `gather()` (No `async/await`) | `✓` Rust Tokio | `✗` | `✗` | `✗` |
+| `requests` + `httpx` + `curl_cffi` Drop-in | `✓` | `◐` `requests`-style | `◐` `requests`-style | `◐` `requests`-style |
+| Async Hickory DNS & Custom `resolve` | `✓` | `◐` `resolve` only | `◐` | `✗` |
+| Outbound IPv4 / IPv6 `/64` Socket Binding | `✓` | `✓` | `◐` | `✗` |
+| TLS-Impersonated WebSockets (Sync & Async) | `✓` | `✓` | `◐` | `✗` |
+| Streaming, Multipart, Custom CA, mTLS | `✓` | `✓` | `◐` | `◐` |
+| RFC 7616 `DigestAuth` (MD5/SHA-256/512) | `✓` | `✗` | `✗` | `✗` |
+| Deep `cookies.clear()` Sync Across FFI | `✓` | `✓` | `✓` | `✗` Broken |
+| Built-in WAF `resp.challenge` Detector | `✓` | `✗` | `✗` | `✗` |
+| Playwright `storage_state.json` & Solver Bridge | `✓` | `✗` | `✗` | `✗` |
+| Wireshark `keylog_file` & HAR 1.2 Export | `✓` | `✗` | `✗` | `✗` |
+| Memory Safety (No CGo / Manual Free) | `✓` Rust RAII | `◐` C/CFFI | `✓` Rust RAII | `✗` Go CGo leaks |
 
 > Legend: `✓` Native / full support · `◐` Partial / indirect · `✗` Not built-in
 
@@ -117,8 +120,6 @@ Reproduce locally with `python benchmarks/bench_vs_competitors.py`:
 | :--- | ---: | ---: | ---: |
 | `▸` `http_tls` (Rust BoringSSL) | 38.0 ms | 24.4 req/s | 16.4 KB |
 | `▸` `curl_cffi` | 47.2 ms | 10.4 req/s | 19.2 KB |
-| `▸` `httpx` (HTTP/2, no TLS impersonation) | 40.0 ms | 15.7 req/s | 249.3 KB |
-| `▸` `requests` (HTTP/1.1) | 46.6 ms | 22.1 req/s | 170.7 KB |
 
 **Concurrent Asynchronous Benchmark (30 simultaneous requests):**
 
@@ -126,9 +127,8 @@ Reproduce locally with `python benchmarks/bench_vs_competitors.py`:
 | :--- | ---: | ---: | ---: |
 | `▸` `http_tls.AsyncSession` (Native Tokio) | 2.9 ms | 346.0 req/s | 200.0 KB |
 | `▸` `curl_cffi.AsyncSession` | 4.7 ms | 211.4 req/s | 234.6 KB |
-| `▸` `httpx.AsyncClient` | 6.5 ms | 153.0 req/s | 525.0 KB |
 
-In concurrent workloads, `http_tls` delivers **1.64x higher throughput than `curl_cffi`** and **2.26x higher throughput than `httpx`** while allocating **62% less Python heap memory than `httpx`**.
+Against `curl_cffi`, the most widely used fingerprinting client, `http_tls` delivers **1.24x faster median sync latency**, **2.35x higher sync throughput**, and **1.64x higher async throughput** at 30-way concurrency while allocating less Python heap memory.
 
 ---
 
@@ -658,7 +658,7 @@ pip install -e ".[test]"
 pytest -v tests/
 ```
 
-Run the live throughput and memory benchmark against `curl_cffi`, `httpx`, and `requests`:
+Run the live throughput and memory benchmark against `curl_cffi`:
 
 ```bash
 python benchmarks/bench_vs_competitors.py --url https://www.cloudflare.com/cdn-cgi/trace --n 15 --concurrency 30
