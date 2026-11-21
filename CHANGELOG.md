@@ -2,6 +2,17 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [0.6.1] - 2026-11-21
+
+### Added
+- **Complete Drop-in API Parity (`requests` + `httpx` + `curl_cffi`):**
+  - Context-manager streaming: `http_tls.stream()`, `client.stream()`, and `async with async_client.stream()`.
+  - `AsyncSession`: `await client.aclose()`, `await client.solve_challenge()`, `is_closed`, session-level default `params`.
+  - `Session`: `is_closed`, session-level default `params`, `http_tls.session()` factory.
+  - `Response`: `iter_bytes()`, `iter_text()`, `aiter_content()`, `aiter_text()`, `acontent()`, `atext()`, `reason_phrase`, `is_permanent_redirect`, `has_redirect_location`, `num_bytes_downloaded`, RFC 8288 `links`.
+  - `Cookies`: `get_dict()`.
+  - Exception aliases: `HTTPStatusError`, `ConnectError`, `TimeoutException`, `RequestError`, `RequestsError`, `InvalidURL`.
+
 ## [0.6.0] - 2026-11-21
 
 ### Added

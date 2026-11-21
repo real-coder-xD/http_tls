@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+from contextlib import asynccontextmanager, contextmanager
 import datetime as _dt
 from enum import Enum
 import inspect
@@ -50,7 +51,7 @@ try:
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.6.0"
+    __version__ = "0.6.1"
 
     def _rust_presets() -> List[str]:
         return []
@@ -357,6 +358,10 @@ class Cookies(dict):
         if name in self:
             del self[name]
 
+    def get_dict(self) -> Dict[str, str]:
+        """Return cookies as a plain dictionary (requests & curl_cffi compatible)."""
+        return dict(self)
+
 
 class _OkDescriptor:
     def __init__(self, is_ok: bool):
@@ -409,6 +414,7 @@ class Response:
         self._closer = closer
         self._content: Optional[bytes] = None if (raw_chunks is not None or async_stream is not None) else (content or b"")
         self._text = text
+        self._num_bytes_downloaded: int = len(self._content) if self._content is not None else 0
 
     @property
     def content(self) -> bytes:
@@ -436,6 +442,7 @@ class Response:
                         if chunk is None:
                             return
                         if chunk:
+                            self._num_bytes_downloaded += len(chunk)
                             yield chunk
                 finally:
                     self.close()
@@ -445,6 +452,7 @@ class Response:
         try:
             for chunk in chunks:
                 if chunk:
+                    self._num_bytes_downloaded += len(chunk)
                     yield chunk
         finally:
             self.close()
@@ -492,6 +500,7 @@ class Response:
                 chunk = bytes(raw)
                 if not chunk:
                     continue
+                self._num_bytes_downloaded += len(chunk)
                 if chunk_size is None:
                     yield chunk
                 else:
@@ -582,6 +591,18 @@ class Response:
         return 300 <= self.status_code < 400
 
     @property
+    def is_permanent_redirect(self) -> bool:
+        return self.status_code in (301, 308) and "location" in self.headers
+
+    @property
+    def has_redirect_location(self) -> bool:
+        return self.is_redirect and "location" in self.headers
+
+    @property
+    def num_bytes_downloaded(self) -> int:
+        return self._num_bytes_downloaded
+
+    @property
     def is_client_error(self) -> bool:
         return 400 <= self.status_code < 500
 
@@ -602,6 +623,41 @@ class Response:
             self._content = b"".join(chunks)
         return self._content
 
+    async def acontent(self) -> bytes:
+        """Asynchronously read response bytes (curl_cffi compatible)."""
+        return await self.aread()
+
+    async def atext(self) -> str:
+        """Asynchronously read and decode response text (curl_cffi compatible)."""
+        raw = await self.aread()
+        if self._text is None:
+            self._text = raw.decode(self.encoding or "utf-8", errors="replace")
+        return self._text
+
+    def iter_bytes(self, chunk_size: Optional[int] = None) -> Iterator[bytes]:
+        """Iterate over response bytes (httpx compatible)."""
+        return self.iter_content(chunk_size=chunk_size, decode_unicode=False)
+
+    def iter_text(self, chunk_size: Optional[int] = None) -> Iterator[str]:
+        """Iterate over decoded response text chunks (httpx compatible)."""
+        return self.iter_content(chunk_size=chunk_size, decode_unicode=True)
+
+    async def aiter_content(self, chunk_size: Optional[int] = None) -> AsyncIterator[bytes]:
+        """Asynchronously iterate over response bytes (curl_cffi compatible)."""
+        async for chunk in self.aiter_bytes(chunk_size=chunk_size):
+            yield chunk
+
+    async def aiter_text(self, chunk_size: Optional[int] = None) -> AsyncIterator[str]:
+        """Asynchronously iterate over decoded text chunks (httpx compatible)."""
+        decoder = codecs.getincrementaldecoder(self.encoding or "utf-8")(errors="replace")
+        async for chunk in self.aiter_bytes(chunk_size=chunk_size):
+            out = decoder.decode(chunk)
+            if out:
+                yield out
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            yield tail
+
     @property
     def reason(self) -> str:
         try:
@@ -609,6 +665,32 @@ class Response:
             return HTTPStatus(self.status_code).phrase
         except ValueError:
             return ""
+
+    @property
+    def reason_phrase(self) -> str:
+        """HTTP reason phrase (httpx compatible alias for `reason`)."""
+        return self.reason
+
+    @property
+    def links(self) -> Dict[str, Dict[str, str]]:
+        """Parse RFC 8288 `Link` header into `{rel: {"url": ..., "rel": ...}}` (requests/httpx compatible)."""
+        header = self.headers.get("link", "")
+        if not header:
+            return {}
+        out: Dict[str, Dict[str, str]] = {}
+        for part in header.split(","):
+            seg = part.strip()
+            if not seg or not seg.startswith("<") or ">" not in seg:
+                continue
+            url_val, _, rest = seg[1:].partition(">")
+            entry: Dict[str, str] = {"url": url_val.strip()}
+            for param in rest.split(";"):
+                if "=" in param:
+                    k, _, v = param.partition("=")
+                    entry[k.strip().lower()] = v.strip().strip('"').strip("'")
+            key = entry.get("rel") or entry["url"]
+            out[key] = entry
+        return out
 
     @property
     def challenge(self) -> Optional[str]:
@@ -786,6 +868,7 @@ class Session:
         max_redirects: int = 10,
         headers: Optional[Dict[str, str]] = None,
         header_order: Optional[Sequence[str]] = None,
+        params: Optional[Dict[str, Any]] = None,
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Union[Tuple[str, str], AuthBase]] = None,
         cert: Union[str, Tuple[str, str], None] = None,
@@ -848,7 +931,9 @@ class Session:
         }
 
         self.headers = CaseInsensitiveDict(headers or {})
+        self.params: Dict[str, Any] = dict(params or {})
         self.cookies = Cookies(cookies, on_clear=self._clear_backend_cookies)
+        self._closed = False
         p_val = _extract_proxy(proxy, proxies)
         self.proxies = dict(proxies) if proxies else ({"all": proxy, "http": proxy, "https": proxy} if proxy else {})
 
@@ -1195,6 +1280,13 @@ class Session:
         if headers:
             req_headers.update(headers)
 
+        merged_params: Optional[Dict[str, str]] = None
+        if self.params or params:
+            mp: Dict[str, Any] = dict(self.params)
+            if params:
+                mp.update(params)
+            merged_params = {str(k): str(v) for k, v in mp.items()}
+
         req_cookies = dict(self.cookies)
         if cookies:
             req_cookies.update(cookies)
@@ -1232,7 +1324,7 @@ class Session:
         return dict(
             method=method,
             url=url,
-            params={k: str(v) for k, v in params.items()} if params else None,
+            params=merged_params,
             headers=req_headers or None,
             cookies=req_cookies or None,
             data=body,
@@ -1403,6 +1495,13 @@ class Session:
         req_headers = dict(self.headers.items())
         if headers:
             req_headers.update(headers)
+
+        merged_params: Optional[Dict[str, str]] = None
+        if self.params or params:
+            mp: Dict[str, Any] = dict(self.params)
+            if params:
+                mp.update(params)
+            merged_params = {str(k): str(v) for k, v in mp.items()}
         req_cookies = dict(self.cookies)
         if cookies:
             req_cookies.update(cookies)
@@ -1417,7 +1516,7 @@ class Session:
         r = self._session.request(
             method=method.upper(),
             url=url,
-            params=params,
+            params=merged_params,
             headers=req_headers,
             cookies=req_cookies,
             data=data,
@@ -1497,7 +1596,22 @@ class Session:
     def options(self, url: str, **kwargs: Any) -> Response:
         return self.request("OPTIONS", url, **kwargs)
 
+    @contextmanager
+    def stream(self, method: str, url: str, **kwargs: Any) -> Iterator[Response]:
+        """Context-manager streaming request (httpx & curl_cffi compatible)."""
+        kwargs["stream"] = True
+        resp = self.request(method, url, **kwargs)
+        try:
+            yield resp
+        finally:
+            resp.close()
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
     def close(self) -> None:
+        self._closed = True
         if hasattr(self._session, "close"):
             self._session.close()
 
@@ -1526,8 +1640,20 @@ class AsyncSession:
     def cookies(self) -> Cookies:
         return self._sync_session.cookies
 
+    @property
+    def params(self) -> Dict[str, Any]:
+        return self._sync_session.params
+
+    @property
+    def is_closed(self) -> bool:
+        return self._sync_session.is_closed
+
     def clear_cookies(self) -> None:
         self._sync_session.clear_cookies()
+
+    async def solve_challenge(self, url_or_resp: Union[str, Response]) -> bool:
+        """Asynchronously attempt to solve an anti-bot challenge and inject clearance into this AsyncSession."""
+        return await asyncio.to_thread(self._sync_session.solve_challenge, url_or_resp)
 
     def load_storage_state(self, state: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         return self._sync_session.load_storage_state(state)
@@ -1692,6 +1818,20 @@ class AsyncSession:
     async def options(self, url: str, **kwargs: Any) -> Response:
         return await self.request("OPTIONS", url, **kwargs)
 
+    @asynccontextmanager
+    async def stream(self, method: str, url: str, **kwargs: Any) -> AsyncIterator[Response]:
+        """Async context-manager streaming request (httpx & curl_cffi compatible)."""
+        kwargs["stream"] = True
+        resp = await self.request(method, url, **kwargs)
+        try:
+            yield resp
+        finally:
+            await resp.aclose()
+
+    async def aclose(self) -> None:
+        """Close the async client (httpx compatible)."""
+        self._sync_session.close()
+
     async def close(self) -> None:
         self._sync_session.close()
 
@@ -1769,6 +1909,24 @@ def head(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs
 
 def options(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
     return request("OPTIONS", url, impersonate=impersonate, **kwargs)
+
+
+@contextmanager
+def stream(
+    method: str, url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any
+) -> Iterator[Response]:
+    """Top-level context-manager streaming request (httpx.stream compatible)."""
+    kwargs["stream"] = True
+    resp = request(method, url, impersonate=impersonate, **kwargs)
+    try:
+        yield resp
+    finally:
+        resp.close()
+
+
+def session(**kwargs: Any) -> Session:
+    """Factory returning a new Session (requests.session compatible)."""
+    return Session(**kwargs)
 
 
 def gather(

@@ -12,13 +12,19 @@ import sys
 from http_tls import auth, challenge, exceptions, requests, status_codes, structures
 from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
 from http_tls.exceptions import (
+    ConnectError,
     ConnectTimeout,
     ConnectionError,
     HTTPError,
+    HTTPStatusError,
+    InvalidURL,
     ReadTimeout,
+    RequestError,
     RequestException,
+    RequestsError,
     SSLError,
     Timeout,
+    TimeoutException,
     TooManyRedirects,
 )
 from http_tls.requests import (
@@ -41,6 +47,8 @@ from http_tls.requests import (
     post,
     put,
     request,
+    session,
+    stream,
     supported_presets,
 )
 from http_tls.status_codes import codes
@@ -49,7 +57,7 @@ from http_tls.structures import CaseInsensitiveDict
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "0.6.0"
+    __version__ = "0.6.1"
 
 sys.modules["http_tls.requests"] = requests
 
@@ -66,13 +74,19 @@ __all__ = [
     "BearerAuth",
     "DigestAuth",
     "RequestException",
+    "RequestError",
+    "RequestsError",
     "HTTPError",
+    "HTTPStatusError",
     "ConnectionError",
+    "ConnectError",
     "Timeout",
+    "TimeoutException",
     "ConnectTimeout",
     "ReadTimeout",
     "SSLError",
     "TooManyRedirects",
+    "InvalidURL",
     "Response",
     "Session",
     "AsyncSession",
@@ -84,6 +98,8 @@ __all__ = [
     "BrowserType",
     "parse_ja3_to_tls_options",
     "gather",
+    "stream",
+    "session",
     "request",
     "get",
     "post",

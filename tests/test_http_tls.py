@@ -731,3 +731,76 @@ def test_tls_keylog_file_and_hickory_dns():
         # Give async keylog writer channel a brief moment to flush
         time.sleep(0.1)
         assert os.path.exists(kl_path) and os.path.getsize(kl_path) > 0
+
+
+# ---------------------------------------------------------------------------
+# 8. Complete Drop-in API Parity (httpx / requests / curl_cffi methods & aliases)
+# ---------------------------------------------------------------------------
+def test_dropin_api_completeness_httpx_requests_cffi(http_server):
+    base, _port = http_server
+
+    # requests.session() factory + session-level default params + cookies.get_dict() + is_closed
+    s = requests.session(base_url=base, params={"api_key": "k1"})
+    assert not s.is_closed
+    r = s.get("/echo", params={"page": "2"})
+    assert "api_key=k1" in r.json()["path"] and "page=2" in r.json()["path"]
+    assert r.reason_phrase == "OK"
+    assert r.num_bytes_downloaded == len(r.content) and r.num_bytes_downloaded > 0
+
+    s.get("/set")
+    assert s.cookies.get_dict()["a"] == "1"
+
+    # Redirect inspection properties + RFC 8288 Link header parser
+    r302 = s.get("/set", allow_redirects=False)
+    assert r302.has_redirect_location and not r302.is_permanent_redirect
+    r_link = http_tls.Response(
+        200,
+        {"Link": '<https://api.example.com/items?page=2>; rel="next", <https://api.example.com/items?page=5>; rel="last"'},
+        "https://api.example.com/items?page=1",
+        b"[]",
+        "[]",
+    )
+    assert r_link.links["next"]["url"] == "https://api.example.com/items?page=2"
+    assert r_link.links["last"]["url"] == "https://api.example.com/items?page=5"
+
+    # httpx.stream() & client.stream() sync context managers + iter_bytes() / iter_text()
+    with httpx.stream("GET", f"{base}/stream") as sr:
+        raw = b"".join(sr.iter_bytes(chunk_size=6))
+        assert raw.startswith(b"line0\n") and sr.num_bytes_downloaded == len(raw)
+
+    with s.stream("GET", "/stream") as sr2:
+        txt = "".join(sr2.iter_text(chunk_size=6))
+        assert "line4" in txt
+
+    s.close()
+    assert s.is_closed
+
+    # Exception aliases (httpx + curl_cffi)
+    assert http_tls.HTTPStatusError is http_tls.HTTPError
+    assert http_tls.ConnectError is http_tls.ConnectionError
+    assert http_tls.TimeoutException is http_tls.Timeout
+    assert http_tls.RequestError is http_tls.RequestException
+    assert http_tls.RequestsError is http_tls.RequestException
+
+    # AsyncClient: stream(), aiter_content(), aiter_text(), acontent(), atext(), aclose(), is_closed
+    async def run_async_dropin():
+        client = httpx.AsyncClient(base_url=base, params={"v": "1"})
+        assert not client.is_closed
+        async with client.stream("GET", "/stream") as sr:
+            chunks = [c async for c in sr.aiter_content(chunk_size=5)]
+            assert b"".join(chunks).startswith(b"line0\n")
+            assert sr.num_bytes_downloaded == len(b"".join(chunks))
+
+        async with client.stream("GET", "/stream") as sr2:
+            txt_chunks = [t async for t in sr2.aiter_text(chunk_size=5)]
+            assert "line3" in "".join(txt_chunks)
+
+        async with client.stream("GET", "/echo") as sr3:
+            body_text = await sr3.atext()
+            body_bytes = await sr3.acontent()
+            assert "v=1" in body_text and len(body_bytes) > 0
+
+        await client.aclose()
+        assert client.is_closed
+
+    asyncio.run(run_async_dropin())
