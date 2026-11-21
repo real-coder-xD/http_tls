@@ -5,16 +5,50 @@ build-backend = "maturin"
 [project]
 name = "http-tls"
 version = "0.6.1"
-description = "Standalone Rust + BoringSSL TLS (JA3/JA4) & HTTP/2 Browser Impersonating HTTP client for Python"
+description = "Standalone Rust + BoringSSL TLS (JA3/JA4) & HTTP/2 Browser-Impersonating HTTP Client for Python (drop-in for requests, httpx, curl_cffi)"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
+keywords = [
+    "http",
+    "http2",
+    "tls",
+    "ja3",
+    "ja4",
+    "boringssl",
+    "impersonate",
+    "browser-impersonation",
+    "tls-fingerprint",
+    "rust",
+    "pyo3",
+    "tokio",
+    "requests",
+    "httpx",
+    "curl-cffi",
+    "websocket",
+    "scraping",
+    "async",
+]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: WWW/HTTP",
-    "Topic :: Software Development :: Libraries :: Python Modules"
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = []
 
@@ -25,6 +59,9 @@ test = ["pytest>=8.0", "cryptography>=42.0", "certifi"]
 
 [project.urls]
 Homepage = "https://github.com/real-coder-xD/http_tls"
+Repository = "https://github.com/real-coder-xD/http_tls"
+Documentation = "https://github.com/real-coder-xD/http_tls#readme"
+Changelog = "https://github.com/real-coder-xD/http_tls/blob/main/CHANGELOG.md"
 Issues = "https://github.com/real-coder-xD/http_tls/issues"
 
 [tool.maturin]
