@@ -1,6 +1,6 @@
 [package]
 name = "http_tls"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 description = "Rust native BoringSSL TLS & HTTP/2 browser-impersonating core for http_tls"
 license = "MIT"
