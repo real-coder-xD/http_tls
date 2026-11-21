@@ -126,13 +126,13 @@ jobs:
           python -m pip install dist/*.whl
           python -m pytest -v tests/
 
-      - name: Verify ABI3 wheel compatibility on Python 3.9
+      - name: Verify ABI3 wheel compatibility on Python 3.13
         if: ${{ matrix.os == 'ubuntu-latest' }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.13'
 
-      - name: Run pytest on Python 3.9
+      - name: Run pytest on Python 3.13
         if: ${{ matrix.os == 'ubuntu-latest' }}
         shell: bash
         run: |
