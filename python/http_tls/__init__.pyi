@@ -24,14 +24,14 @@ from http_tls.structures import CaseInsensitiveDict
 __version__: str
 requests: Any
 solvers: Any
+STABLE_PRESETS: Tuple[str, ...]
+
+def infer_impersonate_from_user_agent(ua: str) -> Optional[str]: ...
+def run_coroutine_sync(coro: Any, timeout: Optional[float] = None) -> Dict[str, Any]: ...
 
 class BrowserType(str, Enum):
-    chrome152 = "chrome_152"
-    chrome152_macos = "chrome_152_macos"
-    chrome151 = "chrome_151"
-    chrome151_macos = "chrome_151_macos"
-    chrome150 = "chrome_150"
     chrome149 = "chrome_149"
+    chrome149_macos = "chrome_149_macos"
     chrome148 = "chrome_148"
     chrome147 = "chrome_147"
     chrome146 = "chrome_146"
@@ -66,7 +66,6 @@ class BrowserType(str, Enum):
     chrome107 = "chrome_107"
     chrome104 = "chrome_104"
     chrome100 = "chrome_100"
-    edge152 = "edge_152"
     edge148 = "edge_148"
     edge147 = "edge_147"
     edge146 = "edge_146"
@@ -78,7 +77,6 @@ class BrowserType(str, Enum):
     edge127 = "edge_127"
     edge122 = "edge_122"
     edge101 = "edge_101"
-    safari27 = "safari_27"
     safari26_4 = "safari_26_4"
     safari26_3 = "safari_26_3"
     safari26_2 = "safari_26_2"
@@ -90,12 +88,9 @@ class BrowserType(str, Enum):
     safari184 = "safari_18_4"
     safari180 = "safari_18"
     safari18 = "safari_18"
-    safari170 = "safari_17"
-    safari17 = "safari_17"
+    safari170 = "safari_17_0"
+    safari17 = "safari_17_0"
     safari155 = "safari_15_5"
-    firefox155 = "firefox_155"
-    firefox154 = "firefox_154"
-    firefox153 = "firefox_153"
     firefox151 = "firefox_151"
     firefox150 = "firefox_150"
     firefox149 = "firefox_149"
@@ -133,6 +128,9 @@ class BestDriverSolver:
     wait_cookies: Tuple[str, ...]
     browser_path: Optional[str]
     extra_args: Optional[List[str]]
+    keep_warm: bool
+    cache_ttl: float
+    click_turnstile: bool
     def __init__(
         self,
         headless: bool = True,
@@ -141,9 +139,14 @@ class BestDriverSolver:
         wait_cookies: Sequence[str] = ...,
         browser_path: Optional[str] = None,
         extra_args: Optional[Sequence[str]] = None,
+        keep_warm: bool = False,
+        cache_ttl: float = 15.0,
+        click_turnstile: bool = True,
     ) -> None: ...
     async def asolve(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
-    def __call__(self, url: str, resp: Any = None) -> Any: ...
+    def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
+    async def aclose(self) -> None: ...
+    def close(self) -> None: ...
 
 class PlaywrightSolver:
     headless: bool
@@ -151,6 +154,8 @@ class PlaywrightSolver:
     proxy: Optional[str]
     wait_cookies: Tuple[str, ...]
     browser_type: str
+    cache_ttl: float
+    click_turnstile: bool
     def __init__(
         self,
         headless: bool = True,
@@ -158,6 +163,8 @@ class PlaywrightSolver:
         proxy: Optional[str] = None,
         wait_cookies: Sequence[str] = ...,
         browser_type: str = "chromium",
+        cache_ttl: float = 15.0,
+        click_turnstile: bool = True,
     ) -> None: ...
     def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
 
@@ -165,11 +172,13 @@ class FlareSolverrSolver:
     endpoint: str
     max_timeout_ms: int
     proxy: Optional[str]
+    cache_ttl: float
     def __init__(
         self,
         endpoint: str = "http://localhost:8191/v1",
         max_timeout_ms: int = 60000,
         proxy: Optional[str] = None,
+        cache_ttl: float = 15.0,
     ) -> None: ...
     def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
 
@@ -213,12 +222,32 @@ class MockTransport:
     async def handle_async_request(self, request_ctx: Dict[str, Any]) -> "Response": ...
 
 class Cookies(dict):
-    def __init__(self, initial: Optional[Dict[str, str]] = None, on_clear: Optional[Callable[[], None]] = None) -> None: ...
+    def __init__(
+        self,
+        initial: Optional[Dict[str, str]] = None,
+        on_clear: Optional[Callable[[], None]] = None,
+        on_set: Optional[Callable[[str, str, Optional[str], Optional[str], bool, bool], None]] = None,
+        on_delete: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
+    ) -> None: ...
     def clear(self) -> None: ...
-    def set(self, name: str, value: str, domain: Optional[str] = None, path: Optional[str] = None) -> None: ...
-    def get(self, name: str, default: Any = None) -> Any: ...
-    def delete(self, name: str) -> None: ...
-    def get_dict(self) -> Dict[str, str]: ...
+    def set(
+        self,
+        name: str,
+        value: str,
+        domain: Optional[str] = None,
+        path: Optional[str] = None,
+        secure: bool = False,
+        http_only: bool = False,
+    ) -> None: ...
+    def get(
+        self,
+        name: str,
+        default: Any = None,
+        domain: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> Any: ...
+    def delete(self, name: str, domain: Optional[str] = None, path: Optional[str] = None) -> None: ...
+    def get_dict(self, domain: Optional[str] = None, path: Optional[str] = None) -> Dict[str, str]: ...
 
 class Response:
     status_code: int
@@ -400,7 +429,8 @@ class Session:
         **kwargs: Any,
     ) -> None: ...
     def clear_cookies(self) -> None: ...
-    def load_storage_state(self, state: Union[str, Dict[str, Any]]) -> Dict[str, Any]: ...
+    def set_impersonate(self, preset: Union[str, BrowserType]) -> None: ...
+    def load_storage_state(self, state: Union[str, Dict[str, Any]], sync_impersonate: bool = True) -> Dict[str, Any]: ...
     def save_storage_state(self, path: Optional[str] = None) -> Dict[str, Any]: ...
     def export_har(self, path: Optional[str] = None) -> Dict[str, Any]: ...
     def clear_har(self) -> None: ...
@@ -453,6 +483,7 @@ class Session:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None: ...
 
 class AsyncSession:
+    impersonate: str
     headers: CaseInsensitiveDict
     cookies: Cookies
     params: Dict[str, Any]
@@ -463,7 +494,8 @@ class AsyncSession:
     @property
     def is_closed(self) -> bool: ...
     def clear_cookies(self) -> None: ...
-    def load_storage_state(self, state: Union[str, Dict[str, Any]]) -> Dict[str, Any]: ...
+    def set_impersonate(self, preset: Union[str, BrowserType]) -> None: ...
+    def load_storage_state(self, state: Union[str, Dict[str, Any]], sync_impersonate: bool = True) -> Dict[str, Any]: ...
     def save_storage_state(self, path: Optional[str] = None) -> Dict[str, Any]: ...
     def export_har(self, path: Optional[str] = None) -> Dict[str, Any]: ...
     def clear_har(self) -> None: ...

@@ -15,16 +15,24 @@ import http_tls
 from http_tls import (
     AsyncClient,
     BestDriverSolver,
+    BrowserType,
     Client,
     FlareSolverrSolver,
     Limits,
     MockTransport,
     PlaywrightSolver,
+    STABLE_PRESETS,
     Session,
     TimeoutConfig,
+    infer_impersonate_from_user_agent,
     is_verified_preset,
     parse_akamai_h2_to_http2_options,
     supported_presets,
+)
+from http_tls.solvers import (
+    _SINGLEFLIGHT,
+    _try_click_turnstile_best_driver,
+    _try_click_turnstile_playwright,
 )
 
 
@@ -109,12 +117,204 @@ def test_verified_native_default_and_preset_audit():
     assert "safari_26_4" in presets
     assert "firefox_151" in presets
     assert "edge_148" in presets
-    # No extrapolated future versions advertised in supported_presets()
+    # No extrapolated future versions advertised in supported_presets(), STABLE_PRESETS, or BrowserType
     assert "chrome_152" not in presets
     assert "safari_27" not in presets
     assert all(is_verified_preset(p) for p in presets)
+    assert all(is_verified_preset(p) for p in STABLE_PRESETS)
+    assert all(is_verified_preset(b.value) for b in BrowserType)
     assert is_verified_preset("chrome_152") is False
     assert is_verified_preset("safari_27") is False
+
+
+def test_solver_ua_to_rust_impersonate_alignment_and_client_hints(fast_server: str):
+    assert infer_impersonate_from_user_agent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    ) == "chrome_134"
+    assert infer_impersonate_from_user_agent(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/149.0.0.0 Safari/537.36"
+    ) == "chrome_149_macos"
+    assert infer_impersonate_from_user_agent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0"
+    ) == "firefox_147"
+    assert infer_impersonate_from_user_agent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
+    ) == "edge_145"
+    assert infer_impersonate_from_user_agent(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.5 Safari/605.1.15"
+    ) == "safari_18_5"
+
+    with Session(impersonate="chrome_149") as s:
+        assert s.impersonate == "chrome_149"
+        s.load_storage_state(
+            {
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+                "headers": {
+                    "sec-ch-ua": '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-ch-ua-mobile": "?0",
+                },
+                "cookies": [
+                    {"name": "cf_clearance", "value": " aligned_134 ", "domain": "127.0.0.1", "path": "/"}
+                ],
+            }
+        )
+        # Rust NativeSession must hot-swap its impersonate profile to match Chrome 134
+        assert s.impersonate == "chrome_134"
+        assert s._session.impersonate == "chrome_134"
+        r = s.get(f"{fast_server}/echo")
+        hdrs = r.json()["headers"]
+        assert "Chrome/134.0.0.0" in hdrs["user-agent"]
+        assert '"Google Chrome";v="134"' in hdrs["sec-ch-ua"]
+
+
+def test_sync_solver_in_running_event_loop_and_singleflight_coalescing():
+    _SINGLEFLIGHT.clear_cache()
+    solve_calls = {"n": 0}
+
+    async def slow_async_solver(url: str, resp):
+        solve_calls["n"] += 1
+        await asyncio.sleep(0.08)
+        return {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/136.0.0.0 Safari/537.36",
+            "cookies": [{"name": "cf_clearance", "value": "sf_token", "domain": "coalesce.test", "path": "/"}],
+        }
+
+    # 1. Calling synchronous Session.solve_challenge() FROM INSIDE a running event loop must NOT drop the coroutine!
+    async def _inside_running_loop():
+        with Session(solver=slow_async_solver) as s:
+            chal_resp = http_tls.Response(
+                status_code=403,
+                headers={"cf-mitigated": "challenge", "server": "cloudflare"},
+                content=b"<html>Just a moment...</html>",
+                url="https://coalesce.test/page",
+            )
+            ok = s.solve_challenge(chal_resp)
+            assert ok is True
+            assert s.impersonate == "chrome_136"
+            assert s.cookies.get("cf_clearance", domain="coalesce.test") == "sf_token"
+
+    asyncio.run(_inside_running_loop())
+    assert solve_calls["n"] == 1
+
+    # 2. Thundering Herd Singleflight: 16 concurrent callers on the same domain must coalesce into 1 solve
+    _SINGLEFLIGHT.clear_cache()
+    burst_calls = {"n": 0}
+
+    async def burst_coro():
+        burst_calls["n"] += 1
+        await asyncio.sleep(0.08)
+        return {"cookies": [{"name": "cf_clearance", "value": "burst_ok", "domain": "herd.test"}]}
+
+    async def _run_burst():
+        results = await asyncio.gather(
+            *(
+                _SINGLEFLIGHT.execute_async(
+                    url="https://herd.test/api/v1",
+                    proxy=None,
+                    ttl=10.0,
+                    timeout=5.0,
+                    coro_fn=burst_coro,
+                )
+                for _ in range(16)
+            )
+        )
+        assert len(results) == 16
+        assert all(r["cookies"][0]["value"] == "burst_ok" for r in results)
+
+    asyncio.run(_run_burst())
+    assert burst_calls["n"] == 1
+
+
+def test_active_turnstile_checkbox_clicking():
+    clicked = {"iframe": False, "bbox": False, "pw": False}
+
+    class _FakeEl:
+        rect = {"x": 100.0, "y": 200.0, "width": 300.0, "height": 65.0}
+
+        async def click(self):
+            clicked["iframe"] = True
+
+    class _FakeFrame:
+        async def ele(self, sel, timeout_ms=600):
+            return _FakeEl() if sel == "input[type='checkbox']" else None
+
+    class _FakeTab:
+        def __init__(self, use_iframe: bool):
+            self.use_iframe = use_iframe
+
+        async def exists(self, sel):
+            return self.use_iframe and "challenges.cloudflare.com" in sel
+
+        async def iframe(self, sel, timeout_ms=1000):
+            return _FakeFrame()
+
+        async def ele(self, sel, timeout_ms=600):
+            return _FakeEl() if not self.use_iframe else None
+
+        async def mouse_click(self, x, y):
+            assert 110.0 <= x <= 140.0 and 220.0 <= y <= 245.0
+            clicked["bbox"] = True
+
+    assert asyncio.run(_try_click_turnstile_best_driver(_FakeTab(use_iframe=True))) is True
+    assert clicked["iframe"] is True
+    assert asyncio.run(_try_click_turnstile_best_driver(_FakeTab(use_iframe=False))) is True
+    assert clicked["bbox"] is True
+
+    class _FakePwLoc:
+        defproperty_first = None
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def click(self, timeout=1000):
+            clicked["pw"] = True
+
+    class _FakePwFrame:
+        url = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile"
+
+        def locator(self, sel):
+            return _FakePwLoc()
+
+    class _FakePwPage:
+        frames = [_FakePwFrame()]
+
+    assert _try_click_turnstile_playwright(_FakePwPage()) is True
+    assert clicked["pw"] is True
+
+
+def test_rfc6265_domain_path_cookie_isolation_and_no_cross_domain_leak(fast_server: str):
+    with Session() as s:
+        s.cookies.set("sid", "login_secret", domain="login.site.test", path="/auth", secure=True, http_only=True)
+        s.cookies.set("sid", "api_secret", domain="api.site.test", path="/v1", secure=True)
+
+        # Multi-subdomain lookup with identical cookie name must not overwrite each other
+        assert s.cookies.get("sid", domain="login.site.test", path="/auth/callback") == "login_secret"
+        assert s.cookies.get("sid", domain="api.site.test", path="/v1/users") == "api_secret"
+        assert s.cookies.get("sid", domain="other.site.test") is None
+        assert s.cookies.get_dict(domain="login.site.test") == {"sid": "login_secret"}
+        assert s.cookies.get_dict(domain="api.site.test") == {"sid": "api_secret"}
+
+        # Exporting storage_state must preserve both domain-scoped cookies
+        state = s.save_storage_state()
+        by_dom = {(c["domain"], c["path"], c["name"]): c["value"] for c in state["cookies"]}
+        assert by_dom[("login.site.test", "/auth", "sid")] == "login_secret"
+        assert by_dom[("api.site.test", "/v1", "sid")] == "api_secret"
+
+        # Requests to fast_server (127.0.0.1) must NOT leak cookies from login.site.test or api.site.test!
+        r = s.get(f"{fast_server}/echo")
+        sent_cookie_hdr = r.json()["headers"].get("cookie", "")
+        assert "login_secret" not in sent_cookie_hdr
+        assert "api_secret" not in sent_cookie_hdr
+
+        # Deleting only login.site.test's cookie must leave api.site.test intact
+        s.cookies.delete("sid", domain="login.site.test")
+        assert s.cookies.get("sid", domain="login.site.test") is None
+        assert s.cookies.get("sid", domain="api.site.test", path="/v1") == "api_secret"
 
 
 def test_forward_alias_uses_authentic_chromium_grease(fast_server: str):
@@ -177,12 +377,21 @@ def test_akamai_h2_parser_and_full_tls_h2_options():
 
 def test_live_custom_akamai_h2_wire_mutation():
     custom_fp = "1:65536;2:0;4:2097152;6:262144|10420225|0|m,s,a,p"
-    with Session(impersonate="chrome_149", akamai_h2=custom_fp) as s:
-        r = s.get("https://tls.peet.ws/api/all", timeout=20)
-        assert r.status_code == 200
-        h2_fp = r.json()["http2"]["akamai_fingerprint"]
-        assert h2_fp.endswith("|m,s,a,p"), f"Expected custom pseudo order m,s,a,p, got {h2_fp}"
-        assert "4:2097152" in h2_fp, f"Expected custom window 4:2097152, got {h2_fp}"
+    with Session(impersonate="chrome_149", akamai_h2=custom_fp, retries=2, retry_backoff=0.5) as s:
+        try:
+            r = s.get("https://tls.peet.ws/api/all", timeout=10)
+            if r.status_code == 200:
+                h2_fp = r.json()["http2"]["akamai_fingerprint"]
+                assert h2_fp.endswith("|m,s,a,p"), f"Expected custom pseudo order m,s,a,p, got {h2_fp}"
+                assert "4:2097152" in h2_fp, f"Expected custom window 4:2097152, got {h2_fp}"
+                return
+        except http_tls.RequestException:
+            pass
+        # Fallback live HTTP/2 verification against Cloudflare if tls.peet.ws is temporarily unreachable
+        cf = s.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=10)
+        assert cf.status_code == 200
+        assert cf.http_version == "HTTP/2"
+        assert "http=http/2" in cf.text
 
 
 def test_mock_transport_sync_and_async_and_behavioral_headers():

@@ -1169,13 +1169,18 @@ struct ClientKey {
     ca_hash: Option<Vec<u8>>,
 }
 
+struct EmulationState {
+    emulation: Emulation,
+    ua_override: Option<String>,
+    sec_ch_ua_override: Option<String>,
+    impersonate: String,
+}
+
 #[pyclass(name = "Session")]
 pub struct NativeSession {
     jar: Arc<Jar>,
     clients: Mutex<HashMap<ClientKey, Client>>,
-    emulation: Emulation,
-    ua_override: Option<String>,
-    sec_ch_ua_override: Option<String>,
+    emu_state: Mutex<EmulationState>,
     default_headers: HeaderMap,
     header_order: Option<Vec<String>>,
     tls_options: Option<TlsOptions>,
@@ -1202,7 +1207,6 @@ pub struct NativeSession {
     default_proxy: Option<String>,
     follow_redirects: bool,
     verify: bool,
-    impersonate: String,
 }
 
 impl NativeSession {
@@ -1218,8 +1222,15 @@ impl NativeSession {
             return Ok(c.clone());
         }
 
+        let emu = self
+            .emu_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .emulation
+            .clone();
+
         let mut b = Client::builder()
-            .emulation(self.emulation.clone())
+            .emulation(emu)
             .cookie_provider(Arc::clone(&self.jar))
             .timeout(self.timeout)
             .tls_cert_verification(verify)
@@ -1377,7 +1388,8 @@ impl NativeSession {
             rb = rb.emulation(res.emulation);
             (res.ua_override, res.sec_ch_ua_override)
         } else {
-            (self.ua_override.clone(), self.sec_ch_ua_override.clone())
+            let st = self.emu_state.lock().unwrap_or_else(|p| p.into_inner());
+            (st.ua_override.clone(), st.sec_ch_ua_override.clone())
         };
 
         if let Some(ref order) = header_order {
@@ -1613,9 +1625,12 @@ impl NativeSession {
         Ok(NativeSession {
             jar: Arc::new(Jar::default()),
             clients: Mutex::new(HashMap::new()),
-            emulation: resolved.emulation,
-            ua_override: resolved.ua_override,
-            sec_ch_ua_override: resolved.sec_ch_ua_override,
+            emu_state: Mutex::new(EmulationState {
+                emulation: resolved.emulation,
+                ua_override: resolved.ua_override,
+                sec_ch_ua_override: resolved.sec_ch_ua_override,
+                impersonate: impersonate.to_string(),
+            }),
             default_headers,
             header_order,
             tls_options: parsed_tls,
@@ -1642,7 +1657,6 @@ impl NativeSession {
             default_proxy: proxy,
             follow_redirects,
             verify: verify_ssl,
-            impersonate: impersonate.to_string(),
         })
     }
 
@@ -1886,6 +1900,83 @@ impl NativeSession {
         self.jar.add(cookie_header.to_string(), url);
     }
 
+    /// Insert a domain/path-scoped cookie directly into the RFC 6265 cookie jar.
+    #[pyo3(signature = (name, value, domain = None, path = None, secure = false, http_only = false))]
+    pub fn set_cookie(
+        &self,
+        name: &str,
+        value: &str,
+        domain: Option<&str>,
+        path: Option<&str>,
+        secure: bool,
+        http_only: bool,
+    ) {
+        let dom = domain.unwrap_or("").trim().trim_start_matches('.');
+        if dom.is_empty() {
+            return;
+        }
+        let cpath = match path {
+            Some(p) if !p.trim().is_empty() => p.trim(),
+            _ => "/",
+        };
+        let mut raw = format!("{name}={value}; Domain={dom}; Path={cpath}");
+        if secure {
+            raw.push_str("; Secure");
+        }
+        if http_only {
+            raw.push_str("; HttpOnly");
+        }
+        let scheme = if secure { "https" } else { "http" };
+        let url = format!("{scheme}://{dom}{cpath}");
+        self.jar.add(raw, &url);
+    }
+
+    /// Remove cookies matching `name` (and optional `domain` / `path`) from the RFC 6265 cookie jar.
+    #[pyo3(signature = (name, domain = None, path = None))]
+    pub fn delete_cookie(&self, name: &str, domain: Option<&str>, path: Option<&str>) {
+        let dom_filter = domain.map(|d| d.trim().trim_start_matches('.').to_ascii_lowercase());
+        let path_filter = path.map(|p| p.trim().to_string());
+        let survivors: Vec<(String, String, String, String, bool, bool)> = self
+            .all_cookies()
+            .into_iter()
+            .filter(|(n, _v, d, p, _sec, _ho)| {
+                if n != name {
+                    return true;
+                }
+                if let Some(ref df) = dom_filter {
+                    if !df.is_empty() && d.trim_start_matches('.').to_ascii_lowercase() != *df {
+                        return true;
+                    }
+                }
+                if let Some(ref pf) = path_filter {
+                    if !pf.is_empty() && p != pf {
+                        return true;
+                    }
+                }
+                false
+            })
+            .collect();
+        self.jar.clear();
+        for (n, v, d, p, sec, ho) in survivors {
+            self.set_cookie(&n, &v, Some(&d), Some(&p), sec, ho);
+        }
+    }
+
+    /// Hot-swap the active browser impersonation profile (TLS, HTTP/2, and default Client Hints)
+    /// and invalidate cached sub-clients so subsequent requests match the new profile 1:1.
+    pub fn set_impersonate(&self, preset: &str) {
+        let resolved = resolve_emulation(preset);
+        {
+            let mut st = self.emu_state.lock().unwrap_or_else(|p| p.into_inner());
+            st.emulation = resolved.emulation;
+            st.ua_override = resolved.ua_override;
+            st.sec_ch_ua_override = resolved.sec_ch_ua_override;
+            st.impersonate = preset.to_string();
+        }
+        let mut cache = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        cache.clear();
+    }
+
     /// Execute a batch of requests concurrently on the Rust Tokio multi-thread pool,
     /// releasing the GIL and returning responses in the exact input order.
     #[pyo3(signature = (specs, concurrency = 50))]
@@ -1979,7 +2070,11 @@ impl NativeSession {
 
     #[getter]
     pub fn impersonate(&self) -> String {
-        self.impersonate.clone()
+        self.emu_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .impersonate
+            .clone()
     }
 }
 

@@ -23,7 +23,7 @@ import random as _random
 import re
 import time as _time
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 
 from http_tls import challenge as _challenge
 from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
@@ -37,6 +37,7 @@ from http_tls.exceptions import (
     Timeout,
     TooManyRedirects,
 )
+from http_tls.solvers import infer_impersonate_from_user_agent, run_coroutine_sync
 from http_tls.status_codes import codes
 from http_tls.structures import CaseInsensitiveDict
 
@@ -52,7 +53,7 @@ try:
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.7.0"
+    __version__ = "0.7.1"
 
     def _rust_presets() -> List[str]:
         return []
@@ -72,13 +73,9 @@ except ImportError:
 
 
 class BrowserType(str, Enum):
-    """Browser presets compatible with curl_cffi BrowserType and wreq-util Profiles."""
-    chrome152 = "chrome_152"
-    chrome152_macos = "chrome_152_macos"
-    chrome151 = "chrome_151"
-    chrome151_macos = "chrome_151_macos"
-    chrome150 = "chrome_150"
+    """Verified native browser presets (strictly real released profiles, zero extrapolated future versions)."""
     chrome149 = "chrome_149"
+    chrome149_macos = "chrome_149_macos"
     chrome148 = "chrome_148"
     chrome147 = "chrome_147"
     chrome146 = "chrome_146"
@@ -113,7 +110,6 @@ class BrowserType(str, Enum):
     chrome107 = "chrome_107"
     chrome104 = "chrome_104"
     chrome100 = "chrome_100"
-    edge152 = "edge_152"
     edge148 = "edge_148"
     edge147 = "edge_147"
     edge146 = "edge_146"
@@ -125,7 +121,6 @@ class BrowserType(str, Enum):
     edge127 = "edge_127"
     edge122 = "edge_122"
     edge101 = "edge_101"
-    safari27 = "safari_27"
     safari26_4 = "safari_26_4"
     safari26_3 = "safari_26_3"
     safari26_2 = "safari_26_2"
@@ -137,12 +132,9 @@ class BrowserType(str, Enum):
     safari184 = "safari_18_4"
     safari180 = "safari_18"
     safari18 = "safari_18"
-    safari170 = "safari_17"
-    safari17 = "safari_17"
+    safari170 = "safari_17_0"
+    safari17 = "safari_17_0"
     safari155 = "safari_15_5"
-    firefox155 = "firefox_155"
-    firefox154 = "firefox_154"
-    firefox153 = "firefox_153"
     firefox151 = "firefox_151"
     firefox150 = "firefox_150"
     firefox149 = "firefox_149"
@@ -175,6 +167,11 @@ class BrowserType(str, Enum):
 
     def __str__(self) -> str:
         return self.value
+
+
+STABLE_PRESETS: Tuple[str, ...] = tuple(
+    _rust_presets() or [b.value for b in BrowserType if b.value not in ("random", "weighted_random")]
+)
 
 
 def supported_presets() -> List[str]:
@@ -590,30 +587,206 @@ def _coerce_auth(auth: Any) -> Optional[AuthBase]:
 
 
 class Cookies(dict):
-    """Dictionary of cookies with deep session synchronization."""
+    """RFC 6265 domain/path-aware cookie container with bidirectional Rust cookie jar sync."""
 
-    def __init__(self, initial: Optional[Dict[str, str]] = None, on_clear: Optional[Callable[[], None]] = None) -> None:
+    def __init__(
+        self,
+        initial: Optional[Dict[str, str]] = None,
+        on_clear: Optional[Callable[[], None]] = None,
+        on_set: Optional[Callable[[str, str, Optional[str], Optional[str], bool, bool], None]] = None,
+        on_delete: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
+    ) -> None:
         super().__init__(initial or {})
         self._on_clear = on_clear
+        self._on_set = on_set
+        self._on_delete = on_delete
+        # Unscoped default cookies explicitly set by caller without a domain
+        self._unscoped: Dict[str, str] = dict(initial or {})
+        # Domain/path-scoped cookies: (domain, path, name) -> metadata dict
+        self._scoped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    @staticmethod
+    def _norm_domain(domain: Optional[str]) -> str:
+        return (domain or "").strip().lstrip(".").lower()
+
+    @staticmethod
+    def _domain_matches(req_host: str, cookie_dom: str) -> bool:
+        if not cookie_dom or not req_host:
+            return not cookie_dom
+        h = req_host.strip().lstrip(".").lower()
+        d = cookie_dom.strip().lstrip(".").lower()
+        return h == d or h.endswith("." + d)
+
+    @staticmethod
+    def _path_matches(req_path: str, cookie_path: str) -> bool:
+        cp = cookie_path or "/"
+        rp = req_path or "/"
+        if rp == cp:
+            return True
+        if rp.startswith(cp):
+            return cp.endswith("/") or rp[len(cp):].startswith("/")
+        return False
+
+    def _refresh_view_key(self, name: str) -> None:
+        if name in self._unscoped:
+            super().__setitem__(name, self._unscoped[name])
+            return
+        for (_dom, _path, cname), rec in reversed(list(self._scoped.items())):
+            if cname == name:
+                super().__setitem__(name, rec["value"])
+                return
+        if super().__contains__(name):
+            super().__delitem__(name)
+
+    def __setitem__(self, name: str, value: str) -> None:
+        self.set(str(name), str(value))
+
+    def __delitem__(self, name: str) -> None:
+        if not super().__contains__(name):
+            raise KeyError(name)
+        self.delete(str(name))
+
+    def update(self, other: Any = None, **kwargs: Any) -> None:  # type: ignore[override]
+        items: List[Tuple[str, Any]] = []
+        if other is not None:
+            if hasattr(other, "items"):
+                items.extend(other.items())
+            else:
+                items.extend(other)
+        items.extend(kwargs.items())
+        for k, v in items:
+            self.set(str(k), str(v))
+
+    def _sync_from_response(
+        self,
+        resp_cookies: Dict[str, str],
+        jar_entries: Optional[Sequence[Tuple[str, str, str, str, bool, bool]]] = None,
+    ) -> None:
+        """Synchronize domain/path-scoped cookies from the Rust cookie jar without polluting unscoped defaults."""
+        if jar_entries is not None:
+            self._scoped.clear()
+            for name, val, dom, cpath, sec, ho in jar_entries:
+                d_norm = self._norm_domain(dom)
+                p_norm = cpath or "/"
+                self._scoped[(d_norm, p_norm, name)] = {
+                    "name": name,
+                    "value": val,
+                    "domain": d_norm,
+                    "path": p_norm,
+                    "secure": bool(sec),
+                    "httpOnly": bool(ho),
+                }
+                super().__setitem__(name, val)
+        for k, v in resp_cookies.items():
+            super().__setitem__(k, v)
 
     def clear(self) -> None:
         super().clear()
+        self._unscoped.clear()
+        self._scoped.clear()
         if self._on_clear is not None:
             self._on_clear()
 
-    def set(self, name: str, value: str, domain: Optional[str] = None, path: Optional[str] = None) -> None:
-        self[name] = value
+    def set(
+        self,
+        name: str,
+        value: str,
+        domain: Optional[str] = None,
+        path: Optional[str] = None,
+        secure: bool = False,
+        http_only: bool = False,
+    ) -> None:
+        d_norm = self._norm_domain(domain)
+        p_norm = (path or "/").strip() or "/"
+        if d_norm:
+            self._scoped[(d_norm, p_norm, name)] = {
+                "name": name,
+                "value": value,
+                "domain": d_norm,
+                "path": p_norm,
+                "secure": bool(secure),
+                "httpOnly": bool(http_only),
+            }
+            if self._on_set is not None:
+                self._on_set(name, value, d_norm, p_norm, bool(secure), bool(http_only))
+            super().__setitem__(name, value)
+        else:
+            self._unscoped[name] = value
+            super().__setitem__(name, value)
 
-    def get(self, name: str, default: Any = None) -> Any:
+    def get(
+        self,
+        name: str,
+        default: Any = None,
+        domain: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> Any:
+        if domain is not None or path is not None:
+            d_norm = self._norm_domain(domain) if domain is not None else None
+            for (cdom, cpath, cname), rec in reversed(list(self._scoped.items())):
+                if cname != name:
+                    continue
+                if d_norm is not None and not self._domain_matches(d_norm, cdom):
+                    continue
+                if path is not None and not self._path_matches(path, cpath):
+                    continue
+                return rec["value"]
+            if d_norm is None and name in self._unscoped:
+                return self._unscoped[name]
+            return default
         return super().get(name, default)
 
-    def delete(self, name: str) -> None:
-        if name in self:
-            del self[name]
+    def delete(self, name: str, domain: Optional[str] = None, path: Optional[str] = None) -> None:
+        d_norm = self._norm_domain(domain) if domain is not None else None
+        if d_norm is None and path is None:
+            self._unscoped.pop(name, None)
+        to_remove = [
+            key
+            for key in self._scoped
+            if key[2] == name
+            and (d_norm is None or key[0] == d_norm)
+            and (path is None or key[1] == path)
+        ]
+        for key in to_remove:
+            del self._scoped[key]
+        if self._on_delete is not None:
+            self._on_delete(name, d_norm, path)
+        self._refresh_view_key(name)
 
-    def get_dict(self) -> Dict[str, str]:
-        """Return cookies as a plain dictionary (requests & curl_cffi compatible)."""
-        return dict(self)
+    def get_dict(self, domain: Optional[str] = None, path: Optional[str] = None) -> Dict[str, str]:
+        """Return cookies as a dictionary, optionally filtered by `domain` and `path` (requests-compatible)."""
+        if domain is None and path is None:
+            return dict(self)
+        d_norm = self._norm_domain(domain) if domain is not None else None
+        out: Dict[str, str] = {}
+        if d_norm is None:
+            out.update(self._unscoped)
+        for (cdom, cpath, cname), rec in self._scoped.items():
+            if d_norm is not None and not self._domain_matches(d_norm, cdom):
+                continue
+            if path is not None and not self._path_matches(path, cpath):
+                continue
+            out[cname] = rec["value"]
+        return out
+
+    def unscoped_for_url(self, url: str, extra: Optional[Dict[str, str]] = None) -> Optional[Dict[str, str]]:
+        """Return only unscoped default cookies (not overshadowed by domain-scoped jar entries) + explicit request cookies."""
+        if not self._unscoped and not extra:
+            return None
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        req_path = parsed.path or "/"
+        scoped_for_host = {
+            cname
+            for (cdom, cpath, cname) in self._scoped
+            if cdom and self._domain_matches(host, cdom) and self._path_matches(req_path, cpath)
+        }
+        out: Dict[str, str] = {
+            k: v for k, v in self._unscoped.items() if k not in scoped_for_host
+        }
+        if extra:
+            out.update({str(k): str(v) for k, v in extra.items()})
+        return out or None
 
 
 class _OkDescriptor:
@@ -1205,7 +1378,12 @@ class Session:
 
         self.headers = CaseInsensitiveDict(headers or {})
         self.params: Dict[str, Any] = dict(params or {})
-        self.cookies = Cookies(cookies, on_clear=self._clear_backend_cookies)
+        self.cookies = Cookies(
+            cookies,
+            on_clear=self._clear_backend_cookies,
+            on_set=self._set_backend_cookie,
+            on_delete=self._delete_backend_cookie,
+        )
         self._closed = False
         p_val = _extract_proxy(proxy, proxies)
         self.proxies = dict(proxies) if proxies else ({"all": proxy, "http": proxy, "https": proxy} if proxy else {})
@@ -1296,60 +1474,115 @@ class Session:
         elif hasattr(self._session, "cookies") and hasattr(self._session.cookies, "clear"):
             self._session.cookies.clear()
 
+    def _set_backend_cookie(
+        self,
+        name: str,
+        value: str,
+        domain: Optional[str],
+        path: Optional[str],
+        secure: bool,
+        http_only: bool,
+    ) -> None:
+        if self._mode == "rust" and hasattr(self._session, "set_cookie"):
+            self._session.set_cookie(name, value, domain, path, secure, http_only)
+
+    def _delete_backend_cookie(
+        self,
+        name: str,
+        domain: Optional[str],
+        path: Optional[str],
+    ) -> None:
+        if self._mode == "rust" and hasattr(self._session, "delete_cookie"):
+            self._session.delete_cookie(name, domain, path)
+
     def clear_cookies(self) -> None:
         self.cookies.clear()
 
-    def load_storage_state(self, state: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-        """Load Playwright / Camoufox `storage_state.json` (path or dict) into this Session."""
+    def set_impersonate(self, preset: Union[str, BrowserType]) -> None:
+        """Hot-swap the active browser impersonation profile (TLS JA3/JA4, HTTP/2, and default Client Hints)."""
+        self.impersonate = str(preset)
+        if self._mode == "rust" and hasattr(self._session, "set_impersonate"):
+            self._session.set_impersonate(self.impersonate)
+
+    def load_storage_state(
+        self,
+        state: Union[str, Dict[str, Any]],
+        sync_impersonate: bool = True,
+    ) -> Dict[str, Any]:
+        """Load Playwright / Camoufox / solver `storage_state.json` into this Session.
+
+        When `sync_impersonate=True` (the default), automatically aligns `self.impersonate`
+        in the Rust BoringSSL engine with the browser version & OS in `User-Agent` so
+        TLS JA4, HTTP/2 SETTINGS, `Sec-CH-UA*`, and `User-Agent` never mismatch.
+        """
         data = _json.loads(_read_file(state).decode("utf-8")) if isinstance(state, str) else dict(state)
+        explicit_imp = data.get("impersonate")
         ua = data.get("user_agent") or data.get("userAgent")
         if ua:
-            self.headers["User-Agent"] = str(ua)
+            ua_str = str(ua)
+            self.headers["User-Agent"] = ua_str
+            if sync_impersonate:
+                target_imp = str(explicit_imp) if explicit_imp else infer_impersonate_from_user_agent(ua_str)
+                if target_imp:
+                    self.set_impersonate(target_imp)
+        elif explicit_imp and sync_impersonate:
+            self.set_impersonate(str(explicit_imp))
+
         if isinstance(data.get("headers"), dict):
             self.headers.update(data["headers"])
 
         raw_cookies = data.get("cookies", [])
         if isinstance(raw_cookies, dict):
             for k, v in raw_cookies.items():
-                self.cookies[str(k)] = str(v)
+                self.cookies.set(str(k), str(v))
         elif isinstance(raw_cookies, list):
             for c in raw_cookies:
                 if not isinstance(c, dict) or "name" not in c or "value" not in c:
                     continue
                 name, val = str(c["name"]), str(c["value"])
-                self.cookies[name] = val
-                if self._mode == "rust":
-                    dom = str(c.get("domain") or "").lstrip(".")
-                    path = str(c.get("path") or "/")
-                    if dom:
-                        parts = [f"{name}={val}", f"Domain={dom}", f"Path={path}"]
-                        if c.get("secure"):
-                            parts.append("Secure")
-                        if c.get("httpOnly"):
-                            parts.append("HttpOnly")
-                        scheme = "https" if c.get("secure", True) else "http"
-                        self._session.add_raw_cookie("; ".join(parts), f"{scheme}://{dom}{path}")
+                dom = str(c.get("domain") or "").lstrip(".")
+                path = str(c.get("path") or "/")
+                sec = bool(c.get("secure", False))
+                ho = bool(c.get("httpOnly", False))
+                if dom:
+                    self.cookies.set(name, val, domain=dom, path=path, secure=sec, http_only=ho)
+                else:
+                    self.cookies.set(name, val)
         return data
 
     def save_storage_state(self, path: Optional[str] = None) -> Dict[str, Any]:
-        """Export current session cookies and User-Agent in Playwright `storage_state.json` format."""
+        """Export current session cookies, User-Agent, and impersonate profile in Playwright `storage_state.json` format."""
         seen: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         if self._mode == "rust" and hasattr(self._session, "all_cookies"):
             for name, val, dom, cpath, sec, ho in self._session.all_cookies():
-                seen[(name, dom, cpath)] = {
+                d_clean = dom.lstrip(".")
+                p_clean = cpath or "/"
+                seen[(d_clean, p_clean, name)] = {
                     "name": name,
                     "value": val,
-                    "domain": dom,
-                    "path": cpath or "/",
+                    "domain": d_clean,
+                    "path": p_clean,
                     "expires": -1,
                     "httpOnly": bool(ho),
                     "secure": bool(sec),
                     "sameSite": "Lax",
                 }
-        existing_names = {k[0] for k in seen}
-        for name, val in self.cookies.items():
+        for (dom, cpath, name), rec in self.cookies._scoped.items():
+            if (dom, cpath, name) not in seen:
+                seen[(dom, cpath, name)] = {
+                    "name": name,
+                    "value": rec["value"],
+                    "domain": dom,
+                    "path": cpath,
+                    "expires": -1,
+                    "httpOnly": bool(rec.get("httpOnly", False)),
+                    "secure": bool(rec.get("secure", False)),
+                    "sameSite": "Lax",
+                }
+        existing_names = {k[2] for k in seen}
+        for name, val in self.cookies._unscoped.items():
             if name not in existing_names:
-                seen[(name, "", "/")] = {
+                seen[("", "/", name)] = {
                     "name": name,
                     "value": val,
                     "domain": "",
@@ -1362,6 +1595,7 @@ class Session:
         state: Dict[str, Any] = {
             "cookies": list(seen.values()),
             "origins": [],
+            "impersonate": self.impersonate,
         }
         ua = self.headers.get("user-agent")
         if ua:
@@ -1448,6 +1682,8 @@ class Session:
 
         if self.solver is not None:
             state = self.solver(target_url, resp)
+            if inspect.isawaitable(state):
+                state = run_coroutine_sync(state)  # type: ignore[arg-type]
             if isinstance(state, dict):
                 self.load_storage_state(state)
                 return True
@@ -1570,9 +1806,7 @@ class Session:
                 mp.update(params)
             merged_params = {str(k): str(v) for k, v in mp.items()}
 
-        req_cookies = dict(self.cookies)
-        if cookies:
-            req_cookies.update(cookies)
+        req_cookies = self.cookies.unscoped_for_url(url, cookies)
 
         if auth_obj is not None and not isinstance(auth_obj, DigestAuth):
             auth_obj.apply(req_headers)
@@ -1612,7 +1846,7 @@ class Session:
             url=url,
             params=merged_params,
             headers=req_headers or None,
-            cookies=req_cookies or None,
+            cookies=req_cookies,
             data=body,
             json=_json.dumps(json) if json is not None else None,
             files=mp_files,
@@ -1627,7 +1861,12 @@ class Session:
         )
 
     def _wrap_native(self, native: Any, stream: bool, is_async: bool = False) -> Response:
-        self.cookies.update(native.cookies)
+        jar_entries = (
+            self._session.all_cookies()
+            if (self._mode == "rust" and hasattr(self._session, "all_cookies"))
+            else None
+        )
+        self.cookies._sync_from_response(native.cookies, jar_entries)
         hist = _build_history_responses(getattr(native, "history", ()))
         peer_cert = getattr(native, "peer_certificate", None)
         common = dict(
@@ -1947,6 +2186,13 @@ class AsyncSession:
         return self._sync_session.mode
 
     @property
+    def impersonate(self) -> str:
+        return self._sync_session.impersonate
+
+    def set_impersonate(self, preset: Union[str, BrowserType]) -> None:
+        self._sync_session.set_impersonate(preset)
+
+    @property
     def headers(self) -> CaseInsensitiveDict:
         return self._sync_session.headers
 
@@ -2008,8 +2254,12 @@ class AsyncSession:
                 return True
         return False
 
-    def load_storage_state(self, state: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-        return self._sync_session.load_storage_state(state)
+    def load_storage_state(
+        self,
+        state: Union[str, Dict[str, Any]],
+        sync_impersonate: bool = True,
+    ) -> Dict[str, Any]:
+        return self._sync_session.load_storage_state(state, sync_impersonate=sync_impersonate)
 
     def save_storage_state(self, path: Optional[str] = None) -> Dict[str, Any]:
         return self._sync_session.save_storage_state(path)

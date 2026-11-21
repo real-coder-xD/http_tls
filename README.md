@@ -475,16 +475,20 @@ with http_tls.Session(
 
 ### 2. Browser Solver Bridges (`BestDriverSolver`, `PlaywrightSolver`, `FlareSolverrSolver`) & `storage_state.json`
 
-`http_tls` is a pure HTTP client (no embedded V8 engine). For L4/L7 TLS + HTTP/2 fingerprinting it handles traffic natively in Rust; when a target serves a JavaScript proof-of-work or Turnstile challenge (`resp.challenge is not None`), bridge directly to a stealth browser solver or reuse Playwright / Camoufox `storage_state.json`:
+`http_tls` is a pure HTTP client (no embedded V8 engine). For L4/L7 TLS + HTTP/2 fingerprinting it handles traffic natively in Rust; when a target serves a JavaScript proof-of-work or Turnstile challenge (`resp.challenge is not None`), bridge directly to a stealth browser solver or reuse Playwright / Camoufox `storage_state.json`.
+
+- `◈` **Automatic Fingerprint Alignment**: `load_storage_state()` and all built-in solvers extract `User-Agent` and `Sec-CH-UA*` Client Hints, infer the matching verified preset via `infer_impersonate_from_user_agent()`, and hot-swap the active Rust BoringSSL + HTTP/2 profile via `session.set_impersonate()` so TLS JA4, HTTP/2 `SETTINGS`, Client Hints, and `User-Agent` never mismatch.
+- `◈` **Per-Domain Singleflight & Warm Browser Reuse**: Concurrent challenge solves on the same domain coalesce into a single browser run with a TTL clearance cache (`cache_ttl=15.0`) and optional warm browser reuse (`keep_warm=True`), preventing Thundering Herd process storms.
+- `◈` **Active Turnstile Checkbox Clicking**: `BestDriverSolver` and `PlaywrightSolver` actively locate and click Cloudflare Turnstile checkboxes (piercing open/closed Shadow DOM and challenge iframes with humanized cursor movement).
 
 ```python
 import http_tls
 from http_tls import BestDriverSolver, FlareSolverrSolver
 
 # Load cookies + User-Agent from Playwright context.storage_state(path="state.json")
+# Automatically aligns Rust TLS/H2 impersonation profile with the User-Agent version & OS
 with http_tls.Session(
     storage_state="state.json",
-    impersonate="firefox_151",
     auto_referer=True,        # Chains Referer across navigations like a real browser
     fetch_mode="same-origin", # Emits coherent Sec-Fetch-Mode / Site / Dest headers
 ) as s:
@@ -495,7 +499,7 @@ with http_tls.Session(
 with http_tls.Session(
     retries=1,
     retry_on_challenge=True,
-    solver=BestDriverSolver(headless=True),  # or PlaywrightSolver() / FlareSolverrSolver()
+    solver=BestDriverSolver(headless=True, keep_warm=True, click_turnstile=True),
 ) as s:
     resp = s.get("https://protected.example.com")
 ```
@@ -669,7 +673,7 @@ Pass `keylog_file="sslkeys.log"` to `Session(...)` (or set the `SSLKEYLOGFILE` e
 
 ## Testing & Development
 
-Run the full pytest suite (30 integration, fingerprint, production-readiness, and soak tests covering TLS/JA4, custom Akamai HTTP/2, sync/async streaming, `gather()`, WebSockets, Digest Auth, custom CA/mTLS, `storage_state.json`, `MockTransport`, HAR export, pool cleanup, and bounded memory):
+Run the full pytest suite (34 integration, fingerprint, solver-alignment, singleflight, RFC 6265 cookie-isolation, production-readiness, and soak tests):
 
 ```bash
 pip install -e ".[test]"

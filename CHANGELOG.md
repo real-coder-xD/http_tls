@@ -2,6 +2,15 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [0.7.1] - 2026-11-21
+
+### Fingerprint Synchronization, Solver Hardening & RFC 6265 Cookie Isolation
+- **Automatic Solver -> Rust Fingerprint Alignment (`set_impersonate` & `infer_impersonate_from_user_agent`):** `Session.load_storage_state()` now parses the solver/browser `User-Agent` (and explicit `impersonate`), hot-swaps the active Rust BoringSSL + HTTP/2 profile via `NativeSession::set_impersonate()`, and imports full `Sec-CH-UA*` Client Hints headers so TLS JA4, HTTP/2 `SETTINGS`, Client Hints, and `User-Agent` never mismatch after solving a challenge.
+- **Zero Dropped Coroutines & Per-Domain Singleflight Coalescing:** `BestDriverSolver.__call__()` and `Session.solve_challenge()` now execute async solver coroutines on a dedicated background event-loop thread (`run_coroutine_sync`) when called from synchronous code inside an already-running event loop (FastAPI, Jupyter, workers). Added per-domain Singleflight coalescing lock + TTL clearance cache and `keep_warm=True` persistent browser support to prevent Thundering Herd process storms.
+- **Active Turnstile & Challenge Checkbox Clicking:** `BestDriverSolver` and `PlaywrightSolver` now actively probe and click Cloudflare Turnstile checkboxes (piercing open/closed Shadow DOM and challenge iframes with humanized cursor movement) during the solve loop.
+- **Strict `STABLE_PRESETS` & `BrowserType`:** Removed extrapolated future versions (`chrome_152`, `edge_152`, `safari_27`, `firefox_155`) from `BrowserType` and exposed `STABLE_PRESETS`.
+- **RFC 6265 Domain/Path-Scoped `Cookies` (Zero Cross-Domain Cookie Leak):** `Cookies.set()`, `Cookies.get()`, `Cookies.get_dict()`, and `Cookies.delete()` now preserve `(domain, path, secure, httpOnly)` and synchronize bidirectionally with the Rust `Jar` (`NativeSession::set_cookie` / `delete_cookie`), preventing multi-subdomain overwrites and eliminating cross-domain cookie leakage.
+
 ## [0.7.0] - 2026-11-21
 
 ### Fingerprint Fidelity & Production Hardening

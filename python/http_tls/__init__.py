@@ -11,7 +11,13 @@ from __future__ import annotations
 import sys
 from http_tls import auth, challenge, exceptions, requests, solvers, status_codes, structures
 from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
-from http_tls.solvers import BestDriverSolver, FlareSolverrSolver, PlaywrightSolver
+from http_tls.solvers import (
+    BestDriverSolver,
+    FlareSolverrSolver,
+    PlaywrightSolver,
+    infer_impersonate_from_user_agent,
+    run_coroutine_sync,
+)
 from http_tls.exceptions import (
     ConnectError,
     ConnectTimeout,
@@ -38,6 +44,7 @@ from http_tls.requests import (
     Limits,
     MockTransport,
     Response,
+    STABLE_PRESETS,
     Session,
     TimeoutConfig,
     WebSocket,
@@ -63,7 +70,7 @@ from http_tls.structures import CaseInsensitiveDict
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "0.7.0"
+    __version__ = "0.7.1"
 
 sys.modules["http_tls.requests"] = requests
 
@@ -102,6 +109,7 @@ __all__ = [
     "AsyncWebSocket",
     "Cookies",
     "BrowserType",
+    "STABLE_PRESETS",
     "TimeoutConfig",
     "Limits",
     "MockTransport",
@@ -109,6 +117,8 @@ __all__ = [
     "BestDriverSolver",
     "PlaywrightSolver",
     "FlareSolverrSolver",
+    "infer_impersonate_from_user_agent",
+    "run_coroutine_sync",
     "parse_ja3_to_tls_options",
     "parse_akamai_h2_to_http2_options",
     "is_verified_preset",
