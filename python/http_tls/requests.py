@@ -820,6 +820,7 @@ class Response:
         remote_addr: Optional[str] = None,
         peer_certificate: Optional[bytes] = None,
         history: Optional[List["Response"]] = None,
+        proxy: Optional[str] = None,
         *,
         raw_chunks: Optional[Iterator[bytes]] = None,
         async_stream: Optional[Any] = None,
@@ -835,6 +836,7 @@ class Response:
         self.remote_addr = remote_addr
         self.peer_certificate = peer_certificate
         self.history: List["Response"] = history or []
+        self.proxy: Optional[str] = proxy
         self._raw_chunks = raw_chunks
         self._async_stream = async_stream
         self._closer = closer
@@ -1122,6 +1124,26 @@ class Response:
     def challenge(self) -> Optional[str]:
         return _challenge.detect(self)
 
+    @property
+    def alt_svc(self) -> Dict[str, str]:
+        """Parse RFC 7838 `Alt-Svc` header (e.g. `h3=":443"; ma=86400`) into `{protocol: authority}`."""
+        raw = self.headers.get("alt-svc", "").strip()
+        if not raw or raw.lower() == "clear":
+            return {}
+        out: Dict[str, str] = {}
+        for item in raw.split(","):
+            seg = item.strip()
+            if not seg:
+                continue
+            proto_part = seg.split(";", 1)[0].strip()
+            if "=" in proto_part:
+                proto, _, auth = proto_part.partition("=")
+                p_clean = proto.strip().lower()
+                a_clean = auth.strip().strip('"')
+                if p_clean and a_clean:
+                    out[p_clean] = a_clean
+        return out
+
     def json(self, **kwargs: Any) -> Any:
         return _json.loads(self.text, **kwargs)
 
@@ -1369,6 +1391,7 @@ class Session:
         self.fetch_mode = fetch_mode
         self.transport = transport
         self._last_url: Optional[str] = None
+        self.alt_svc_cache: Dict[str, Dict[str, str]] = {}
         self.proxies_pool: List[str] = list(proxies_pool) if proxies_pool else []
         self._proxy_idx = 0
         self.event_hooks: Dict[str, List[Callable[..., Any]]] = {
@@ -1971,11 +1994,15 @@ class Session:
 
         max_attempts = 1 if stream else (1 + self.retries)
         last_exc: Optional[BaseException] = None
+        sticky_proxy: Optional[str] = None
+        solved_clearance = False
 
         for attempt in range(max_attempts):
-            attempt_proxy = proxy or (self._next_pool_proxy() if not proxies else None)
+            attempt_proxy = proxy or sticky_proxy or (self._next_pool_proxy() if not proxies else None)
             attempt_imp = str(impersonate) if impersonate else (
-                "weighted_random" if (attempt > 0 and (self.rotate_impersonate or self.retry_on_challenge)) else None
+                "weighted_random"
+                if (attempt > 0 and not solved_clearance and (self.rotate_impersonate or self.retry_on_challenge))
+                else None
             )
             try:
                 if self._mode == "curl_cffi":
@@ -1992,6 +2019,8 @@ class Session:
                     call = self._session.request_stream if stream else self._session.request
                     resp = self._wrap_native(call(**args), stream=stream, is_async=False)
 
+                resp.proxy = attempt_proxy or _extract_proxy(None, proxies) or _extract_proxy(None, self.proxies)
+
                 # RFC 7616 DigestAuth automatic 401 handshake
                 if isinstance(auth_obj, DigestAuth) and resp.status_code == 401:
                     www = resp.headers.get("www-authenticate", "")
@@ -2006,11 +2035,14 @@ class Session:
                         )
                         call = self._session.request_stream if stream else self._session.request
                         resp = self._wrap_native(call(**args), stream=stream, is_async=False)
+                        resp.proxy = attempt_proxy or _extract_proxy(None, proxies) or _extract_proxy(None, self.proxies)
 
                 if attempt + 1 < max_attempts and self._should_retry_resp(resp):
                     if resp.challenge is not None or _try_extract_inline_cookie(resp.text):
                         try:
-                            self.solve_challenge(resp)
+                            if self.solve_challenge(resp):
+                                solved_clearance = True
+                                sticky_proxy = resp.proxy
                         except Exception:
                             pass
                     _time.sleep(self._backoff_delay(attempt))
@@ -2036,6 +2068,11 @@ class Session:
 
         assert resp is not None, last_exc
         self._last_url = resp.url or full_url
+        alt = resp.alt_svc
+        if alt:
+            host = (urlparse(self._last_url).hostname or "").lower()
+            if host:
+                self.alt_svc_cache[host] = alt
         self._record_har_entry(method, full_url, req_headers, resp)
         if self.event_hooks["response"]:
             self._run_sync_hooks("response", resp)
@@ -2348,11 +2385,15 @@ class AsyncSession:
             return resp
 
         max_attempts = 1 if stream else (1 + s.retries)
+        sticky_proxy: Optional[str] = None
+        solved_clearance = False
 
         for attempt in range(max_attempts):
-            attempt_proxy = proxy or (s._next_pool_proxy() if not proxies else None)
+            attempt_proxy = proxy or sticky_proxy or (s._next_pool_proxy() if not proxies else None)
             attempt_imp = str(impersonate) if impersonate else (
-                "weighted_random" if (attempt > 0 and (s.rotate_impersonate or s.retry_on_challenge)) else None
+                "weighted_random"
+                if (attempt > 0 and not solved_clearance and (s.rotate_impersonate or s.retry_on_challenge))
+                else None
             )
             try:
                 args = s._build_native_args(
@@ -2362,6 +2403,7 @@ class AsyncSession:
                 )
                 call = s._session.async_request_stream if stream else s._session.async_request
                 resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
+                resp.proxy = attempt_proxy or _extract_proxy(None, proxies) or _extract_proxy(None, s.proxies)
 
                 if isinstance(auth_obj, DigestAuth) and resp.status_code == 401:
                     www = resp.headers.get("www-authenticate", "")
@@ -2376,11 +2418,14 @@ class AsyncSession:
                         )
                         call = s._session.async_request_stream if stream else s._session.async_request
                         resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
+                        resp.proxy = attempt_proxy or _extract_proxy(None, proxies) or _extract_proxy(None, s.proxies)
 
                 if attempt + 1 < max_attempts and s._should_retry_resp(resp):
                     if resp.challenge is not None or _try_extract_inline_cookie(resp.text):
                         try:
-                            await self.solve_challenge(resp)
+                            if await self.solve_challenge(resp):
+                                solved_clearance = True
+                                sticky_proxy = resp.proxy
                         except Exception:
                             pass
                     await asyncio.sleep(s._backoff_delay(attempt))
@@ -2400,6 +2445,11 @@ class AsyncSession:
 
         assert resp is not None
         s._last_url = resp.url or full_url
+        alt = resp.alt_svc
+        if alt:
+            host = (urlparse(s._last_url).hostname or "").lower()
+            if host:
+                s.alt_svc_cache[host] = alt
         s._record_har_entry(method, full_url, req_headers, resp)
         if s.event_hooks["response"]:
             await self._run_async_hooks("response", resp)

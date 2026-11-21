@@ -129,6 +129,7 @@ class BestDriverSolver:
     browser_path: Optional[str]
     extra_args: Optional[List[str]]
     keep_warm: bool
+    max_warm_browsers: int
     cache_ttl: float
     click_turnstile: bool
     def __init__(
@@ -140,6 +141,7 @@ class BestDriverSolver:
         browser_path: Optional[str] = None,
         extra_args: Optional[Sequence[str]] = None,
         keep_warm: bool = False,
+        max_warm_browsers: int = 4,
         cache_ttl: float = 15.0,
         click_turnstile: bool = True,
     ) -> None: ...
@@ -147,6 +149,10 @@ class BestDriverSolver:
     def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
     async def aclose(self) -> None: ...
     def close(self) -> None: ...
+    def __enter__(self) -> "BestDriverSolver": ...
+    def __exit__(self, *exc: Any) -> None: ...
+    async def __aenter__(self) -> "BestDriverSolver": ...
+    async def __aexit__(self, *exc: Any) -> None: ...
 
 class PlaywrightSolver:
     headless: bool
@@ -154,6 +160,7 @@ class PlaywrightSolver:
     proxy: Optional[str]
     wait_cookies: Tuple[str, ...]
     browser_type: str
+    keep_warm: bool
     cache_ttl: float
     click_turnstile: bool
     def __init__(
@@ -163,10 +170,17 @@ class PlaywrightSolver:
         proxy: Optional[str] = None,
         wait_cookies: Sequence[str] = ...,
         browser_type: str = "chromium",
+        keep_warm: bool = False,
         cache_ttl: float = 15.0,
         click_turnstile: bool = True,
     ) -> None: ...
     def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
+    def close(self) -> None: ...
+    async def aclose(self) -> None: ...
+    def __enter__(self) -> "PlaywrightSolver": ...
+    def __exit__(self, *exc: Any) -> None: ...
+    async def __aenter__(self) -> "PlaywrightSolver": ...
+    async def __aexit__(self, *exc: Any) -> None: ...
 
 class FlareSolverrSolver:
     endpoint: str
@@ -262,6 +276,7 @@ class Response:
     remote_addr: Optional[str]
     peer_certificate: Optional[bytes]
     history: List["Response"]
+    proxy: Optional[str]
 
     def __init__(
         self,
@@ -277,6 +292,7 @@ class Response:
         remote_addr: Optional[str] = None,
         peer_certificate: Optional[bytes] = None,
         history: Optional[List["Response"]] = None,
+        proxy: Optional[str] = None,
         *,
         raw_chunks: Optional[Iterator[bytes]] = None,
         async_stream: Optional[Any] = None,
@@ -311,6 +327,8 @@ class Response:
     def links(self) -> Dict[str, Dict[str, str]]: ...
     @property
     def challenge(self) -> Optional[str]: ...
+    @property
+    def alt_svc(self) -> Dict[str, str]: ...
 
     def read(self) -> bytes: ...
     async def aread(self) -> bytes: ...
@@ -370,6 +388,7 @@ class Session:
     cookies: Cookies
     proxies: Dict[str, str]
     proxies_pool: List[str]
+    alt_svc_cache: Dict[str, Dict[str, str]]
     event_hooks: Dict[str, List[Callable[..., Any]]]
     mode: str
     _session: Any

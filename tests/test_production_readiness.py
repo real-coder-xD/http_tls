@@ -452,9 +452,55 @@ def test_async_solver_bridge_and_solver_classes():
 
     asyncio.run(_run())
     # Ensure solver classes instantiate cleanly without requiring optional deps until called
-    assert isinstance(BestDriverSolver(headless=True), BestDriverSolver)
-    assert isinstance(PlaywrightSolver(headless=True), PlaywrightSolver)
+    assert isinstance(BestDriverSolver(headless=True, keep_warm=True, max_warm_browsers=4), BestDriverSolver)
+    assert isinstance(PlaywrightSolver(headless=True, keep_warm=True), PlaywrightSolver)
     assert isinstance(FlareSolverrSolver(), FlareSolverrSolver)
+
+
+def test_warm_solver_proxy_isolation_cdp_context_and_alt_svc():
+    from http_tls.solvers import _open_isolated_cdp_proxy_context, _resolve_effective_proxy
+
+    # 1. Response.alt_svc RFC 7838 parsing
+    r_alt = http_tls.Response(
+        status_code=200,
+        headers={"Alt-Svc": 'h3=":443"; ma=86400, h3-29=":443"; ma=86400'},
+        content=b"ok",
+        url="https://cloudflare.com/",
+        proxy="http://10.0.0.1:8080",
+    )
+    assert r_alt.alt_svc == {"h3": ":443", "h3-29": ":443"}
+    assert r_alt.proxy == "http://10.0.0.1:8080"
+    assert _resolve_effective_proxy("http://default:8080", r_alt) == "http://10.0.0.1:8080"
+
+    # 2. CDP Target.createBrowserContext(proxyServer=...) isolation for warm BestDriverSolver
+    sent_cdp = []
+
+    class _FakeWarmTab:
+        async def url(self):
+            return "https://target.test/challenge"
+
+        async def send(self, method, params=None):
+            sent_cdp.append((method, params))
+            if method == "Target.createBrowserContext":
+                return {"browserContextId": "ctx-proxy-1"}
+            return {"targetId": "t-1"}
+
+    class _FakeWarmBrowser:
+        async def main_tab(self):
+            return _FakeWarmTab()
+
+        async def tabs(self):
+            return [_FakeWarmTab()]
+
+        async def get(self, url, new_tab=True, wait_until="domcontentloaded"):
+            return _FakeWarmTab()
+
+    tab, ctx_id = asyncio.run(
+        _open_isolated_cdp_proxy_context(_FakeWarmBrowser(), "https://target.test/challenge", "http://1.2.3.4:8080")
+    )
+    assert ctx_id == "ctx-proxy-1"
+    assert sent_cdp[0] == ("Target.createBrowserContext", {"disposeOnDetach": True, "proxyServer": "http://1.2.3.4:8080"})
+    assert sent_cdp[1] == ("Target.createTarget", {"url": "https://target.test/challenge", "browserContextId": "ctx-proxy-1"})
 
 
 def test_soak_stability_pool_cleanup_and_bounded_memory(fast_server: str):

@@ -4,10 +4,13 @@ Features:
 - Synchronous & asynchronous execution without dropped coroutines: when called
   from synchronous code inside an already-running event loop (FastAPI, Jupyter,
   async workers), dispatches onto a dedicated background event-loop thread.
-- Per-domain Singleflight coalescing lock + TTL clearance cache: when N threads
-  or tasks hit a 403 challenge on the same domain simultaneously, only 1 browser
-  solve runs while the other N-1 waiters share the solved clearance state.
-- Optional warm browser reuse (`keep_warm=True`) to avoid cold-starting Chromium.
+- Per-(domain, proxy) Singleflight coalescing lock + TTL clearance cache: when N
+  threads or tasks hit a 403 challenge on the same domain and proxy simultaneously,
+  only 1 browser solve runs while the other N-1 waiters share the solved clearance.
+- Warm browser reuse (`keep_warm=True`) on BOTH `BestDriverSolver` and
+  `PlaywrightSolver`, with per-proxy isolation (proxy-keyed warm pool + CDP
+  `Target.createBrowserContext(proxyServer=...)` / Playwright per-context proxy)
+  so the solver IP always matches the active `proxies_pool` IP in Rust.
 - Active Cloudflare Turnstile & challenge checkbox clicking (piercing open/closed
   Shadow DOM and challenge iframes with humanized cursor movement).
 - Full fingerprint synchronization: extracts `User-Agent`, `Sec-CH-UA*` Client
@@ -18,6 +21,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from concurrent.futures import Future as _ConcurrentFuture
 import json as _json
 import re
@@ -116,6 +120,34 @@ def _has_clearance(cookies: Sequence[Any], names: Iterable[str]) -> bool:
     return False
 
 
+def _resolve_effective_proxy(default_proxy: Optional[str], resp: Any = None) -> Optional[str]:
+    """Return the per-request proxy attached to `resp` (from `proxies_pool` or request kwargs), falling back to `default_proxy`."""
+    resp_proxy = getattr(resp, "proxy", None) if resp is not None else None
+    if resp_proxy:
+        return str(resp_proxy)
+    return default_proxy
+
+
+def _proxy_has_auth(proxy: Optional[str]) -> bool:
+    if not proxy:
+        return False
+    parsed = urlparse(proxy)
+    return bool(parsed.username or parsed.password)
+
+
+def _format_playwright_proxy(proxy: str) -> Dict[str, str]:
+    parsed = urlparse(proxy)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    px: Dict[str, str] = {"server": f"{scheme}://{host}{port}"}
+    if parsed.username:
+        px["username"] = parsed.username
+    if parsed.password:
+        px["password"] = parsed.password
+    return px
+
+
 # ---------------------------------------------------------------------------
 # Dedicated background event-loop thread (prevents dropped coroutines when
 # synchronous code calls an async solver from inside FastAPI/Jupyter/workers)
@@ -170,7 +202,7 @@ def run_coroutine_sync(coro: Coroutine[Any, Any, Dict[str, Any]], timeout: Optio
 
 
 # ---------------------------------------------------------------------------
-# Per-Domain Singleflight Coalescing Coordinator + TTL Clearance Cache
+# Per-(Domain, Proxy) Singleflight Coalescing Coordinator + TTL Clearance Cache
 # ---------------------------------------------------------------------------
 class _SingleflightCoordinator:
     """Coalesces concurrent challenge solves for the same `(host, proxy)` into a single browser run."""
@@ -295,11 +327,7 @@ _SINGLEFLIGHT = _SingleflightCoordinator()
 
 
 def infer_impersonate_from_user_agent(ua: str) -> Optional[str]:
-    """Map a browser `User-Agent` string to the closest verified native `http_tls` preset.
-
-    Ensures TLS JA3/JA4, HTTP/2 SETTINGS, and `Sec-CH-UA` headers match the browser
-    that solved the challenge.
-    """
+    """Map a browser `User-Agent` string to the closest verified native `http_tls` preset."""
     if not ua:
         return None
     low = ua.lower()
@@ -308,7 +336,6 @@ def infer_impersonate_from_user_agent(ua: str) -> Optional[str]:
     is_ipad = "ipad" in low
     is_ios = "iphone" in low or "ios" in low
 
-    # 1. Microsoft Edge (Edg/, EdgA/, EdgiOS/)
     m_edge = re.search(r"edg(?:a|ios)?/(\d+)", low)
     if m_edge:
         ver = int(m_edge.group(1))
@@ -316,7 +343,6 @@ def infer_impersonate_from_user_agent(ua: str) -> Optional[str]:
         best = min(supported_edge, key=lambda x: (abs(x - min(ver, 148)), -x))
         return f"edge_{best}"
 
-    # 2. Opera (OPR/)
     m_opr = re.search(r"opr/(\d+)", low)
     if m_opr:
         ver = int(m_opr.group(1))
@@ -324,7 +350,6 @@ def infer_impersonate_from_user_agent(ua: str) -> Optional[str]:
         best = min(supported_opr, key=lambda x: (abs(x - min(ver, 131)), -x))
         return f"opera_{best}"
 
-    # 3. Firefox (Firefox/)
     m_ff = re.search(r"firefox/(\d+)", low)
     if m_ff:
         ver = int(m_ff.group(1))
@@ -334,7 +359,6 @@ def infer_impersonate_from_user_agent(ua: str) -> Optional[str]:
         best = min(supported_ff, key=lambda x: (abs(x - min(ver, 151)), -x))
         return f"firefox_{best}"
 
-    # 4. Chrome / Chromium (Chrome/ or CriOS/)
     m_chr = re.search(r"(?:chrome|crios)/(\d+)", low)
     if m_chr:
         ver = int(m_chr.group(1))
@@ -350,7 +374,6 @@ def infer_impersonate_from_user_agent(ua: str) -> Optional[str]:
             return "chrome_149_macos"
         return f"chrome_{best}"
 
-    # 5. Safari (Version/XX.Y ... Safari/)
     m_saf = re.search(r"version/(\d+)(?:\.(\d+))?", low)
     if m_saf and "safari/" in low:
         maj = int(m_saf.group(1))
@@ -378,7 +401,6 @@ def infer_impersonate_from_user_agent(ua: str) -> Optional[str]:
 
 async def _try_click_turnstile_best_driver(tab: Any) -> bool:
     """Attempt to locate and click a Cloudflare Turnstile / interstitial checkbox in `best-driver`."""
-    # 1. Try piercing the Turnstile iframe directly (works across open/closed Shadow DOM and OOPIFs)
     for sel in _TURNSTILE_IFRAME_SELECTORS:
         try:
             if await tab.exists(sel):
@@ -391,7 +413,6 @@ async def _try_click_turnstile_best_driver(tab: Any) -> bool:
         except Exception:
             pass
 
-    # 2. Fallback: click the left-side checkbox coordinates inside the Turnstile widget container rect
     for sel in _TURNSTILE_CONTAINER_SELECTORS:
         try:
             el = await tab.ele(sel, timeout_ms=600)
@@ -439,13 +460,49 @@ def _try_click_turnstile_playwright(page: Any) -> bool:
     return False
 
 
+async def _open_isolated_cdp_proxy_context(browser: Any, url: str, proxy_server: Optional[str]) -> Tuple[Any, Optional[str]]:
+    """Allocate an isolated CDP `BrowserContext` with its own `proxyServer` when supported by the warm browser.
+
+    Falls back cleanly to `browser.get(url, new_tab=True)` if `Target.createBrowserContext` is unavailable.
+    """
+    if not proxy_server or _proxy_has_auth(proxy_server):
+        tab = await browser.get(url, new_tab=True, wait_until="domcontentloaded")
+        return tab, None
+    try:
+        main_tab = await browser.main_tab()
+        ctx_res = await main_tab.send(
+            "Target.createBrowserContext",
+            {"disposeOnDetach": True, "proxyServer": proxy_server},
+        )
+        ctx_id = ctx_res.get("browserContextId") if isinstance(ctx_res, dict) else None
+        if ctx_id:
+            await main_tab.send(
+                "Target.createTarget",
+                {"url": url, "browserContextId": ctx_id},
+            )
+            for candidate in reversed(await browser.tabs()):
+                try:
+                    cur = await candidate.url()
+                    if url in cur or cur != "about:blank":
+                        return candidate, str(ctx_id)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    tab = await browser.get(url, new_tab=True, wait_until="domcontentloaded")
+    return tab, None
+
+
 class BestDriverSolver:
     """Challenge solver bridge powered by `best-driver` (stealth Rust CDP Chromium).
 
     - Safe from both sync (`Session`) and async (`AsyncSession`) callers, even inside
       an already-running event loop (FastAPI, Jupyter, workers) — never drops a coroutine.
-    - Uses per-domain Singleflight coalescing + TTL cache to prevent Thundering Herd.
-    - Supports `keep_warm=True` to reuse a single persistent Chromium instance across challenges.
+    - Uses per-(domain, proxy) Singleflight coalescing + TTL cache to prevent Thundering Herd.
+    - Supports `keep_warm=True` with per-proxy isolation:
+      - Keyed warm browser pool (`max_warm_browsers=4`) for authenticated proxies (`user:pass@host:port`).
+      - Isolated CDP `Target.createBrowserContext(proxyServer=...)` for unauthenticated proxies so
+        the IP solving the challenge always matches the IP sending the Rust request.
     - Actively clicks Cloudflare Turnstile checkboxes (piercing closed Shadow DOM & OOPIF).
     - Extracts `User-Agent`, `Sec-CH-UA*` Client Hints, and matching `impersonate` preset.
     """
@@ -459,6 +516,7 @@ class BestDriverSolver:
         browser_path: Optional[str] = None,
         extra_args: Optional[Sequence[str]] = None,
         keep_warm: bool = False,
+        max_warm_browsers: int = 4,
         cache_ttl: float = 15.0,
         click_turnstile: bool = True,
     ) -> None:
@@ -469,12 +527,14 @@ class BestDriverSolver:
         self.browser_path = browser_path
         self.extra_args = list(extra_args) if extra_args else None
         self.keep_warm = bool(keep_warm)
+        self.max_warm_browsers = max(1, int(max_warm_browsers))
         self.cache_ttl = float(cache_ttl)
         self.click_turnstile = bool(click_turnstile)
-        self._warm_browser: Any = None
+        # Keyed warm browser pool: proxy_key -> best_driver.Browser
+        self._warm_browsers: "OrderedDict[str, Any]" = OrderedDict()
         self._warm_lock: Optional[asyncio.Lock] = None
 
-    async def _solve_with_tab(self, tab: Any, url: str) -> Dict[str, Any]:
+    async def _solve_with_tab(self, tab: Any, url: str, eff_proxy: Optional[str]) -> Dict[str, Any]:
         deadline = _time.monotonic() + self.timeout
         cookies: Sequence[Any] = []
         last_click = 0.0
@@ -512,9 +572,46 @@ class BestDriverSolver:
             "user_agent": ua_str,
             "headers": ch_headers,
             "impersonate": inferred,
+            "proxy": eff_proxy,
         }
 
-    async def _asolve_uncached(self, url: str) -> Dict[str, Any]:
+    async def _get_or_create_warm_browser(self, best_driver_mod: Any, eff_proxy: Optional[str]) -> Tuple[Any, bool]:
+        """Return `(browser, use_cdp_proxy_context)`.
+
+        - Authenticated proxies (`user:pass@host:port`) get a dedicated warm browser keyed by `eff_proxy`
+          so `Fetch.authRequired` credentials match the proxy.
+        - Unauthenticated proxies share the base warm browser (`key=""`) when one is already running and
+          isolate via CDP `Target.createBrowserContext(proxyServer=...)`, or key by `eff_proxy` otherwise.
+        """
+        proxy_key = eff_proxy or ""
+        if not _proxy_has_auth(eff_proxy) and "" in self._warm_browsers:
+            base_b = self._warm_browsers[""]
+            if await base_b.is_alive():
+                self._warm_browsers.move_to_end("")
+                return base_b, bool(eff_proxy)
+
+        existing = self._warm_browsers.get(proxy_key)
+        if existing is not None and await existing.is_alive():
+            self._warm_browsers.move_to_end(proxy_key)
+            return existing, False
+
+        while len(self._warm_browsers) >= self.max_warm_browsers:
+            _old_key, old_b = self._warm_browsers.popitem(last=False)
+            try:
+                await old_b.stop()
+            except Exception:
+                pass
+
+        browser = await best_driver_mod.start(
+            headless=self.headless,
+            proxy=eff_proxy,
+            browser_path=self.browser_path,
+            extra_args=self.extra_args,
+        )
+        self._warm_browsers[proxy_key] = browser
+        return browser, False
+
+    async def _asolve_uncached(self, url: str, eff_proxy: Optional[str]) -> Dict[str, Any]:
         try:
             import best_driver  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -526,40 +623,45 @@ class BestDriverSolver:
             if self._warm_lock is None:
                 self._warm_lock = asyncio.Lock()
             async with self._warm_lock:
-                if self._warm_browser is None or not await self._warm_browser.is_alive():
-                    self._warm_browser = await best_driver.start(
-                        headless=self.headless,
-                        proxy=self.proxy,
-                        browser_path=self.browser_path,
-                        extra_args=self.extra_args,
-                    )
-                tab = await self._warm_browser.get(url, new_tab=True, wait_until="domcontentloaded")
+                browser, use_cdp_ctx = await self._get_or_create_warm_browser(best_driver, eff_proxy)
+                ctx_id: Optional[str] = None
+                if use_cdp_ctx:
+                    tab, ctx_id = await _open_isolated_cdp_proxy_context(browser, url, eff_proxy)
+                else:
+                    tab = await browser.get(url, new_tab=True, wait_until="domcontentloaded")
                 try:
-                    return await self._solve_with_tab(tab, url)
+                    return await self._solve_with_tab(tab, url, eff_proxy)
                 finally:
                     try:
                         await tab.close()
                     except Exception:
                         pass
+                    if ctx_id is not None:
+                        try:
+                            main_tab = await browser.main_tab()
+                            await main_tab.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
+                        except Exception:
+                            pass
 
         async with await best_driver.start(
             headless=self.headless,
-            proxy=self.proxy,
+            proxy=eff_proxy,
             browser_path=self.browser_path,
             extra_args=self.extra_args,
         ) as browser:
             tab = await browser.get(url, wait_until="domcontentloaded")
-            return await self._solve_with_tab(tab, url)
+            return await self._solve_with_tab(tab, url, eff_proxy)
         raise RuntimeError("BestDriverSolver failed to initialize browser")
 
     async def asolve(self, url: str, resp: Any = None) -> Dict[str, Any]:
-        """Asynchronously solve a JS/WAF challenge with per-domain Singleflight coalescing."""
+        """Asynchronously solve a JS/WAF challenge with per-(domain, proxy) Singleflight coalescing."""
+        eff_proxy = _resolve_effective_proxy(self.proxy, resp)
         return await _SINGLEFLIGHT.execute_async(
             url=url,
-            proxy=self.proxy,
+            proxy=eff_proxy,
             ttl=self.cache_ttl,
             timeout=self.timeout,
-            coro_fn=lambda: self._asolve_uncached(url),
+            coro_fn=lambda: self._asolve_uncached(url, eff_proxy),
         )
 
     def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]:
@@ -567,24 +669,46 @@ class BestDriverSolver:
         return run_coroutine_sync(self.asolve(url, resp), timeout=self.timeout + 15.0)
 
     async def aclose(self) -> None:
-        """Close the warm browser instance if `keep_warm=True` was used."""
-        if self._warm_browser is not None:
+        """Close all warm browser instances when `keep_warm=True` was used."""
+        browsers = list(self._warm_browsers.values())
+        self._warm_browsers.clear()
+        for b in browsers:
             try:
-                await self._warm_browser.stop()
-            finally:
-                self._warm_browser = None
+                await b.stop()
+            except Exception:
+                pass
 
     def close(self) -> None:
-        if self._warm_browser is not None:
+        if self._warm_browsers:
             run_coroutine_sync(self._close_coro(), timeout=10.0)
 
     async def _close_coro(self) -> Dict[str, Any]:
         await self.aclose()
         return {}
 
+    def __enter__(self) -> "BestDriverSolver":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "BestDriverSolver":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()
+
 
 class PlaywrightSolver:
-    """Challenge solver bridge powered by Playwright / Camoufox with Singleflight, Turnstile clicking & Client Hints sync."""
+    """Challenge solver bridge powered by Playwright / Camoufox.
+
+    - Supports `keep_warm=True`: keeps a persistent Playwright browser process alive
+      and allocates an isolated `browser.new_context(proxy=...)` per challenge so
+      rotating proxies from `Session(proxies_pool=[...])` each use their own outbound IP
+      without cold-starting Chromium.
+    - Per-(domain, proxy) Singleflight coalescing + TTL cache.
+    - Active Cloudflare Turnstile checkbox clicking & full `Sec-CH-UA*` Client Hints sync.
+    """
 
     def __init__(
         self,
@@ -593,6 +717,7 @@ class PlaywrightSolver:
         proxy: Optional[str] = None,
         wait_cookies: Sequence[str] = DEFAULT_CLEARANCE_COOKIES,
         browser_type: str = "chromium",
+        keep_warm: bool = False,
         cache_ttl: float = 15.0,
         click_turnstile: bool = True,
     ) -> None:
@@ -601,10 +726,84 @@ class PlaywrightSolver:
         self.proxy = proxy
         self.wait_cookies = tuple(wait_cookies)
         self.browser_type = browser_type
+        self.keep_warm = bool(keep_warm)
         self.cache_ttl = float(cache_ttl)
         self.click_turnstile = bool(click_turnstile)
+        self._warm_lock = threading.Lock()
+        self._pw_ctx_mgr: Any = None
+        self._pw: Any = None
+        self._warm_browser: Any = None
 
-    def _solve_uncached(self, url: str) -> Dict[str, Any]:
+    def _solve_in_browser(self, browser: Any, url: str, eff_proxy: Optional[str]) -> Dict[str, Any]:
+        ctx_kw: Dict[str, Any] = {}
+        if eff_proxy:
+            ctx_kw["proxy"] = _format_playwright_proxy(eff_proxy)
+        deadline = _time.monotonic() + self.timeout
+        ctx = browser.new_context(**ctx_kw)
+        try:
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
+            cookies: Sequence[Any] = []
+            last_click = 0.0
+            while _time.monotonic() < deadline:
+                cookies = ctx.cookies([url])
+                title = (page.title() or "").strip().lower()
+                if _has_clearance(cookies, self.wait_cookies) and not any(
+                    m in title for m in _CHALLENGE_TITLE_MARKERS
+                ):
+                    break
+                now = _time.monotonic()
+                if self.click_turnstile and (now - last_click) >= 1.5:
+                    last_click = now
+                    _try_click_turnstile_playwright(page)
+                page.wait_for_timeout(500)
+
+            ch_info = page.evaluate(_CLIENT_HINTS_JS)
+            ua_str: Optional[str] = None
+            ch_headers: Dict[str, str] = {}
+            if isinstance(ch_info, dict):
+                ua_val = ch_info.get("user_agent")
+                if ua_val:
+                    ua_str = str(ua_val)
+                raw_hdrs = ch_info.get("headers")
+                if isinstance(raw_hdrs, dict):
+                    ch_headers = {str(k): str(v) for k, v in raw_hdrs.items() if v is not None}
+            if not ua_str:
+                ua_eval = page.evaluate("() => navigator.userAgent")
+                ua_str = str(ua_eval) if ua_eval else None
+
+            cookies = ctx.cookies([url])
+            return {
+                "cookies": list(cookies),
+                "user_agent": ua_str,
+                "headers": ch_headers,
+                "impersonate": infer_impersonate_from_user_agent(ua_str or ""),
+                "proxy": eff_proxy,
+            }
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+    def _ensure_warm_browser(self, sync_playwright_fn: Any) -> Any:
+        if self._warm_browser is not None:
+            connected = getattr(self._warm_browser, "is_connected", None)
+            if not callable(connected) or connected():
+                return self._warm_browser
+        self.close()
+        self._pw_ctx_mgr = sync_playwright_fn()
+        self._pw = self._pw_ctx_mgr.start()
+        launcher = getattr(self._pw, self.browser_type)
+        # Enable per-context proxy routing on Chromium by providing a placeholder default proxy
+        launch_kw: Dict[str, Any] = {
+            "headless": self.headless,
+            "proxy": {"server": "http://per-context"},
+        }
+        self._warm_browser = launcher.launch(**launch_kw)
+        return self._warm_browser
+
+    def _solve_uncached(self, url: str, eff_proxy: Optional[str]) -> Dict[str, Any]:
         try:
             from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -612,75 +811,67 @@ class PlaywrightSolver:
                 "PlaywrightSolver requires `playwright`: pip install playwright"
             ) from exc
 
-        launch_kw: Dict[str, Any] = {"headless": self.headless}
-        if self.proxy:
-            parsed = urlparse(self.proxy)
-            px: Dict[str, Any] = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-            if parsed.username:
-                px["username"] = parsed.username
-            if parsed.password:
-                px["password"] = parsed.password
-            launch_kw["proxy"] = px
+        if self.keep_warm:
+            with self._warm_lock:
+                browser = self._ensure_warm_browser(sync_playwright)
+                return self._solve_in_browser(browser, url, eff_proxy)
 
-        deadline = _time.monotonic() + self.timeout
+        launch_kw: Dict[str, Any] = {"headless": self.headless}
+        if eff_proxy:
+            launch_kw["proxy"] = _format_playwright_proxy(eff_proxy)
+
         with sync_playwright() as p:
             launcher = getattr(p, self.browser_type)
             browser = launcher.launch(**launch_kw)
             try:
-                ctx = browser.new_context()
-                page = ctx.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
-                cookies: Sequence[Any] = []
-                last_click = 0.0
-                while _time.monotonic() < deadline:
-                    cookies = ctx.cookies([url])
-                    title = (page.title() or "").strip().lower()
-                    if _has_clearance(cookies, self.wait_cookies) and not any(
-                        m in title for m in _CHALLENGE_TITLE_MARKERS
-                    ):
-                        break
-                    now = _time.monotonic()
-                    if self.click_turnstile and (now - last_click) >= 1.5:
-                        last_click = now
-                        _try_click_turnstile_playwright(page)
-                    page.wait_for_timeout(500)
-
-                ch_info = page.evaluate(_CLIENT_HINTS_JS)
-                ua_str: Optional[str] = None
-                ch_headers: Dict[str, str] = {}
-                if isinstance(ch_info, dict):
-                    ua_val = ch_info.get("user_agent")
-                    if ua_val:
-                        ua_str = str(ua_val)
-                    raw_hdrs = ch_info.get("headers")
-                    if isinstance(raw_hdrs, dict):
-                        ch_headers = {str(k): str(v) for k, v in raw_hdrs.items() if v is not None}
-                if not ua_str:
-                    ua_eval = page.evaluate("() => navigator.userAgent")
-                    ua_str = str(ua_eval) if ua_eval else None
-
-                cookies = ctx.cookies([url])
-                return {
-                    "cookies": list(cookies),
-                    "user_agent": ua_str,
-                    "headers": ch_headers,
-                    "impersonate": infer_impersonate_from_user_agent(ua_str or ""),
-                }
+                return self._solve_in_browser(browser, url, eff_proxy)
             finally:
                 browser.close()
 
     def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]:
+        eff_proxy = _resolve_effective_proxy(self.proxy, resp)
         return _SINGLEFLIGHT.execute_sync(
             url=url,
-            proxy=self.proxy,
+            proxy=eff_proxy,
             ttl=self.cache_ttl,
             timeout=self.timeout,
-            fn=lambda: self._solve_uncached(url),
+            fn=lambda: self._solve_uncached(url, eff_proxy),
         )
+
+    def close(self) -> None:
+        """Close the warm Playwright browser and driver process if `keep_warm=True` was used."""
+        if self._warm_browser is not None:
+            try:
+                self._warm_browser.close()
+            except Exception:
+                pass
+            self._warm_browser = None
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+            self._pw_ctx_mgr = None
+
+    async def aclose(self) -> None:
+        await asyncio.to_thread(self.close)
+
+    def __enter__(self) -> "PlaywrightSolver":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "PlaywrightSolver":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()
 
 
 class FlareSolverrSolver:
-    """Challenge solver bridge for a local or remote FlareSolverr `/v1` endpoint with Singleflight & UA preset sync."""
+    """Challenge solver bridge for a local or remote FlareSolverr `/v1` endpoint with Singleflight & per-request proxy sync."""
 
     def __init__(
         self,
@@ -694,7 +885,7 @@ class FlareSolverrSolver:
         self.proxy = proxy
         self.cache_ttl = float(cache_ttl)
 
-    def _solve_uncached(self, url: str) -> Dict[str, Any]:
+    def _solve_uncached(self, url: str, eff_proxy: Optional[str]) -> Dict[str, Any]:
         from http_tls.requests import Session
 
         payload: Dict[str, Any] = {
@@ -702,8 +893,8 @@ class FlareSolverrSolver:
             "url": url,
             "maxTimeout": self.max_timeout_ms,
         }
-        if self.proxy:
-            payload["proxy"] = {"url": self.proxy}
+        if eff_proxy:
+            payload["proxy"] = {"url": eff_proxy}
 
         with Session(timeout=max(30.0, self.max_timeout_ms / 1000.0 + 5.0)) as helper:
             res = helper.post(self.endpoint, json=payload)
@@ -714,13 +905,15 @@ class FlareSolverrSolver:
                 "cookies": sol.get("cookies", []),
                 "user_agent": ua_str,
                 "impersonate": infer_impersonate_from_user_agent(str(ua_str or "")),
+                "proxy": eff_proxy,
             }
 
     def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]:
+        eff_proxy = _resolve_effective_proxy(self.proxy, resp)
         return _SINGLEFLIGHT.execute_sync(
             url=url,
-            proxy=self.proxy,
+            proxy=eff_proxy,
             ttl=self.cache_ttl,
             timeout=self.max_timeout_ms / 1000.0,
-            fn=lambda: self._solve_uncached(url),
+            fn=lambda: self._solve_uncached(url, eff_proxy),
         )
