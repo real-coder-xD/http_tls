@@ -11,9 +11,40 @@ permissions:
   id-token: write
 
 jobs:
+  lint:
+    name: Static Quality Gates (Clippy + Typing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up latest stable Rust + Clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Linux BoringSSL build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake perl clang libclang-dev ninja-build
+
+      - name: Run cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Verify Python syntax & stub typing (mypy)
+        run: |
+          python -m pip install --upgrade pip mypy
+          python -m compileall -q python/ tests/ benchmarks/
+          mypy --ignore-missing-imports python/http_tls/__init__.pyi
+
   build-wheels:
     name: Build & Test Wheels on ${{ matrix.os }} (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    needs: [lint]
     strategy:
       fail-fast: false
       matrix:
@@ -22,23 +53,29 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             run_tests: true
-          # Linux x86_64 (manylinux + BoringSSL)
+            test_pythons: '3.12'
+          # Linux x86_64 (AlmaLinux 8 manylinux_2_28 + BoringSSL)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            manylinux: auto
+            manylinux: 2_28
             run_tests: true
-          # Linux aarch64 (native ARM64 runner for clean BoringSSL build)
+            test_pythons: '3.9,3.12,3.14'
+          # Linux aarch64 (native ARM64 runner + manylinux_2_28 + BoringSSL)
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            manylinux: auto
+            manylinux: 2_28
             run_tests: true
-          # macOS Intel & Apple Silicon
+            test_pythons: '3.12'
+          # macOS Intel (cross-compiled from Apple Silicon)
           - os: macos-latest
             target: x86_64-apple-darwin
             run_tests: false
+            test_pythons: ''
+          # macOS Apple Silicon
           - os: macos-latest
             target: aarch64-apple-darwin
             run_tests: true
+            test_pythons: '3.12'
 
     steps:
       - uses: actions/checkout@v4
@@ -68,20 +105,38 @@ jobs:
           manylinux: ${{ matrix.manylinux || '' }}
           args: --release --out dist
           before-script-linux: |
-            if command -v yum >/dev/null 2>&1; then
-              yum install -y cmake perl-core clang-devel llvm-devel || true
-            elif command -v dnf >/dev/null 2>&1; then
-              dnf install -y cmake perl-core clang-devel llvm-devel || true
+            set -e
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y cmake perl-core clang clang-devel clang-libs llvm-devel git ninja-build
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y cmake perl-core clang clang-devel clang-libs llvm-devel git
             elif command -v apt-get >/dev/null 2>&1; then
-              apt-get update && apt-get install -y cmake perl libclang-dev clang || true
+              apt-get update && apt-get install -y cmake perl clang libclang-dev git ninja-build
             fi
+            rustup update stable
+            rustup default stable
+            rustc --version
 
-      - name: Run pytest test suite against built wheel
+      - name: Run pytest test suite against built ABI3 wheel (Python 3.12)
         if: ${{ matrix.run_tests }}
         shell: bash
         run: |
           python -m pip install --upgrade pip
           python -m pip install pytest cryptography certifi
+          python -m pip install dist/*.whl
+          python -m pytest -v tests/
+
+      - name: Verify ABI3 wheel compatibility on Python 3.9
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Run pytest on Python 3.9
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip pytest cryptography certifi
           python -m pip install dist/*.whl
           python -m pytest -v tests/
 
@@ -94,6 +149,7 @@ jobs:
   build-sdist:
     name: Build Source Distribution (sdist)
     runs-on: ubuntu-latest
+    needs: [lint]
     steps:
       - uses: actions/checkout@v4
       - name: Build sdist

@@ -175,7 +175,7 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
                 Platform::Android => format!("Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Mobile Safari/537.36"),
                 _ => format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"),
             };
-            let grease = if ver % 2 == 0 { "24" } else { "99" };
+            let grease = if ver.is_multiple_of(2) { "24" } else { "99" };
             let ch = format!("\"Google Chrome\";v=\"{ver}\", \"Chromium\";v=\"{ver}\", \"Not)A;Brand\";v=\"{grease}\"");
             (Some(ua), Some(ch))
         } else {
@@ -275,8 +275,7 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
             .replace("safari", "")
             .replace("ios", "")
             .replace("ipad", "")
-            .replace('_', "")
-            .replace('.', "");
+            .replace(['_', '.'], "");
         let profile = match (is_ios, is_ipad, clean.as_str()) {
             (true, _, s) if s.starts_with("262") => Profile::SafariIos26_2,
             (true, _, s) if s.starts_with("26") || s.starts_with("27") => Profile::SafariIos26,
@@ -345,7 +344,7 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
     }
 
     if lower.starts_with("okhttp") {
-        let clean = lower.replace("okhttp", "").replace('_', "").replace('.', "");
+        let clean = lower.replace("okhttp", "").replace(['_', '.'], "");
         let profile = match clean.as_str() {
             "39" => Profile::OkHttp3_9,
             "311" => Profile::OkHttp3_11,

@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime
+import gc
+import gzip
 import hashlib
 import json
 import os
@@ -13,6 +15,8 @@ import struct
 import tempfile
 import threading
 import time
+import tracemalloc
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -76,6 +80,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(payload).encode(), [("Content-Type", "application/json")])
         elif p.startswith("/latin1"):
             self._send(200, "café".encode("iso-8859-1"), [("Content-Type", "text/plain; charset=ISO-8859-1")])
+        elif p.startswith("/gzip"):
+            raw = gzip.compress(b"compressed-gzip-payload-ok")
+            self._send(200, raw, [("Content-Encoding", "gzip"), ("Content-Type", "text/plain")])
+        elif p.startswith("/deflate"):
+            raw = zlib.compress(b"compressed-deflate-payload-ok")
+            self._send(200, raw, [("Content-Encoding", "deflate"), ("Content-Type", "text/plain")])
         elif p.startswith("/stream"):
             self.send_response(200)
             self.send_header("Transfer-Encoding", "chunked")
@@ -139,6 +149,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found")
 
     def do_POST(self):
+        if self.path == "/redir307":
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 0:
+                self.rfile.read(length)
+            self._send(307, b"", [("Location", "/upload")])
+            return
+        if self.path == "/redir308":
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 0:
+                self.rfile.read(length)
+            self._send(308, b"", [("Location", "/upload")])
+            return
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length > 0 else b""
         payload = {
@@ -522,3 +544,101 @@ def test_custom_ca_and_mtls():
 
         with Session(cert=(crt_path, key_path), timeout=15) as s:
             assert s.get("https://www.example.com/").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 6. Edge Cases: Compression, 307/308 POST Redirects, Proxy Pool, Stress/RAM
+# ---------------------------------------------------------------------------
+def test_compression_gzip_and_deflate(http_server):
+    base, _port = http_server
+    with Session(base_url=base) as s:
+        rg = s.get("/gzip")
+        assert rg.status_code == 200 and rg.text == "compressed-gzip-payload-ok"
+        rd = s.get("/deflate")
+        assert rd.status_code == 200 and rd.text == "compressed-deflate-payload-ok"
+
+
+def test_redirect_307_and_308_preserve_post_body(http_server):
+    base, _port = http_server
+    with Session(base_url=base) as s:
+        r307 = s.post("/redir307", json={"keep": "307-body"})
+        assert r307.status_code == 200 and len(r307.history) == 1 and r307.history[0].status_code == 307
+        assert '"keep"' in r307.json()["body"]
+
+        r308 = s.post("/redir308", data="preserve-308-raw")
+        assert r308.status_code == 200 and len(r308.history) == 1 and r308.history[0].status_code == 308
+        assert r308.json()["body"] == "preserve-308-raw"
+
+
+def test_local_http_proxy_and_proxy_pool_rotation():
+    hits = {"p1": 0, "p2": 0}
+
+    def make_proxy(tag):
+        class ProxyHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                hits[tag] += 1
+                body = json.dumps({"via": tag, "target": self.path}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, f"http://127.0.0.1:{srv.server_port}"
+
+    s1, p1 = make_proxy("p1")
+    s2, p2 = make_proxy("p2")
+    try:
+        with Session(proxies_pool=[p1, p2], timeout=5) as s:
+            r1 = s.get("http://example.invalid/one")
+            r2 = s.get("http://example.invalid/two")
+            r3 = s.get("http://example.invalid/three")
+            assert r1.json()["via"] == "p1"
+            assert r2.json()["via"] == "p2"
+            assert r3.json()["via"] == "p1"
+            assert hits["p1"] == 2 and hits["p2"] == 1
+    finally:
+        s1.shutdown()
+        s2.shutdown()
+
+
+def test_session_cookie_isolation_and_preset_families(http_server):
+    base, _port = http_server
+    with Session(base_url=base) as s1, Session(base_url=base) as s2:
+        s1.get("/set")
+        assert s1.cookies["a"] == "1"
+        assert "a" not in s2.cookies
+        assert s2.get("/echo").json()["cookie"] is None
+
+    for preset in ("chrome_149", "edge_148", "safari_26_4", "firefox_151", "opera_131", "okhttp_5", "random", "weighted_random"):
+        with Session(base_url=base, impersonate=preset) as s:
+            r = s.get("/echo")
+            assert r.status_code == 200 and r.json()["ua"]
+
+
+def test_high_concurrency_stress_and_no_memory_leak(http_server):
+    """Fire 300 concurrent native Tokio requests and verify bounded Python memory growth."""
+    base, _port = http_server
+
+    async def burst(n: int):
+        async with httpx.AsyncClient(base_url=base, impersonate="chrome_149") as client:
+            resps = await asyncio.gather(*[client.get(f"/echo?i={i}") for i in range(n)])
+            assert len(resps) == n and all(r.is_success for r in resps)
+
+    asyncio.run(burst(30))  # warmup
+    gc.collect()
+    tracemalloc.start()
+    snap1 = tracemalloc.take_snapshot()
+    asyncio.run(burst(300))
+    gc.collect()
+    snap2 = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+
+    delta_bytes = sum(stat.size_diff for stat in snap2.compare_to(snap1, "lineno") if stat.size_diff > 0)
+    # After GC, 300 concurrent completed requests must retain < 4 MB in Python heap
+    assert delta_bytes < 4 * 1024 * 1024, f"Unexpected memory retention: {delta_bytes} bytes"

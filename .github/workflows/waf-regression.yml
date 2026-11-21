@@ -1,0 +1,36 @@
+name: Weekly WAF & JA4 Regression
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'  # Every Monday 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  waf-regression:
+    name: Live JA4 / H2 / WAF Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install latest published http-tls & pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install http-tls pytest cryptography certifi
+
+      - name: Run full test suite & JA4 fingerprint parity check
+        run: |
+          python -m pytest -v tests/
+          python -c "
+          import http_tls
+          for preset in ('chrome_149', 'safari_26_4', 'firefox_151', 'edge_148'):
+              with http_tls.Session(impersonate=preset, timeout=20) as s:
+                  r = s.get('https://tls.peet.ws/api/all')
+                  assert r.status_code == 200
+                  j = r.json()
+                  print(f'{preset:14s} | {r.http_version:7s} | JA4={j[\"tls\"][\"ja4\"]} | H2={j[\"http2\"][\"akamai_fingerprint\"]}')
+          "
