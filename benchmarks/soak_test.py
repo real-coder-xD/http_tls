@@ -26,7 +26,7 @@ class _SoakHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     _BODY = b'{"status":"ok","payload":"0123456789abcdef"}'
 
-    def log_message(self, fmt: str, *args) -> None:
+    def log_message(self, format: str, *args) -> None:
         return
 
     def do_GET(self) -> None:
@@ -67,10 +67,16 @@ def _rss_mb() -> float:
     try:
         import resource
 
-        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return usage / (1024.0 * 1024.0) if os.uname().sysname == "Darwin" else usage / 1024.0
+        getrusage = getattr(resource, "getrusage", None)
+        rusage_self = getattr(resource, "RUSAGE_SELF", 0)
+        if getrusage is not None:
+            usage = getrusage(rusage_self).ru_maxrss
+            uname_fn = getattr(os, "uname", None)
+            is_darwin = uname_fn is not None and uname_fn().sysname == "Darwin"
+            return usage / (1024.0 * 1024.0) if is_darwin else usage / 1024.0
     except Exception:
-        return 0.0
+        pass
+    return 0.0
 
 
 class _QuietSoakServer(ThreadingHTTPServer):

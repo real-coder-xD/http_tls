@@ -12,7 +12,7 @@ import asyncio
 import statistics
 import time
 import tracemalloc
-from typing import Callable, List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 
 def _run_sync(name: str, fn: Callable[[], int], n: int) -> Tuple[str, float, float, float]:
@@ -31,7 +31,7 @@ def _run_sync(name: str, fn: Callable[[], int], n: int) -> Tuple[str, float, flo
     return name, statistics.median(latencies), n / total, peak / 1024.0
 
 
-async def _run_async(name: str, coro_factory: Callable[[], object], concurrency: int) -> Tuple[str, float, float, float]:
+async def _run_async(name: str, coro_factory: Callable[[], Awaitable[int]], concurrency: int) -> Tuple[str, float, float, float]:
     tracemalloc.start()
     t0 = time.perf_counter()
     statuses = await asyncio.gather(*[coro_factory() for _ in range(concurrency)])
@@ -89,7 +89,7 @@ def main() -> None:
             rows.append(
                 await _run_async(
                     "http_tls AsyncSession",
-                    lambda: s.get(args.url).then if False else _status(s.get(args.url)),
+                    lambda: _status(s.get(args.url)),
                     args.concurrency,
                 )
             )

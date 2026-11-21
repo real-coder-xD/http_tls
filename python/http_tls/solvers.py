@@ -526,10 +526,10 @@ class BestDriverSolver:
         self.wait_cookies = tuple(wait_cookies)
         self.browser_path = browser_path
         self.extra_args = list(extra_args) if extra_args else None
-        self.keep_warm = bool(keep_warm)
-        self.max_warm_browsers = max(1, int(max_warm_browsers))
+        self.keep_warm = keep_warm
+        self.max_warm_browsers = max(1, max_warm_browsers)
         self.cache_ttl = float(cache_ttl)
-        self.click_turnstile = bool(click_turnstile)
+        self.click_turnstile = click_turnstile
         # Keyed warm browser pool: proxy_key -> best_driver.Browser
         self._warm_browsers: "OrderedDict[str, Any]" = OrderedDict()
         self._warm_lock: Optional[asyncio.Lock] = None
@@ -726,9 +726,9 @@ class PlaywrightSolver:
         self.proxy = proxy
         self.wait_cookies = tuple(wait_cookies)
         self.browser_type = browser_type
-        self.keep_warm = bool(keep_warm)
+        self.keep_warm = keep_warm
         self.cache_ttl = float(cache_ttl)
-        self.click_turnstile = bool(click_turnstile)
+        self.click_turnstile = click_turnstile
         self._warm_lock = threading.Lock()
         self._pw_ctx_mgr: Any = None
         self._pw: Any = None
@@ -881,7 +881,7 @@ class FlareSolverrSolver:
         cache_ttl: float = 15.0,
     ) -> None:
         self.endpoint = endpoint
-        self.max_timeout_ms = int(max_timeout_ms)
+        self.max_timeout_ms = max_timeout_ms
         self.proxy = proxy
         self.cache_ttl = float(cache_ttl)
 

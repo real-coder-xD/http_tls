@@ -70,3 +70,6 @@ module-name = "http_tls._core"
 features = ["pyo3/extension-module"]
 strip = true
 opt-level = 3
+
+[tool.pyrefly]
+search-path = ["python"]

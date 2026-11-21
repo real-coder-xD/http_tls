@@ -53,7 +53,7 @@ try:
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.7.1"
+    __version__ = "0.7.2"
 
     def _rust_presets() -> List[str]:
         return []
@@ -63,11 +63,11 @@ except ImportError:
 
 
 # Optional legacy curl_cffi backend (only used when explicitly requested via engine="curl_cffi")
-_CffiSession: Any = None
+_CffiSession: Optional[Callable[..., Any]] = None
 try:
-    from curl_cffi.requests.session import Session as _ImportedCffiSession
-    _CffiSession = _ImportedCffiSession
-    _HAS_CFFI = True
+    import curl_cffi.requests.session as _cffi_mod
+    _CffiSession = getattr(_cffi_mod, "Session", None)
+    _HAS_CFFI = _CffiSession is not None
 except ImportError:
     _HAS_CFFI = False
 
@@ -530,7 +530,7 @@ def _read_file(path: str) -> bytes:
 def _split_verify(verify: Union[bool, str, None]) -> Tuple[bool, Optional[str]]:
     if isinstance(verify, str):
         return True, verify
-    return bool(True if verify is None else verify), None
+    return (True if verify is None else verify), None
 
 
 _PEM_CERT_RE = re.compile(rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
@@ -639,15 +639,15 @@ class Cookies(dict):
             super().__delitem__(name)
 
     def __setitem__(self, name: str, value: str) -> None:
-        self.set(str(name), str(value))
+        self.set(name, value)
 
     def __delitem__(self, name: str) -> None:
         if not super().__contains__(name):
             raise KeyError(name)
-        self.delete(str(name))
+        self.delete(name)
 
     def update(self, other: Any = None, **kwargs: Any) -> None:  # type: ignore[override]
-        items: List[Tuple[str, Any]] = []
+        items: List[Tuple[Any, Any]] = []
         if other is not None:
             if hasattr(other, "items"):
                 items.extend(other.items())
@@ -673,8 +673,8 @@ class Cookies(dict):
                     "value": val,
                     "domain": d_norm,
                     "path": p_norm,
-                    "secure": bool(sec),
-                    "httpOnly": bool(ho),
+                    "secure": sec,
+                    "httpOnly": ho,
                 }
                 super().__setitem__(name, val)
         for k, v in resp_cookies.items():
@@ -704,11 +704,11 @@ class Cookies(dict):
                 "value": value,
                 "domain": d_norm,
                 "path": p_norm,
-                "secure": bool(secure),
-                "httpOnly": bool(http_only),
+                "secure": secure,
+                "httpOnly": http_only,
             }
             if self._on_set is not None:
-                self._on_set(name, value, d_norm, p_norm, bool(secure), bool(http_only))
+                self._on_set(name, value, d_norm, p_norm, secure, http_only)
             super().__setitem__(name, value)
         else:
             self._unscoped[name] = value
@@ -785,7 +785,7 @@ class Cookies(dict):
             k: v for k, v in self._unscoped.items() if k not in scoped_for_host
         }
         if extra:
-            out.update({str(k): str(v) for k, v in extra.items()})
+            out.update(extra)
         return out or None
 
 
@@ -1376,18 +1376,18 @@ class Session:
         self.allow_redirects = allow_redirects and follow_redirects
         self.engine = engine
         self.auth = auth
-        self.retries = max(0, int(retries))
+        self.retries = max(0, retries)
         self.retry_backoff = float(retry_backoff)
         self.retry_statuses = tuple(retry_statuses)
-        self.retry_on_challenge = bool(retry_on_challenge)
-        self.rotate_impersonate = bool(rotate_impersonate)
+        self.retry_on_challenge = retry_on_challenge
+        self.rotate_impersonate = rotate_impersonate
         self.keylog_file = keylog_file
-        self.system_dns = bool(system_dns)
-        self.record_har = bool(record_har)
+        self.system_dns = system_dns
+        self.record_har = record_har
         self.har_entries: List[Dict[str, Any]] = []
         self.flare_solverr_url = flare_solverr_url
         self.solver = solver
-        self.auto_referer = bool(auto_referer)
+        self.auto_referer = auto_referer
         self.fetch_mode = fetch_mode
         self.transport = transport
         self._last_url: Optional[str] = None
@@ -1408,6 +1408,7 @@ class Session:
             on_delete=self._delete_backend_cookie,
         )
         self._closed = False
+        self._session: Any = None
         p_val = _extract_proxy(proxy, proxies)
         self.proxies = dict(proxies) if proxies else ({"all": proxy, "http": proxy, "https": proxy} if proxy else {})
 
@@ -1428,7 +1429,7 @@ class Session:
                 merged_h2.update(http2_options)
 
         if engine == "curl_cffi":
-            if not _HAS_CFFI:
+            if not _HAS_CFFI or _CffiSession is None:
                 raise RuntimeError('engine="curl_cffi" requires curl_cffi: pip install "http-tls[curl_cffi]"')
             self._mode = "curl_cffi"
             self._session = _CffiSession(
@@ -1785,7 +1786,7 @@ class Session:
             meta_list.append((method, full_url, args.get("headers")))
 
         try:
-            natives = self._session.gather(native_specs, concurrency=max(1, int(concurrency)))
+            natives = self._session.gather(native_specs, concurrency=max(1, concurrency))
         except (RuntimeError, OSError) as exc:
             raise _translate_error(exc) from exc
 
@@ -1824,7 +1825,7 @@ class Session:
 
         merged_params: Optional[Dict[str, str]] = None
         if self.params or params:
-            mp: Dict[str, Any] = dict(self.params)
+            mp: Dict[Any, Any] = dict(self.params)
             if params:
                 mp.update(params)
             merged_params = {str(k): str(v) for k, v in mp.items()}
@@ -1846,7 +1847,7 @@ class Session:
         if mp_files is not None:
             if isinstance(data, dict):
                 for k, v in data.items():
-                    mp_files.append((str(k), None, str(v).encode("utf-8"), None))
+                    mp_files.append((k, None, str(v).encode("utf-8"), None))
         elif isinstance(data, dict):
             body = urlencode(data, doseq=True).encode("utf-8")
             if not any(k.lower() == "content-type" for k in req_headers):
@@ -1854,7 +1855,7 @@ class Session:
         elif isinstance(data, str):
             body = data.encode("utf-8")
         elif data is not None:
-            body = bytes(data)
+            body = data
 
         verify_flag: Optional[bool] = None
         ca_bytes: Optional[bytes] = None
@@ -1879,7 +1880,7 @@ class Session:
             verify=verify_flag,
             ca_bundle=ca_bytes,
             header_order=list(header_order) if header_order else None,
-            impersonate=str(impersonate_override) if impersonate_override else None,
+            impersonate=impersonate_override if impersonate_override else None,
             local_address=local_address,
         )
 
@@ -2088,7 +2089,7 @@ class Session:
 
         merged_params: Optional[Dict[str, str]] = None
         if self.params or params:
-            mp: Dict[str, Any] = dict(self.params)
+            mp: Dict[Any, Any] = dict(self.params)
             if params:
                 mp.update(params)
             merged_params = {str(k): str(v) for k, v in mp.items()}
@@ -2187,7 +2188,7 @@ class Session:
         return self.request("OPTIONS", url, **kwargs)
 
     @contextmanager
-    def stream(self, method: str, url: str, **kwargs: Any) -> Iterator[Response]:
+    def stream(self, method: str, url: str, **kwargs: Any):
         """Context-manager streaming request (httpx & curl_cffi compatible)."""
         kwargs["stream"] = True
         resp = self.request(method, url, **kwargs)
@@ -2505,7 +2506,7 @@ class AsyncSession:
         return await self.request("OPTIONS", url, **kwargs)
 
     @asynccontextmanager
-    async def stream(self, method: str, url: str, **kwargs: Any) -> AsyncIterator[Response]:
+    async def stream(self, method: str, url: str, **kwargs: Any):
         """Async context-manager streaming request (httpx & curl_cffi compatible)."""
         kwargs["stream"] = True
         resp = await self.request(method, url, **kwargs)
@@ -2602,7 +2603,7 @@ def options(url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwa
 @contextmanager
 def stream(
     method: str, url: str, impersonate: Union[str, BrowserType] = "chrome_149", **kwargs: Any
-) -> Iterator[Response]:
+):
     """Top-level context-manager streaming request (httpx.stream compatible)."""
     kwargs["stream"] = True
     resp = request(method, url, impersonate=impersonate, **kwargs)

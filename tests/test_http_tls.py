@@ -42,7 +42,7 @@ _FLAKY_COUNTER = {"503": 0, "cf": 0}
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *args):
+    def log_message(self, format: str, *args):
         pass
 
     def _send(self, code: int, body: bytes = b"", headers=()):
@@ -196,7 +196,7 @@ def _start_ws_echo_server():
                 if not c:
                     return
                 raw += c
-            key = None
+            key = ""
             for line in raw.decode("latin1").split("\r\n"):
                 if line.lower().startswith("sec-websocket-key:"):
                     key = line.split(":", 1)[1].strip()
@@ -214,11 +214,11 @@ def _start_ws_echo_server():
                 masked = (hdr[1] & 0x80) != 0
                 plen = hdr[1] & 0x7F
                 if plen == 126:
-                    plen = struct.unpack("!H", recv_exact(conn, 2))[0]
+                    plen = struct.unpack("!H", recv_exact(conn, 2) or b"\x00\x00")[0]
                 elif plen == 127:
-                    plen = struct.unpack("!Q", recv_exact(conn, 8))[0]
-                mask = recv_exact(conn, 4) if masked else b"\x00\x00\x00\x00"
-                data = recv_exact(conn, plen) if plen else b""
+                    plen = struct.unpack("!Q", recv_exact(conn, 8) or b"\x00" * 8)[0]
+                mask = (recv_exact(conn, 4) or b"\x00\x00\x00\x00") if masked else b"\x00\x00\x00\x00"
+                data = (recv_exact(conn, plen) or b"") if plen else b""
                 if masked:
                     data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
                 if opcode == 0x8:
@@ -575,7 +575,7 @@ def test_local_http_proxy_and_proxy_pool_rotation():
 
     def make_proxy(tag):
         class ProxyHandler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
+            def log_message(self, format: str, *args):
                 pass
 
             def do_GET(self):

@@ -39,7 +39,7 @@ from http_tls.solvers import (
 class _FastHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt: str, *args) -> None:
+    def log_message(self, format: str, *args) -> None:
         return
 
     def do_GET(self) -> None:
