@@ -1,17 +1,24 @@
 <div align="center">
 
-# 🔐 http_tls
+# `http_tls`
 
 **Rust & BoringSSL TLS (JA3/JA4) and HTTP/2 Impersonating HTTP Client for Python**
 
-[![CI & Release Wheels](https://github.com/real-coder-xD/http_tls/actions/workflows/release.yml/badge.svg)](https://github.com/real-coder-xD/http_tls/actions)
-[![PyPI version](https://img.shields.io/pypi/v/http-tls.svg)](https://pypi.org/project/http-tls/)
-[![Python versions](https://img.shields.io/badge/python-3.8%20--%203.14-blue.svg)](https://pypi.org/project/http-tls/)
-[![Downloads](https://img.shields.io/pypi/dm/http-tls.svg)](https://pypi.org/project/http-tls/)
-[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+*Byte-exact browser fingerprints, native Tokio async, and GIL-free parallel batching — a drop-in replacement for `requests`, `httpx`, and `curl_cffi` shipped as one self-contained ABI3 wheel.*
 
-[Installation](#-installation) • [Quick Start](#-migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client) • [Benchmarks](#-verified-benchmarks--live-ja4--http2-fingerprint-audit) • [API Reference](#-api-reference-summary) • [FAQ](#-frequently-asked-questions-faq) • [Changelog](CHANGELOG.md)
+[![PyPI version](https://img.shields.io/pypi/v/http-tls?style=flat-square&color=blue)](https://pypi.org/project/http-tls/)
+[![Python](https://img.shields.io/badge/python-3.8%20--%203.14-blue.svg?style=flat-square)](https://www.python.org/)
+[![Typing](https://img.shields.io/badge/typing-PEP%20561%20typed-007acc.svg?style=flat-square)](https://peps.python.org/pep-0561/)
+[![Rust](https://img.shields.io/badge/rust-PyO3%200.23%20%7C%20Tokio%20%7C%20BoringSSL-orange.svg?style=flat-square)](https://www.rust-lang.org/)
+
+[![CI](https://img.shields.io/github/actions/workflow/status/real-coder-xD/http_tls/release.yml?style=flat-square&label=CI)](https://github.com/real-coder-xD/http_tls/actions)
+[![Browser Presets](https://img.shields.io/badge/browser%20presets-100%2B-success.svg?style=flat-square)](#supported-browser-impersonation-presets-100-profiles)
+[![Wheels](https://img.shields.io/badge/wheels-5%20platforms-brightgreen.svg?style=flat-square)](https://pypi.org/project/http-tls/#files)
+[![Downloads](https://img.shields.io/pypi/dm/http-tls?style=flat-square&color=blue)](https://pypi.org/project/http-tls/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](https://github.com/real-coder-xD/http_tls/blob/main/LICENSE)
+
+[Why](#why-http_tls) · [Comparison](#comparison-http_tls-vs-curl_cffi-primp-tls-client-httpx-and-requests) · [Benchmarks](#verified-benchmarks--live-ja4--http2-fingerprint-audit) · [Installation](#installation) · [Quick Start](#migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client) · [Concurrency](#high-concurrency-execution-native-tokio-async--sync-gather) · [Streaming](#streaming-responses--multipart-file-uploads) · [WebSockets](#tls-impersonated-websockets-sync--async) · [Fingerprint Tuning](#custom-ja3-boringssl-tls_options-http2-settings--wire-header-order)<br>
+[Proxies & DNS](#proxies-custom-dns-resolve-ipv6-64-binding--hickory-dns) · [Auth & mTLS](#authentication-basic-bearer-digest-custom-ca-bundles--mutual-tls-mtls) · [Anti-Bot](#waf-challenge-detection-retries-playwright-storage_statejson--solver-bridge) · [Traffic Inspection](#traffic-inspection-wireshark-keylog--har-12-export) · [Presets](#supported-browser-impersonation-presets-100-profiles) · [API Reference](#api-reference-summary) · [Architecture](#architecture-under-the-hood) · [FAQ](#frequently-asked-questions-faq) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -25,7 +32,7 @@ pip install http-tls
 
 ---
 
-## 📌 Key Facts (At a Glance)
+## Key Facts (At a Glance)
 
 | Property | Value |
 | :--- | :--- |
@@ -43,72 +50,49 @@ pip install http-tls
 
 ---
 
-## 📑 Table of Contents
-
-- [Why `http_tls`?](#-why-http_tls)
-- [Comparison: `http_tls` vs `curl_cffi`, `primp`, `tls-client`, `httpx`, and `requests`](#-comparison-http_tls-vs-curl_cffi-primp-tls-client-httpx-and-requests)
-- [Verified Benchmarks & Live JA4 / HTTP/2 Fingerprint Audit](#-verified-benchmarks--live-ja4--http2-fingerprint-audit)
-- [Installation](#-installation)
-- [Migration & Drop-in Quick Start (`requests`, `httpx`, `curl_cffi`, `tls-client`)](#-migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client)
-- [High-Concurrency Execution: Native Tokio Async & Sync `gather()`](#-high-concurrency-execution-native-tokio-async--sync-gather)
-- [Streaming Responses & Multipart File Uploads](#-streaming-responses--multipart-file-uploads)
-- [TLS-Impersonated WebSockets (Sync & Async)](#-tls-impersonated-websockets-sync--async)
-- [Custom JA3, BoringSSL `tls_options`, HTTP/2 Settings & Wire Header Order](#-custom-ja3-boringssl-tls_options-http2-settings--wire-header-order)
-- [Proxies, Custom DNS (`resolve`), IPv6 `/64` Binding & Hickory DNS](#-proxies-custom-dns-resolve-ipv6-64-binding--hickory-dns)
-- [Authentication (`Basic`, `Bearer`, `Digest`), Custom CA Bundles & Mutual TLS (mTLS)](#-authentication-basic-bearer-digest-custom-ca-bundles--mutual-tls-mtls)
-- [WAF Challenge Detection, Retries, Playwright `storage_state.json` & Solver Bridge](#-waf-challenge-detection-retries-playwright-storage_statejson--solver-bridge)
-- [Traffic Inspection: Wireshark KeyLog & HAR 1.2 Export](#-traffic-inspection-wireshark-keylog--har-12-export)
-- [Supported Browser Impersonation Presets (100+ Profiles)](#-supported-browser-impersonation-presets-100-profiles)
-- [API Reference Summary](#-api-reference-summary)
-- [Frequently Asked Questions (FAQ)](#-frequently-asked-questions-faq)
-- [Testing & Development](#-testing--development)
-- [License](#-license)
-
----
-
-## 💡 Why `http_tls`?
+## Why `http_tls`?
 
 Standard Python HTTP clients (`requests`, `urllib3`, `aiohttp`, `httpx`) rely on the system OpenSSL stack. Their TLS `ClientHello` cipher suites, extensions, elliptic curves, and HTTP/2 `SETTINGS` frames produce non-browser JA3/JA4 signatures that are immediately flagged or throttled by Cloudflare, Akamai, DataDome, PerimeterX, Imperva, and Fastly.
 
 Existing Python TLS-impersonating alternatives each carry architectural trade-offs:
-- `tls-client` wraps a Go CGo shared library (`utls`), which suffers from CGo memory leaks in long-running workers, lacks native `asyncio`, and does not synchronize `cookies.clear()` across the FFI boundary.
-- `curl_cffi` binds `libcurl-impersonate` over CFFI, carrying C memory-management complexity and lacking synchronous Rust-native batching, built-in WAF interstitial detection, HAR recording, or Playwright `storage_state.json` integration.
-- `primp` and `rnet` expose Rust engines but do not provide full drop-in API compatibility with `requests`, `httpx`, and `curl_cffi`.
+- `▸` `tls-client` wraps a Go CGo shared library (`utls`), which suffers from CGo memory leaks in long-running workers, lacks native `asyncio`, and does not synchronize `cookies.clear()` across the FFI boundary.
+- `▸` `curl_cffi` binds `libcurl-impersonate` over CFFI, carrying C memory-management complexity and lacking synchronous Rust-native batching, built-in WAF interstitial detection, HAR recording, or Playwright `storage_state.json` integration.
+- `▸` `primp` and `rnet` expose Rust engines but do not provide full drop-in API compatibility with `requests`, `httpx`, and `curl_cffi`.
 
 `http_tls` solves these problems in a single compiled Rust PyO3 module:
-1. **Byte-Exact BoringSSL Fingerprinting:** Authentic JA3, JA4, GREASE, ALPS, Post-Quantum `X25519MLKEM768`, and Akamai HTTP/2 frame order for Chrome, Safari, Firefox, Edge, Opera, OkHttp, and Tor.
-2. **True Native Async + GIL-Free Sync Batching:** `AsyncSession` maps Rust Tokio futures directly onto Python's `asyncio` event loop with zero `asyncio.to_thread` overhead. Synchronous code can call `session.gather(urls, concurrency=50)` to execute batches concurrently inside Rust while releasing the GIL.
-3. **Triple Drop-in API:** Switch from `requests`, `httpx`, or `curl_cffi` by changing a single import line.
-4. **Rust RAII Memory Safety:** Shared process-wide Tokio runtime and automatic resource cleanup with minimal Python heap overhead (16.4 KB peak Python allocation in sequential tests).
+- `◈` **Byte-Exact BoringSSL Fingerprinting**: Authentic JA3, JA4, GREASE, ALPS, Post-Quantum `X25519MLKEM768`, and Akamai HTTP/2 frame order for Chrome, Safari, Firefox, Edge, Opera, OkHttp, and Tor.
+- `◈` **True Native Async + GIL-Free Sync Batching**: `AsyncSession` maps Rust Tokio futures directly onto Python's `asyncio` event loop with zero `asyncio.to_thread` overhead. Synchronous code can call `session.gather(urls, concurrency=50)` to execute batches concurrently inside Rust while releasing the GIL.
+- `◈` **Triple Drop-in API**: Switch from `requests`, `httpx`, or `curl_cffi` by changing a single import line.
+- `◈` **Rust RAII Memory Safety**: Shared process-wide Tokio runtime and automatic resource cleanup with minimal Python heap overhead (16.4 KB peak Python allocation in sequential tests).
 
 ---
 
-## 🆚 Comparison: `http_tls` vs `curl_cffi`, `primp`, `tls-client`, `httpx`, and `requests`
-
-✅ Supported &nbsp;&nbsp; 🟡 Partial &nbsp;&nbsp; ❌ Not supported
+## Comparison: `http_tls` vs `curl_cffi`, `primp`, `tls-client`, `httpx`, and `requests`
 
 | Capability | `http_tls` | `curl_cffi` | `primp` / `rnet` | `tls-client` | `httpx` | `requests` |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| Standalone BoringSSL TLS / JA4 | ✅ 100+ presets | ✅ | ✅ | 🟡 Go `utls` | ❌ | ❌ |
-| Custom JA3, TLS & H2 Options | ✅ | ✅ | 🟡 | ✅ | ❌ | ❌ |
-| Exact Wire Header Order (`OrigHeaderMap`) | ✅ | 🟡 | ✅ | ✅ | ❌ | ❌ |
-| Native Event-Loop Async | ✅ Tokio | ✅ libcurl | ✅ Tokio | ❌ | ✅ | ❌ |
-| Sync Parallel `gather()` (No `async/await`) | ✅ Rust Tokio | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `requests` + `httpx` + `curl_cffi` Drop-in | ✅ | 🟡 | ❌ | ❌ | 🟡 `httpx` only | 🟡 `requests` only |
-| Async Hickory DNS & Custom `resolve` | ✅ | 🟡 `resolve` only | 🟡 | ❌ | ❌ | ❌ |
-| Outbound IPv4 / IPv6 `/64` Socket Binding | ✅ | ✅ | 🟡 | ❌ | 🟡 | ❌ |
-| TLS-Impersonated WebSockets (Sync & Async) | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Streaming, Multipart, Custom CA, mTLS | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ |
-| RFC 7616 `DigestAuth` (MD5/SHA-256/512) | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| Deep `cookies.clear()` Sync Across FFI | ✅ | ✅ | ✅ | ❌ Broken | ✅ | ✅ |
-| Built-in WAF `resp.challenge` Detector | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Playwright `storage_state.json` & Solver Bridge | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Wireshark `keylog_file` & HAR 1.2 Export | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Memory Safety (No CGo / Manual Free) | ✅ Rust RAII | 🟡 C/CFFI | ✅ Rust RAII | ❌ Go CGo leaks | ✅ Python | ✅ Python |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Standalone BoringSSL TLS / JA4 | `✓` 100+ presets | `✓` | `✓` | `◐` Go `utls` | `✗` | `✗` |
+| Custom JA3, TLS & H2 Options | `✓` | `✓` | `◐` | `✓` | `✗` | `✗` |
+| Exact Wire Header Order (`OrigHeaderMap`) | `✓` | `◐` | `✓` | `✓` | `✗` | `✗` |
+| Native Event-Loop Async | `✓` Tokio | `✓` libcurl | `✓` Tokio | `✗` | `✓` | `✗` |
+| Sync Parallel `gather()` (No `async/await`) | `✓` Rust Tokio | `✗` | `✗` | `✗` | `✗` | `✗` |
+| `requests` + `httpx` + `curl_cffi` Drop-in | `✓` | `◐` | `✗` | `✗` | `◐` `httpx` only | `◐` `requests` only |
+| Async Hickory DNS & Custom `resolve` | `✓` | `◐` `resolve` only | `◐` | `✗` | `✗` | `✗` |
+| Outbound IPv4 / IPv6 `/64` Socket Binding | `✓` | `✓` | `◐` | `✗` | `◐` | `✗` |
+| TLS-Impersonated WebSockets (Sync & Async) | `✓` | `✓` | `✓` | `✗` | `✗` | `✗` |
+| Streaming, Multipart, Custom CA, mTLS | `✓` | `✓` | `◐` | `◐` | `✓` | `✓` |
+| RFC 7616 `DigestAuth` (MD5/SHA-256/512) | `✓` | `✗` | `✗` | `✗` | `✓` | `✓` |
+| Deep `cookies.clear()` Sync Across FFI | `✓` | `✓` | `✓` | `✗` Broken | `✓` | `✓` |
+| Built-in WAF `resp.challenge` Detector | `✓` | `✗` | `✗` | `✗` | `✗` | `✗` |
+| Playwright `storage_state.json` & Solver Bridge | `✓` | `✗` | `✗` | `✗` | `✗` | `✗` |
+| Wireshark `keylog_file` & HAR 1.2 Export | `✓` | `✗` | `✗` | `✗` | `✗` | `✗` |
+| Memory Safety (No CGo / Manual Free) | `✓` Rust RAII | `◐` C/CFFI | `✓` Rust RAII | `✗` Go CGo leaks | `✓` Python | `✓` Python |
+
+> Legend: `✓` Native / full support · `◐` Partial / indirect · `✗` Not built-in
 
 ---
 
-## 📊 Verified Benchmarks & Live JA4 / HTTP/2 Fingerprint Audit
+## Verified Benchmarks & Live JA4 / HTTP/2 Fingerprint Audit
 
 ### 1. Live Multi-Browser Fingerprint Audit (`https://tls.peet.ws/api/all`)
 
@@ -131,24 +115,24 @@ Reproduce locally with `python benchmarks/bench_vs_competitors.py`:
 
 | Python HTTP Client | Median Latency | Throughput | Peak Python Memory (`tracemalloc`) |
 | :--- | ---: | ---: | ---: |
-| `http_tls` (Rust BoringSSL) | 38.0 ms | 24.4 req/s | 16.4 KB |
-| `curl_cffi` | 47.2 ms | 10.4 req/s | 19.2 KB |
-| `httpx` (HTTP/2, no TLS impersonation) | 40.0 ms | 15.7 req/s | 249.3 KB |
-| `requests` (HTTP/1.1) | 46.6 ms | 22.1 req/s | 170.7 KB |
+| `▸` `http_tls` (Rust BoringSSL) | 38.0 ms | 24.4 req/s | 16.4 KB |
+| `▸` `curl_cffi` | 47.2 ms | 10.4 req/s | 19.2 KB |
+| `▸` `httpx` (HTTP/2, no TLS impersonation) | 40.0 ms | 15.7 req/s | 249.3 KB |
+| `▸` `requests` (HTTP/1.1) | 46.6 ms | 22.1 req/s | 170.7 KB |
 
 **Concurrent Asynchronous Benchmark (30 simultaneous requests):**
 
 | Python Async HTTP Client | Average per Request | Throughput | Peak Python Memory (`tracemalloc`) |
 | :--- | ---: | ---: | ---: |
-| `http_tls.AsyncSession` (Native Tokio) | 2.9 ms | 346.0 req/s | 200.0 KB |
-| `curl_cffi.AsyncSession` | 4.7 ms | 211.4 req/s | 234.6 KB |
-| `httpx.AsyncClient` | 6.5 ms | 153.0 req/s | 525.0 KB |
+| `▸` `http_tls.AsyncSession` (Native Tokio) | 2.9 ms | 346.0 req/s | 200.0 KB |
+| `▸` `curl_cffi.AsyncSession` | 4.7 ms | 211.4 req/s | 234.6 KB |
+| `▸` `httpx.AsyncClient` | 6.5 ms | 153.0 req/s | 525.0 KB |
 
 In concurrent workloads, `http_tls` delivers **1.64x higher throughput than `curl_cffi`** and **2.26x higher throughput than `httpx`** while allocating **62% less Python heap memory than `httpx`**.
 
 ---
 
-## 📦 Installation
+## Installation
 
 Prebuilt ABI3 wheels (~4.3 MB) are published on PyPI for Windows (`x86_64`), Linux (`manylinux_2_28` `x86_64` and `aarch64`), and macOS (`x86_64` and `arm64`), supporting Python 3.8 through 3.14+:
 
@@ -176,7 +160,7 @@ pip install dist/*.whl
 
 ---
 
-## 🚀 Migration & Drop-in Quick Start (`requests`, `httpx`, `curl_cffi`, `tls-client`)
+## Migration & Drop-in Quick Start (`requests`, `httpx`, `curl_cffi`, `tls-client`)
 
 ### 1. Drop-in Replacement for `requests`
 
@@ -262,7 +246,7 @@ with http_tls.Session(impersonate="chrome_149") as session:
 
 ---
 
-## ⚡ High-Concurrency Execution: Native Tokio Async & Sync `gather()`
+## High-Concurrency Execution: Native Tokio Async & Sync `gather()`
 
 ### Native Tokio Async (`AsyncSession` / `AsyncClient`)
 
@@ -305,7 +289,7 @@ with http_tls.Session(base_url="https://httpbin.org", impersonate="chrome_149") 
 
 ---
 
-## 📥 Streaming Responses & Multipart File Uploads
+## Streaming Responses & Multipart File Uploads
 
 ### Sync & Async Streaming
 
@@ -347,7 +331,7 @@ with http_tls.Session() as s:
 
 ---
 
-## 🔌 TLS-Impersonated WebSockets (Sync & Async)
+## TLS-Impersonated WebSockets (Sync & Async)
 
 Both synchronous and native async WebSocket connections inherit the session's BoringSSL TLS fingerprint, proxy settings, cookies, and custom headers:
 
@@ -376,7 +360,7 @@ asyncio.run(ws_async())
 
 ---
 
-## 🧬 Custom JA3, BoringSSL `tls_options`, HTTP/2 Settings & Wire Header Order
+## Custom JA3, BoringSSL `tls_options`, HTTP/2 Settings & Wire Header Order
 
 For custom mobile clients, non-standard APIs, or fingerprint research, override TLS parameters, HTTP/2 settings, and exact wire header casing and ordering (`OrigHeaderMap`):
 
@@ -410,7 +394,7 @@ with http_tls.Session(
 
 ---
 
-## 🌐 Proxies, Custom DNS (`resolve`), IPv6 `/64` Binding & Hickory DNS
+## Proxies, Custom DNS (`resolve`), IPv6 `/64` Binding & Hickory DNS
 
 `http_tls` uses **Hickory async DNS** by default (eliminating OS resolver thread contention), supports HTTP/HTTPS/SOCKS5 proxies with round-robin pools, overrides DNS resolution per hostname without breaking TLS SNI, and binds outbound IPv4/IPv6 addresses for proxy-less IPv6 `/64` rotation:
 
@@ -434,7 +418,7 @@ with http_tls.Session(
 
 ---
 
-## 🔑 Authentication (`Basic`, `Bearer`, `Digest`), Custom CA Bundles & Mutual TLS (mTLS)
+## Authentication (`Basic`, `Bearer`, `Digest`), Custom CA Bundles & Mutual TLS (mTLS)
 
 ```python
 import http_tls
@@ -456,7 +440,7 @@ with http_tls.Session(cert=("client.crt", "client.key")) as s:
 
 ---
 
-## 🧱 WAF Challenge Detection, Retries, Playwright `storage_state.json` & Solver Bridge
+## WAF Challenge Detection, Retries, Playwright `storage_state.json` & Solver Bridge
 
 ### 1. Automatic Anti-Bot Interstitial Detection & Resilient Retries
 
@@ -519,7 +503,7 @@ with http_tls.Client(event_hooks={"request": [sign_request], "response": [log_re
 
 ---
 
-## 🔍 Traffic Inspection: Wireshark KeyLog & HAR 1.2 Export
+## Traffic Inspection: Wireshark KeyLog & HAR 1.2 Export
 
 Inspect TLS-encrypted HTTP/2 frames in Wireshark or replay full request/response waterfalls in Chrome DevTools:
 
@@ -538,21 +522,72 @@ with http_tls.Session(
 
 ---
 
-## 🧩 Supported Browser Impersonation Presets (100+ Profiles)
+## Supported Browser Impersonation Presets (100+ Profiles)
 
 Query the full list programmatically with `http_tls.supported_presets()`:
 
-- **Google Chrome (`chrome_100` – `chrome_152`):** Desktop Windows/Linux, macOS (`chrome_152_macos`, `chrome_151_macos`), Android (`chrome_131_android`), and dynamic forward-version Client Hints patching.
-- **Microsoft Edge (`edge_101` – `edge_152`):** `edge_152`, `edge_148`, `edge_147`, `edge_145`, `edge_142`, `edge_134`, `edge_131`, `edge_127`, `edge_122`, `edge_101`.
-- **Apple Safari (`safari_15_3` – `safari_27`):** macOS (`safari_27`, `safari_26_4`, `safari_18_5`, `safari_18`, `safari_17`), iOS (`safari_ios_26_2`, `safari_ios_26`, `safari_ios_18_1_1`), and iPadOS (`safari_ipad_26`, `safari_ipad_18`).
-- **Mozilla Firefox (`firefox_109` – `firefox_155`):** Desktop, private browsing (`firefox_private_136`), and Android (`firefox_android_135`).
-- **Opera (`opera_116` – `opera_131`):** `opera_131`, `opera_130`, `opera_128`, `opera_124`, `opera_120`, `opera_116`.
-- **OkHttp (Android):** `okhttp_5`, `okhttp_4_12`, `okhttp_4_10`, `okhttp_4_9`, `okhttp_3_14`, `okhttp_3_11`.
-- **Tor & Automatic Rotation:** `tor_14_5`, `random`, and `weighted_random` (market-share weighted browser + OS selection).
+- `▸` **Google Chrome (`chrome_100` – `chrome_152`)**: Desktop Windows/Linux, macOS (`chrome_152_macos`, `chrome_151_macos`), Android (`chrome_131_android`), and dynamic forward-version Client Hints patching.
+- `▸` **Microsoft Edge (`edge_101` – `edge_152`)**: `edge_152`, `edge_148`, `edge_147`, `edge_145`, `edge_142`, `edge_134`, `edge_131`, `edge_127`, `edge_122`, `edge_101`.
+- `▸` **Apple Safari (`safari_15_3` – `safari_27`)**: macOS (`safari_27`, `safari_26_4`, `safari_18_5`, `safari_18`, `safari_17`), iOS (`safari_ios_26_2`, `safari_ios_26`, `safari_ios_18_1_1`), and iPadOS (`safari_ipad_26`, `safari_ipad_18`).
+- `▸` **Mozilla Firefox (`firefox_109` – `firefox_155`)**: Desktop, private browsing (`firefox_private_136`), and Android (`firefox_android_135`).
+- `▸` **Opera (`opera_116` – `opera_131`)**: `opera_131`, `opera_130`, `opera_128`, `opera_124`, `opera_120`, `opera_116`.
+- `▸` **OkHttp (Android)**: `okhttp_5`, `okhttp_4_12`, `okhttp_4_10`, `okhttp_4_9`, `okhttp_3_14`, `okhttp_3_11`.
+- `▸` **Tor & Automatic Rotation**: `tor_14_5`, `random`, and `weighted_random` (market-share weighted browser + OS selection).
 
 ---
 
-## 📘 API Reference Summary
+## Architecture Under the Hood
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│                     Python Application                     │
+│      import http_tls as requests / httpx / curl_cffi       │
+└─────────────────────────────┬──────────────────────────────┘
+                              │ http_tls package (PEP 561 typed)
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                  Python Layer (http_tls)                   │
+│  ▸ Session · AsyncSession · Client · AsyncClient           │
+│  ▸ Retries · proxy pool · WAF challenge detector           │
+│  ▸ Basic / Bearer / Digest auth · storage_state · HAR      │
+└─────────────────────────────┬──────────────────────────────┘
+                              │ PyO3 0.23 (abi3-py38) · GIL released on I/O
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│             Rust Core (http_tls._core cdylib)              │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │          Shared Tokio Multi-Thread Runtime           │  │
+│  │  ▸ wreq HTTP/1.1 + HTTP/2 engine (OrigHeaderMap)     │  │
+│  │  ▸ wreq-util browser emulation (100+ presets)        │  │
+│  │  ▸ BoringSSL: JA3/JA4 · GREASE · ALPS · MLKEM768     │  │
+│  │  ▸ Hickory async DNS · resolve · local_address       │  │
+│  │  ▸ Cookie jar · multipart · WebSocket · KeyLog       │  │
+│  │  ▸ Buffered gather() scheduler (input order kept)    │  │
+│  └──────────────────────────┬───────────────────────────┘  │
+└─────────────────────────────┼──────────────────────────────┘
+                              │ TLS 1.3 ClientHello + HTTP/2 SETTINGS frames
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                  Target Server / WAF Edge                  │
+│  (Cloudflare · Akamai · DataDome · PerimeterX · Imperva)   │
+│  ▸ Observes a byte-identical Chrome / Safari / Firefox     │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Source Layout
+
+| File | Responsibility |
+| :--- | :--- |
+| `src/lib.rs` | PyO3 module: `NativeSession`, sync/async request paths, streaming, `gather()` scheduler, WebSocket bridge, TLS/H2 option builders, DNS overrides, KeyLog wiring. |
+| `python/http_tls/requests.py` | Public API: `Session`, `AsyncSession`, `Client`, `AsyncClient`, `Response`, `Cookies`, retries, proxy pool, HAR recorder, `storage_state`, solver bridge, `event_hooks`. |
+| `python/http_tls/auth.py` | `AuthBase`, `BasicAuth`, `BearerAuth`, RFC 7616 `DigestAuth` (sync & async). |
+| `python/http_tls/challenge.py` | Interstitial detector for Cloudflare, DDoS-Guard, DataDome, PerimeterX, Imperva, Sucuri, Vercel, Akamai. |
+| `python/http_tls/exceptions.py` | Unified `requests` / `httpx` / `curl_cffi` exception hierarchy. |
+| `python/http_tls/__init__.pyi` | PEP 561 type stubs (shipped with `py.typed`). |
+
+---
+
+## API Reference Summary
 
 ### `Session` / `Client` / `AsyncSession` / `AsyncClient` Parameters
 
@@ -580,9 +615,9 @@ Query the full list programmatically with `http_tls.supported_presets()`:
 
 ### Key `Response` Attributes & Methods
 
-- **Metadata:** `status_code`, `reason`, `reason_phrase`, `url`, `http_version`, `headers`, `cookies`, `elapsed`, `history`, `remote_addr`, `peer_certificate`, `links`, `num_bytes_downloaded`, `challenge`.
-- **Status Helpers:** `ok`, `is_success`, `is_informational`, `is_redirect`, `is_permanent_redirect`, `has_redirect_location`, `is_client_error`, `is_server_error`, `is_error`, `raise_for_status()`.
-- **Body & Streaming:** `content`, `text`, `json()`, `read()`, `aread()`, `acontent()`, `atext()`, `iter_content()`, `iter_bytes()`, `iter_text()`, `iter_lines()`, `aiter_bytes()`, `aiter_content()`, `aiter_text()`, `aiter_lines()`, `close()`, `aclose()`.
+- `▸` **Metadata**: `status_code`, `reason`, `reason_phrase`, `url`, `http_version`, `headers`, `cookies`, `elapsed`, `history`, `remote_addr`, `peer_certificate`, `links`, `num_bytes_downloaded`, `challenge`.
+- `▸` **Status Helpers**: `ok`, `is_success`, `is_informational`, `is_redirect`, `is_permanent_redirect`, `has_redirect_location`, `is_client_error`, `is_server_error`, `is_error`, `raise_for_status()`.
+- `▸` **Body & Streaming**: `content`, `text`, `json()`, `read()`, `aread()`, `acontent()`, `atext()`, `iter_content()`, `iter_bytes()`, `iter_text()`, `iter_lines()`, `aiter_bytes()`, `aiter_content()`, `aiter_text()`, `aiter_lines()`, `close()`, `aclose()`.
 
 ### Exception Hierarchy (`http_tls.exceptions`)
 
@@ -592,7 +627,7 @@ Compatible with `requests`, `httpx`, and `curl_cffi` exception names:
 
 ---
 
-## ❓ Frequently Asked Questions (FAQ)
+## Frequently Asked Questions (FAQ)
 
 ### How does `http_tls` differ from `curl_cffi`?
 `http_tls` is compiled in Rust against BoringSSL (`btls`) and Tokio rather than wrapping `libcurl` via CFFI. In live benchmarks against Cloudflare, `http_tls` achieves higher sync and async throughput (346 req/s vs 211 req/s at 30-way concurrency), adds GIL-free parallel `session.gather()` for synchronous code, and includes built-in WAF challenge detection, RFC 7616 Digest Auth, HAR 1.2 export, Wireshark `keylog_file`, and Playwright `storage_state.json` support.
@@ -614,7 +649,7 @@ Pass `keylog_file="sslkeys.log"` to `Session(...)` (or set the `SSLKEYLOGFILE` e
 
 ---
 
-## 🧪 Testing & Development
+## Testing & Development
 
 Run the full pytest suite (23 integration and unit tests covering TLS/JA4, HTTP/2, sync/async streaming, `gather()`, WebSockets, Digest Auth, custom CA/mTLS, `storage_state.json`, HAR export, and `httpx`/`requests` parity):
 
@@ -633,6 +668,6 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete version history.
 
 ---
 
-## 📄 License
+## License
 
 Released under the [MIT License](LICENSE).
