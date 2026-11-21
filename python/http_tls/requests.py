@@ -1,23 +1,30 @@
 """Drop-in compatibility module matching requests, httpx, and curl_cffi APIs.
 
-Powered by the native Rust BoringSSL (`wreq` + `btls` + Tokio) engine for
-standalone byte-exact JA3/JA4/HTTP2 emulation, native async I/O, streaming,
-multipart uploads, mTLS, custom CA bundles, and TLS-impersonated WebSockets.
+Powered by the standalone Rust BoringSSL (`wreq` + `btls` + Tokio) engine:
+- Byte-exact JA3/JA4/HTTP2 emulation (100+ presets + custom JA3 / TLS / H2 options)
+- Exact wire header casing & order (`header_order` / OrigHeaderMap)
+- Custom DNS / Origin IP (`resolve`), IPv4/IPv6 binding (`local_address`, `interface`)
+- True native Tokio async (`pyo3-async-runtimes`), streaming, multipart uploads, WebSockets
+- Auto-retry with backoff + proxy pool + preset rotation on anti-bot challenges
+- `base_url`, `resp.history`, `resp.remote_addr`, `resp.peer_certificate`, `DigestAuth`, `event_hooks`
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import codecs
 from enum import Enum
+import inspect
 import json as _json
 import os
+import random as _random
 import re
-from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
-from urllib.parse import urlencode
+import time as _time
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from urllib.parse import urlencode, urljoin
 
 from http_tls import challenge as _challenge
+from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
 from http_tls.exceptions import (
     ConnectTimeout,
     ConnectionError,
@@ -42,13 +49,13 @@ try:
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.4.0"
+    __version__ = "0.5.0"
 
     def _rust_presets() -> List[str]:
         return []
 
 
-# Optional curl_cffi backend (only used when explicitly requested via engine="curl_cffi")
+# Optional legacy curl_cffi backend (only used when explicitly requested via engine="curl_cffi")
 try:
     from curl_cffi.requests.session import Session as _CffiSession
     _HAS_CFFI = True
@@ -59,7 +66,6 @@ except ImportError:
 
 class BrowserType(str, Enum):
     """Browser presets compatible with curl_cffi BrowserType and wreq-util Profiles."""
-    # Chrome
     chrome152 = "chrome_152"
     chrome152_macos = "chrome_152_macos"
     chrome151 = "chrome_151"
@@ -100,7 +106,6 @@ class BrowserType(str, Enum):
     chrome107 = "chrome_107"
     chrome104 = "chrome_104"
     chrome100 = "chrome_100"
-    # Edge
     edge152 = "edge_152"
     edge148 = "edge_148"
     edge147 = "edge_147"
@@ -113,7 +118,6 @@ class BrowserType(str, Enum):
     edge127 = "edge_127"
     edge122 = "edge_122"
     edge101 = "edge_101"
-    # Safari
     safari27 = "safari_27"
     safari26_4 = "safari_26_4"
     safari26_3 = "safari_26_3"
@@ -129,7 +133,6 @@ class BrowserType(str, Enum):
     safari170 = "safari_17"
     safari17 = "safari_17"
     safari155 = "safari_15_5"
-    # Firefox
     firefox155 = "firefox_155"
     firefox154 = "firefox_154"
     firefox153 = "firefox_153"
@@ -150,18 +153,15 @@ class BrowserType(str, Enum):
     firefox128 = "firefox_128"
     firefox117 = "firefox_117"
     firefox109 = "firefox_109"
-    # Opera
     opera131 = "opera_131"
     opera130 = "opera_130"
     opera128 = "opera_128"
     opera124 = "opera_124"
     opera120 = "opera_120"
     opera116 = "opera_116"
-    # OkHttp
     okhttp5 = "okhttp_5"
     okhttp4_12 = "okhttp_4_12"
     okhttp4_10 = "okhttp_4_10"
-    # Tor / Random
     tor145 = "tor_14_5"
     random = "random"
     weighted_random = "weighted_random"
@@ -172,6 +172,66 @@ class BrowserType(str, Enum):
 
 def supported_presets() -> List[str]:
     return list(_rust_presets()) or [b.value for b in BrowserType]
+
+
+# ---------------------------------------------------------------------------
+# JA3 string -> BoringSSL tls_options translator
+# ---------------------------------------------------------------------------
+_JA3_CIPHERS: Dict[int, str] = {
+    4865: "TLS_AES_128_GCM_SHA256",
+    4866: "TLS_AES_256_GCM_SHA384",
+    4867: "TLS_CHACHA20_POLY1305_SHA256",
+    49195: "ECDHE-ECDSA-AES128-GCM-SHA256",
+    49196: "ECDHE-ECDSA-AES256-GCM-SHA384",
+    49199: "ECDHE-RSA-AES128-GCM-SHA256",
+    49200: "ECDHE-RSA-AES256-GCM-SHA384",
+    52392: "ECDHE-RSA-CHACHA20-POLY1305",
+    52393: "ECDHE-ECDSA-CHACHA20-POLY1305",
+    49171: "ECDHE-RSA-AES128-SHA",
+    49172: "ECDHE-RSA-AES256-SHA",
+    49161: "ECDHE-ECDSA-AES128-SHA",
+    49162: "ECDHE-ECDSA-AES256-SHA",
+    156: "AES128-GCM-SHA256",
+    157: "AES256-GCM-SHA384",
+    47: "AES128-SHA",
+    53: "AES256-SHA",
+}
+
+_JA3_CURVES: Dict[int, str] = {
+    4588: "X25519MLKEM768",
+    25497: "X25519Kyber768Draft00",
+    29: "X25519",
+    23: "P-256",
+    24: "P-384",
+    25: "P-521",
+}
+
+_JA3_TLS_VERSIONS: Dict[int, str] = {
+    769: "1.0",
+    770: "1.1",
+    771: "1.2",
+    772: "1.3",
+}
+
+
+def parse_ja3_to_tls_options(ja3: str) -> Dict[str, Any]:
+    """Translate a standard 5-field JA3 string into BoringSSL `tls_options`."""
+    parts = ja3.strip().split(",")
+    if len(parts) != 5:
+        raise ValueError("Invalid JA3 string: expected 5 comma-separated fields")
+    ver_s, ciphers_s, _exts_s, curves_s, _pf_s = parts
+    opts: Dict[str, Any] = {}
+    if ver_s.isdigit() and int(ver_s) in _JA3_TLS_VERSIONS:
+        opts["min_tls_version"] = _JA3_TLS_VERSIONS[int(ver_s)]
+    if ciphers_s:
+        mapped = [_JA3_CIPHERS[int(c)] for c in ciphers_s.split("-") if c.isdigit() and int(c) in _JA3_CIPHERS]
+        if mapped:
+            opts["cipher_list"] = ":".join(mapped)
+    if curves_s:
+        mapped_c = [_JA3_CURVES[int(c)] for c in curves_s.split("-") if c.isdigit() and int(c) in _JA3_CURVES]
+        if mapped_c:
+            opts["curves_list"] = ":".join(mapped_c)
+    return opts
 
 
 def _extract_proxy(proxy: Optional[str], proxies: Optional[Dict[str, str]]) -> Optional[str]:
@@ -193,7 +253,6 @@ _ERROR_KINDS = {
 
 
 def _translate_error(exc: BaseException) -> RequestException:
-    """Map native "[kind] msg" errors and curl_cffi errors onto requests/httpx exceptions."""
     msg = str(exc)
     if msg.startswith("[") and "]" in msg:
         kind, _, rest = msg[1:].partition("]")
@@ -227,7 +286,6 @@ _PEM_KEY_RE = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-
 
 
 def _split_identity(cert: Union[str, Tuple[str, str], None]) -> Tuple[Optional[bytes], Optional[bytes]]:
-    """Split cert="combined.pem" or cert=("client.crt", "client.key") into (cert_pem, key_pem)."""
     if cert is None:
         return None, None
     if isinstance(cert, (tuple, list)):
@@ -242,7 +300,6 @@ def _split_identity(cert: Union[str, Tuple[str, str], None]) -> Tuple[Optional[b
 
 
 def _normalize_files(files: Any) -> Optional[List[Tuple[str, Optional[str], bytes, Optional[str]]]]:
-    """Convert requests/httpx `files=` dict or sequence into [(field, filename, bytes, content_type)]."""
     if not files:
         return None
     pairs = files.items() if isinstance(files, dict) else list(files)
@@ -261,13 +318,20 @@ def _normalize_files(files: Any) -> Optional[List[Tuple[str, Optional[str], byte
             obj = spec
             if hasattr(obj, "name") and isinstance(obj.name, str):
                 filename = os.path.basename(obj.name)
-        if hasattr(obj, "read"):
-            raw = obj.read()
-        else:
-            raw = obj
+        raw = obj.read() if hasattr(obj, "read") else obj
         payload = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
         out.append((str(field), filename, payload, content_type))
     return out
+
+
+def _coerce_auth(auth: Any) -> Optional[AuthBase]:
+    if auth is None:
+        return None
+    if isinstance(auth, AuthBase):
+        return auth
+    if isinstance(auth, (tuple, list)) and len(auth) == 2:
+        return BasicAuth(str(auth[0]), str(auth[1]))
+    raise ValueError("auth must be (username, password), BasicAuth, BearerAuth, or DigestAuth")
 
 
 class Cookies(dict):
@@ -321,6 +385,9 @@ class Response:
         elapsed: float = 0.0,
         cookies: Optional[Dict[str, str]] = None,
         http_version: str = "HTTP/1.1",
+        remote_addr: Optional[str] = None,
+        peer_certificate: Optional[bytes] = None,
+        history: Optional[List["Response"]] = None,
         *,
         raw_chunks: Optional[Iterator[bytes]] = None,
         async_stream: Optional[Any] = None,
@@ -333,7 +400,9 @@ class Response:
         self.elapsed = elapsed
         self.cookies = Cookies(cookies)
         self.http_version = http_version
-        self.history: List["Response"] = []
+        self.remote_addr = remote_addr
+        self.peer_certificate = peer_certificate
+        self.history: List["Response"] = history or []
         self._raw_chunks = raw_chunks
         self._async_stream = async_stream
         self._closer = closer
@@ -402,7 +471,6 @@ class Response:
             yield tail
 
     async def aiter_bytes(self, chunk_size: Optional[int] = None) -> AsyncIterator[bytes]:
-        """Asynchronously yield body bytes (httpx compatible, native Tokio streaming)."""
         if self._content is not None:
             data = self._content
             step = chunk_size or len(data) or 1
@@ -436,7 +504,6 @@ class Response:
             await self.aclose()
 
     async def aiter_lines(self) -> AsyncIterator[str]:
-        """Asynchronously yield decoded lines (httpx compatible)."""
         decoder = codecs.getincrementaldecoder(self.encoding or "utf-8")(errors="replace")
         pending = ""
         async for chunk in self.aiter_bytes():
@@ -544,7 +611,6 @@ class Response:
 
     @property
     def challenge(self) -> Optional[str]:
-        """Edge provider name if this is a browser-verification interstitial, else None."""
         return _challenge.detect(self)
 
     def json(self, **kwargs: Any) -> Any:
@@ -607,9 +673,7 @@ class WebSocket:
 
     def recv_text(self) -> Optional[str]:
         msg = self.recv()
-        if msg is None:
-            return None
-        return msg[1].decode("utf-8", errors="replace")
+        return None if msg is None else msg[1].decode("utf-8", errors="replace")
 
     def recv_json(self) -> Any:
         txt = self.recv_text()
@@ -654,15 +718,11 @@ class AsyncWebSocket:
             res = await self._ws.arecv()
         except RuntimeError as exc:
             raise _translate_error(exc) from exc
-        if res is None:
-            return None
-        return (res[0], bytes(res[1]))
+        return None if res is None else (res[0], bytes(res[1]))
 
     async def recv_text(self) -> Optional[str]:
         msg = await self.recv()
-        if msg is None:
-            return None
-        return msg[1].decode("utf-8", errors="replace")
+        return None if msg is None else msg[1].decode("utf-8", errors="replace")
 
     async def recv_json(self) -> Any:
         txt = await self.recv_text()
@@ -686,28 +746,53 @@ def _native_chunks(stream: Any) -> Iterator[bytes]:
         yield chunk
 
 
-class Session:
-    """HTTP Session: 100% drop-in for requests.Session, httpx.Client, and curl_cffi.requests.Session.
+def _build_history_responses(raw_history: Sequence[Tuple[int, str, str, Dict[str, str]]]) -> List[Response]:
+    return [
+        Response(status_code=status, headers=hdrs, url=prev_url, content=b"", text="")
+        for status, prev_url, _next_url, hdrs in raw_history
+    ]
 
-    engine: "auto" | "rust" | "boring" | "impersonate" (all use the standalone Rust BoringSSL engine)
-            or "curl_cffi" (optional legacy curl_cffi backend if installed).
-    """
+
+class Session:
+    """HTTP Session: 100% drop-in for requests.Session, httpx.Client, and curl_cffi.requests.Session."""
 
     def __init__(
         self,
         impersonate: Union[str, BrowserType] = "chrome_152",
         timeout: float = 30.0,
+        connect_timeout: Optional[float] = None,
+        read_timeout: Optional[float] = None,
         verify: Union[bool, str] = True,
         verify_ssl: bool = True,
         proxies: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
+        proxies_pool: Optional[Sequence[str]] = None,
         allow_redirects: bool = True,
         follow_redirects: bool = True,
         max_redirects: int = 10,
         headers: Optional[Dict[str, str]] = None,
+        header_order: Optional[Sequence[str]] = None,
         cookies: Optional[Dict[str, str]] = None,
-        auth: Optional[Tuple[str, str]] = None,
+        auth: Optional[Union[Tuple[str, str], AuthBase]] = None,
         cert: Union[str, Tuple[str, str], None] = None,
+        base_url: str = "",
+        tls_options: Optional[Dict[str, Any]] = None,
+        ja3: Optional[str] = None,
+        http2_options: Optional[Dict[str, Any]] = None,
+        http1_only: bool = False,
+        http2_only: bool = False,
+        resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
+        local_address: Optional[str] = None,
+        interface: Optional[str] = None,
+        tls_info: bool = False,
+        pool_max_idle_per_host: Optional[int] = None,
+        pool_idle_timeout: Optional[float] = None,
+        retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_statuses: Sequence[int] = (429, 500, 502, 503, 504),
+        retry_on_challenge: bool = False,
+        rotate_impersonate: bool = False,
+        event_hooks: Optional[Dict[str, List[Callable[..., Any]]]] = None,
         engine: str = "auto",
         **kwargs: Any,
     ) -> None:
@@ -719,15 +804,35 @@ class Session:
         self.timeout = timeout
         self.verify: Union[bool, str] = ca_path if ca_path else (verify_flag and verify_ssl)
         self.cert = cert
+        self.base_url = base_url
         self.max_redirects = max_redirects
         self.allow_redirects = allow_redirects and follow_redirects
         self.engine = engine
         self.auth = auth
+        self.retries = max(0, int(retries))
+        self.retry_backoff = float(retry_backoff)
+        self.retry_statuses = tuple(retry_statuses)
+        self.retry_on_challenge = bool(retry_on_challenge)
+        self.rotate_impersonate = bool(rotate_impersonate)
+        self.proxies_pool: List[str] = list(proxies_pool) if proxies_pool else []
+        self._proxy_idx = 0
+        self.event_hooks: Dict[str, List[Callable[..., Any]]] = {
+            "request": list((event_hooks or {}).get("request", [])),
+            "response": list((event_hooks or {}).get("response", [])),
+        }
 
         self.headers = CaseInsensitiveDict(headers or {})
         self.cookies = Cookies(cookies, on_clear=self._clear_backend_cookies)
         p_val = _extract_proxy(proxy, proxies)
         self.proxies = dict(proxies) if proxies else ({"all": proxy, "http": proxy, "https": proxy} if proxy else {})
+
+        merged_tls: Optional[Dict[str, Any]] = None
+        if ja3 or tls_options:
+            merged_tls = {}
+            if ja3:
+                merged_tls.update(parse_ja3_to_tls_options(ja3))
+            if tls_options:
+                merged_tls.update(tls_options)
 
         if engine == "curl_cffi":
             if not _HAS_CFFI:
@@ -755,12 +860,37 @@ class Session:
                 ca_bundle=_read_file(ca_path) if ca_path else None,
                 client_cert=client_cert,
                 client_key=client_key,
+                header_order=list(header_order) if header_order else None,
+                tls_options=merged_tls,
+                http2_options=dict(http2_options) if http2_options else None,
+                http1_only=http1_only,
+                http2_only=http2_only,
+                resolve=dict(resolve) if resolve else None,
+                local_address=local_address,
+                interface=interface,
+                tls_info=tls_info,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                pool_max_idle_per_host=pool_max_idle_per_host,
+                pool_idle_timeout=pool_idle_timeout,
             )
 
     @property
     def mode(self) -> str:
-        """Active engine: "rust" (native BoringSSL wreq) or "curl_cffi"."""
         return self._mode
+
+    def _next_pool_proxy(self) -> Optional[str]:
+        if not self.proxies_pool:
+            return None
+        p = self.proxies_pool[self._proxy_idx % len(self.proxies_pool)]
+        self._proxy_idx += 1
+        return p
+
+    def _resolve_url(self, url: str) -> str:
+        if not self.base_url or url.startswith(("http://", "https://", "ws://", "wss://")):
+            return url
+        base = self.base_url if self.base_url.endswith("/") else self.base_url + "/"
+        return urljoin(base, url.lstrip("/"))
 
     def _clear_backend_cookies(self) -> None:
         if self._mode == "rust":
@@ -769,7 +899,6 @@ class Session:
             self._session.cookies.clear()
 
     def clear_cookies(self) -> None:
-        """Clear all session cookies from memory and the native cookie jar."""
         self.cookies.clear()
 
     def _build_native_args(
@@ -787,7 +916,10 @@ class Session:
         proxies: Optional[Dict[str, str]],
         proxy: Optional[str],
         allow_redirects: Optional[bool],
-        auth: Optional[Tuple[str, str]],
+        auth_obj: Optional[AuthBase],
+        header_order: Optional[Sequence[str]],
+        impersonate_override: Optional[str],
+        local_address: Optional[str],
     ) -> Dict[str, Any]:
         req_headers = dict(self.headers.items())
         if headers:
@@ -797,10 +929,8 @@ class Session:
         if cookies:
             req_cookies.update(cookies)
 
-        active_auth = auth or self.auth
-        if active_auth and len(active_auth) == 2:
-            token = base64.b64encode(f"{active_auth[0]}:{active_auth[1]}".encode()).decode()
-            req_headers["Authorization"] = f"Basic {token}"
+        if auth_obj is not None and not isinstance(auth_obj, DigestAuth):
+            auth_obj.apply(req_headers)
 
         actual_proxy = _extract_proxy(proxy, proxies) or _extract_proxy(None, self.proxies)
         actual_timeout = timeout if timeout is not None else self.timeout
@@ -843,10 +973,15 @@ class Session:
             allow_redirects=redirects,
             verify=verify_flag,
             ca_bundle=ca_bytes,
+            header_order=list(header_order) if header_order else None,
+            impersonate=str(impersonate_override) if impersonate_override else None,
+            local_address=local_address,
         )
 
     def _wrap_native(self, native: Any, stream: bool, is_async: bool = False) -> Response:
         self.cookies.update(native.cookies)
+        hist = _build_history_responses(getattr(native, "history", ()))
+        peer_cert = getattr(native, "peer_certificate", None)
         common = dict(
             status_code=native.status_code,
             headers=native.headers,
@@ -854,6 +989,9 @@ class Session:
             elapsed=native.elapsed,
             cookies=native.cookies,
             http_version=getattr(native, "http_version", "HTTP/1.1"),
+            remote_addr=getattr(native, "remote_addr", None),
+            peer_certificate=bytes(peer_cert) if peer_cert is not None else None,
+            history=hist,
         )
         if stream:
             return Response(
@@ -865,6 +1003,21 @@ class Session:
                 **common,
             )
         return Response(content=native.content, text=native.text, encoding=native.encoding, **common)
+
+    def _should_retry_resp(self, resp: Response) -> bool:
+        if resp.status_code in self.retry_statuses:
+            return True
+        if self.retry_on_challenge and resp.challenge is not None:
+            return True
+        return False
+
+    def _backoff_delay(self, attempt: int) -> float:
+        base = self.retry_backoff * (2 ** attempt)
+        return base * (0.8 + 0.4 * _random.random())
+
+    def _run_sync_hooks(self, kind: str, payload: Any) -> None:
+        for hook in self.event_hooks.get(kind, ()):
+            hook(payload)
 
     def request(
         self,
@@ -882,37 +1035,94 @@ class Session:
         proxy: Optional[str] = None,
         allow_redirects: Optional[bool] = None,
         follow_redirects: Optional[bool] = None,
-        auth: Optional[Tuple[str, str]] = None,
+        auth: Optional[Union[Tuple[str, str], AuthBase]] = None,
+        header_order: Optional[Sequence[str]] = None,
+        impersonate: Optional[Union[str, BrowserType]] = None,
+        local_address: Optional[str] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response:
         if allow_redirects is None and follow_redirects is not None:
             allow_redirects = follow_redirects
-        try:
-            if self._mode == "curl_cffi":
-                return self._request_cffi(
-                    method, url, params, headers, cookies, data, json, files, timeout,
-                    verify, proxies, proxy, allow_redirects, auth, stream, kwargs,
-                )
-            args = self._build_native_args(
-                method, url, params, headers, cookies, data, json, files,
-                timeout, verify, proxies, proxy, allow_redirects, auth,
+        full_url = self._resolve_url(url)
+        auth_obj = _coerce_auth(auth if auth is not None else self.auth)
+        req_headers = dict(headers) if headers else {}
+
+        # Request hooks receive a mutable context dict
+        if self.event_hooks["request"]:
+            ctx = {"method": method, "url": full_url, "headers": req_headers, "params": params}
+            self._run_sync_hooks("request", ctx)
+            method, full_url, req_headers, params = ctx["method"], ctx["url"], ctx["headers"], ctx["params"]
+
+        max_attempts = 1 if stream else (1 + self.retries)
+        last_exc: Optional[BaseException] = None
+        resp: Optional[Response] = None
+
+        for attempt in range(max_attempts):
+            attempt_proxy = proxy or (self._next_pool_proxy() if not proxies else None)
+            attempt_imp = str(impersonate) if impersonate else (
+                "weighted_random" if (attempt > 0 and (self.rotate_impersonate or self.retry_on_challenge)) else None
             )
-            call = self._session.request_stream if stream else self._session.request
-            native = call(**args)
-            return self._wrap_native(native, stream=stream, is_async=False)
-        except RequestException:
-            raise
-        except (RuntimeError, OSError) as exc:
-            raise _translate_error(exc) from exc
-        except Exception as exc:
-            if type(exc).__module__.startswith("curl_cffi"):
-                raise _translate_error(exc) from exc
-            raise
+            try:
+                if self._mode == "curl_cffi":
+                    resp = self._request_cffi(
+                        method, full_url, params, req_headers, cookies, data, json, files, timeout,
+                        verify, proxies, attempt_proxy, allow_redirects, auth_obj, stream, kwargs,
+                    )
+                else:
+                    args = self._build_native_args(
+                        method, full_url, params, req_headers, cookies, data, json, files,
+                        timeout, verify, proxies, attempt_proxy, allow_redirects, auth_obj,
+                        header_order, attempt_imp, local_address,
+                    )
+                    call = self._session.request_stream if stream else self._session.request
+                    resp = self._wrap_native(call(**args), stream=stream, is_async=False)
+
+                # RFC 7616 DigestAuth automatic 401 handshake
+                if isinstance(auth_obj, DigestAuth) and resp.status_code == 401:
+                    www = resp.headers.get("www-authenticate", "")
+                    chal = auth_obj.parse_challenge(www)
+                    if chal is not None:
+                        digest_hdrs = dict(req_headers)
+                        digest_hdrs["Authorization"] = auth_obj.build_header(method, resp.url, chal)
+                        args = self._build_native_args(
+                            method, full_url, params, digest_hdrs, cookies, data, json, files,
+                            timeout, verify, proxies, attempt_proxy, allow_redirects, None,
+                            header_order, attempt_imp, local_address,
+                        )
+                        call = self._session.request_stream if stream else self._session.request
+                        resp = self._wrap_native(call(**args), stream=stream, is_async=False)
+
+                if attempt + 1 < max_attempts and self._should_retry_resp(resp):
+                    _time.sleep(self._backoff_delay(attempt))
+                    continue
+                break
+            except RequestException as exc:
+                last_exc = exc
+                if attempt + 1 < max_attempts and isinstance(exc, (Timeout, ConnectionError)):
+                    _time.sleep(self._backoff_delay(attempt))
+                    continue
+                raise
+            except (RuntimeError, OSError) as exc:
+                mapped = _translate_error(exc)
+                last_exc = mapped
+                if attempt + 1 < max_attempts and isinstance(mapped, (Timeout, ConnectionError)):
+                    _time.sleep(self._backoff_delay(attempt))
+                    continue
+                raise mapped from exc
+            except Exception as exc:
+                if type(exc).__module__.startswith("curl_cffi"):
+                    raise _translate_error(exc) from exc
+                raise
+
+        assert resp is not None, last_exc
+        if self.event_hooks["response"]:
+            self._run_sync_hooks("response", resp)
+        return resp
 
     def _request_cffi(
         self, method, url, params, headers, cookies, data, json, files, timeout,
-        verify, proxies, proxy, allow_redirects, auth, stream, extra
+        verify, proxies, proxy, allow_redirects, auth_obj, stream, extra
     ) -> Response:
         req_headers = dict(self.headers.items())
         if headers:
@@ -920,10 +1130,8 @@ class Session:
         req_cookies = dict(self.cookies)
         if cookies:
             req_cookies.update(cookies)
-        active_auth = auth or self.auth
-        if active_auth and len(active_auth) == 2:
-            token = base64.b64encode(f"{active_auth[0]}:{active_auth[1]}".encode()).decode()
-            req_headers["Authorization"] = f"Basic {token}"
+        if auth_obj is not None and not isinstance(auth_obj, DigestAuth):
+            auth_obj.apply(req_headers)
         actual_proxy = _extract_proxy(proxy, proxies) or _extract_proxy(None, self.proxies)
         extra = dict(extra)
         if self.cert is not None:
@@ -973,16 +1181,16 @@ class Session:
         proxies: Optional[Dict[str, str]] = None,
         verify: Optional[bool] = None,
     ) -> WebSocket:
-        """Open a synchronous TLS-impersonated WebSocket connection."""
         if self._mode != "rust":
             raise RuntimeError("ws_connect requires the native Rust BoringSSL engine")
+        full_url = self._resolve_url(url)
         req_headers = dict(self.headers.items())
         if headers:
             req_headers.update(headers)
-        actual_proxy = _extract_proxy(proxy, proxies) or _extract_proxy(None, self.proxies)
+        actual_proxy = _extract_proxy(proxy, proxies) or _extract_proxy(None, self.proxies) or self._next_pool_proxy()
         try:
             native = self._session.ws_connect(
-                url=url,
+                url=full_url,
                 headers=req_headers or None,
                 proxy=actual_proxy,
                 verify=verify,
@@ -1025,10 +1233,7 @@ class Session:
 
 
 class AsyncSession:
-    """Native Tokio asynchronous HTTP Session (zero thread-pool bottleneck).
-
-    100% compatible with httpx.AsyncClient and curl_cffi.requests.AsyncSession.
-    """
+    """Native Tokio asynchronous HTTP Session (zero thread-pool bottleneck)."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._sync_session = Session(*args, **kwargs)
@@ -1048,6 +1253,12 @@ class AsyncSession:
     def clear_cookies(self) -> None:
         self._sync_session.clear_cookies()
 
+    async def _run_async_hooks(self, kind: str, payload: Any) -> None:
+        for hook in self._sync_session.event_hooks.get(kind, ()):
+            res = hook(payload)
+            if inspect.isawaitable(res):
+                await res
+
     async def request(
         self,
         method: str,
@@ -1064,7 +1275,10 @@ class AsyncSession:
         proxy: Optional[str] = None,
         allow_redirects: Optional[bool] = None,
         follow_redirects: Optional[bool] = None,
-        auth: Optional[Tuple[str, str]] = None,
+        auth: Optional[Union[Tuple[str, str], AuthBase]] = None,
+        header_order: Optional[Sequence[str]] = None,
+        impersonate: Optional[Union[str, BrowserType]] = None,
+        local_address: Optional[str] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response:
@@ -1078,18 +1292,67 @@ class AsyncSession:
                 proxies=proxies, proxy=proxy, allow_redirects=allow_redirects,
                 auth=auth, stream=stream, **kwargs,
             )
-        try:
-            args = s._build_native_args(
-                method, url, params, headers, cookies, data, json, files,
-                timeout, verify, proxies, proxy, allow_redirects, auth,
+
+        full_url = s._resolve_url(url)
+        auth_obj = _coerce_auth(auth if auth is not None else s.auth)
+        req_headers = dict(headers) if headers else {}
+
+        if s.event_hooks["request"]:
+            ctx = {"method": method, "url": full_url, "headers": req_headers, "params": params}
+            await self._run_async_hooks("request", ctx)
+            method, full_url, req_headers, params = ctx["method"], ctx["url"], ctx["headers"], ctx["params"]
+
+        max_attempts = 1 if stream else (1 + s.retries)
+        resp: Optional[Response] = None
+
+        for attempt in range(max_attempts):
+            attempt_proxy = proxy or (s._next_pool_proxy() if not proxies else None)
+            attempt_imp = str(impersonate) if impersonate else (
+                "weighted_random" if (attempt > 0 and (s.rotate_impersonate or s.retry_on_challenge)) else None
             )
-            call = s._session.async_request_stream if stream else s._session.async_request
-            native = await call(**args)
-            return s._wrap_native(native, stream=stream, is_async=True)
-        except RequestException:
-            raise
-        except (RuntimeError, OSError) as exc:
-            raise _translate_error(exc) from exc
+            try:
+                args = s._build_native_args(
+                    method, full_url, params, req_headers, cookies, data, json, files,
+                    timeout, verify, proxies, attempt_proxy, allow_redirects, auth_obj,
+                    header_order, attempt_imp, local_address,
+                )
+                call = s._session.async_request_stream if stream else s._session.async_request
+                resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
+
+                if isinstance(auth_obj, DigestAuth) and resp.status_code == 401:
+                    www = resp.headers.get("www-authenticate", "")
+                    chal = auth_obj.parse_challenge(www)
+                    if chal is not None:
+                        digest_hdrs = dict(req_headers)
+                        digest_hdrs["Authorization"] = auth_obj.build_header(method, resp.url, chal)
+                        args = s._build_native_args(
+                            method, full_url, params, digest_hdrs, cookies, data, json, files,
+                            timeout, verify, proxies, attempt_proxy, allow_redirects, None,
+                            header_order, attempt_imp, local_address,
+                        )
+                        call = s._session.async_request_stream if stream else s._session.async_request
+                        resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
+
+                if attempt + 1 < max_attempts and s._should_retry_resp(resp):
+                    await asyncio.sleep(s._backoff_delay(attempt))
+                    continue
+                break
+            except RequestException as exc:
+                if attempt + 1 < max_attempts and isinstance(exc, (Timeout, ConnectionError)):
+                    await asyncio.sleep(s._backoff_delay(attempt))
+                    continue
+                raise
+            except (RuntimeError, OSError) as exc:
+                mapped = _translate_error(exc)
+                if attempt + 1 < max_attempts and isinstance(mapped, (Timeout, ConnectionError)):
+                    await asyncio.sleep(s._backoff_delay(attempt))
+                    continue
+                raise mapped from exc
+
+        assert resp is not None
+        if s.event_hooks["response"]:
+            await self._run_async_hooks("response", resp)
+        return resp
 
     async def ws_connect(
         self,
@@ -1099,17 +1362,17 @@ class AsyncSession:
         proxies: Optional[Dict[str, str]] = None,
         verify: Optional[bool] = None,
     ) -> AsyncWebSocket:
-        """Open a native Tokio async TLS-impersonated WebSocket connection."""
         s = self._sync_session
         if s._mode != "rust":
             raise RuntimeError("ws_connect requires the native Rust BoringSSL engine")
+        full_url = s._resolve_url(url)
         req_headers = dict(s.headers.items())
         if headers:
             req_headers.update(headers)
-        actual_proxy = _extract_proxy(proxy, proxies) or _extract_proxy(None, s.proxies)
+        actual_proxy = _extract_proxy(proxy, proxies) or _extract_proxy(None, s.proxies) or s._next_pool_proxy()
         try:
             native = await s._session.async_ws_connect(
-                url=url,
+                url=full_url,
                 headers=req_headers or None,
                 proxy=actual_proxy,
                 verify=verify,
@@ -1150,16 +1413,27 @@ class AsyncSession:
         self._sync_session.close()
 
 
-_SESSION_KEYS = ("timeout", "verify", "proxies", "proxy", "allow_redirects", "follow_redirects", "auth", "cert", "engine")
+_SESSION_KEYS = (
+    "timeout", "connect_timeout", "read_timeout", "verify", "proxies", "proxy", "proxies_pool",
+    "allow_redirects", "follow_redirects", "auth", "cert", "header_order", "tls_options", "ja3",
+    "http2_options", "http1_only", "http2_only", "resolve", "local_address", "interface",
+    "tls_info", "retries", "retry_backoff", "retry_statuses", "retry_on_challenge",
+    "rotate_impersonate", "event_hooks", "engine",
+)
+_REQ_SKIP_KEYS = {
+    "engine", "cert", "tls_options", "ja3", "http2_options", "http1_only", "http2_only",
+    "resolve", "interface", "tls_info", "connect_timeout", "read_timeout", "proxies_pool",
+    "retries", "retry_backoff", "retry_statuses", "retry_on_challenge", "rotate_impersonate",
+    "event_hooks",
+}
 
 
 def request(method: str, url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
-    """One-shot request. With stream=True the session stays open until the response is closed."""
     session_kw = {k: kwargs[k] for k in _SESSION_KEYS if k in kwargs and kwargs[k] is not None}
     s = Session(impersonate=impersonate, **session_kw)
     stream = bool(kwargs.get("stream"))
     try:
-        resp = s.request(method, url, **{k: v for k, v in kwargs.items() if k not in ("engine", "cert")})
+        resp = s.request(method, url, **{k: v for k, v in kwargs.items() if k not in _REQ_SKIP_KEYS})
     except BaseException:
         s.close()
         raise
@@ -1208,6 +1482,5 @@ def options(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwa
     return request("OPTIONS", url, impersonate=impersonate, **kwargs)
 
 
-# httpx-compatible aliases
 Client = Session
 AsyncClient = AsyncSession

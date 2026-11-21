@@ -1,9 +1,11 @@
-from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
 from http_tls.structures import CaseInsensitiveDict
 
 __version__: str
 
 def supported_presets() -> List[str]: ...
+def parse_ja3_to_tls_options(ja3: str) -> Dict[str, Any]: ...
 
 class Cookies(dict):
     def __init__(self, initial: Optional[Dict[str, str]] = None, on_clear: Optional[Callable[[], None]] = None) -> None: ...
@@ -22,6 +24,8 @@ class Response:
     elapsed: float
     cookies: Cookies
     http_version: str
+    remote_addr: Optional[str]
+    peer_certificate: Optional[bytes]
     history: List["Response"]
 
     @property
@@ -88,26 +92,51 @@ class AsyncWebSocket:
 
 class Session:
     impersonate: str
+    base_url: str
     headers: CaseInsensitiveDict
     cookies: Cookies
     proxies: Dict[str, str]
+    proxies_pool: List[str]
+    event_hooks: Dict[str, List[Callable[..., Any]]]
     mode: str
 
     def __init__(
         self,
         impersonate: str = "chrome_152",
         timeout: float = 30.0,
+        connect_timeout: Optional[float] = None,
+        read_timeout: Optional[float] = None,
         verify: Union[bool, str] = True,
         verify_ssl: bool = True,
         proxies: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
+        proxies_pool: Optional[Sequence[str]] = None,
         allow_redirects: bool = True,
         follow_redirects: bool = True,
         max_redirects: int = 10,
         headers: Optional[Dict[str, str]] = None,
+        header_order: Optional[Sequence[str]] = None,
         cookies: Optional[Dict[str, str]] = None,
-        auth: Optional[Tuple[str, str]] = None,
+        auth: Optional[Union[Tuple[str, str], AuthBase]] = None,
         cert: Union[str, Tuple[str, str], None] = None,
+        base_url: str = "",
+        tls_options: Optional[Dict[str, Any]] = None,
+        ja3: Optional[str] = None,
+        http2_options: Optional[Dict[str, Any]] = None,
+        http1_only: bool = False,
+        http2_only: bool = False,
+        resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
+        local_address: Optional[str] = None,
+        interface: Optional[str] = None,
+        tls_info: bool = False,
+        pool_max_idle_per_host: Optional[int] = None,
+        pool_idle_timeout: Optional[float] = None,
+        retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_statuses: Sequence[int] = (429, 500, 502, 503, 504),
+        retry_on_challenge: bool = False,
+        rotate_impersonate: bool = False,
+        event_hooks: Optional[Dict[str, List[Callable[..., Any]]]] = None,
         engine: str = "auto",
         **kwargs: Any,
     ) -> None: ...
@@ -128,7 +157,10 @@ class Session:
         proxy: Optional[str] = None,
         allow_redirects: Optional[bool] = None,
         follow_redirects: Optional[bool] = None,
-        auth: Optional[Tuple[str, str]] = None,
+        auth: Optional[Union[Tuple[str, str], AuthBase]] = None,
+        header_order: Optional[Sequence[str]] = None,
+        impersonate: Optional[str] = None,
+        local_address: Optional[str] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response: ...

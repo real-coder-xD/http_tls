@@ -47,15 +47,16 @@ Tested against `https://tls.peet.ws/api/all` (the canonical TLS fingerprint diag
 
 ### 🏆 Complete Feature Comparison Matrix
 
-| Feature | **`http_tls` (v0.4.0)** | `curl_cffi` | `primp` / `rnet` | `tls-client` | `httpx` | `requests` |
+| Feature | **`http_tls` (v0.5.0)** | `curl_cffi` | `primp` / `rnet` | `tls-client` | `httpx` | `requests` |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Standalone BoringSSL TLS / JA4** | ✅ **100+ Presets (Zero external deps)** | ✅ | ✅ | ✅ (Go utls) | ❌ | ❌ |
+| **Standalone BoringSSL TLS / JA4** | ✅ **100+ Presets + Custom JA3/TLS** | ✅ | ✅ | ✅ (Go utls) | ❌ | ❌ |
 | **True Native Async (No ThreadPool)** | ✅ **Tokio ↔ asyncio (`pyo3-async`)** | ✅ | ✅ | ❌ | ✅ | ❌ |
-| **HTTP/2 Akamai Fingerprint** | ✅ **`m,a,s,p` + Frame Settings** | ✅ | ✅ | ✅ | ✅ | ❌ |
-| **Triple API (`requests`+`httpx`+`cffi`)**| ✅ **100% Drop-in** | 🔶 | ❌ | ❌ | 🔶 | 🔶 |
+| **HTTP/2 & Exact Header Order** | ✅ **Akamai H2 + `header_order`** | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Triple API (`requests`+`httpx`+`cffi`)**| ✅ **`base_url`, `history`, `hooks`** | 🔶 | ❌ | ❌ | 🔶 | 🔶 |
+| **DNS `resolve`, IPv6 `local_address`** | ✅ **Native Socket/DNS Binding** | ✅ | 🔶 | ❌ | ❌ | ❌ |
 | **TLS-Impersonated WebSockets** | ✅ **Sync & Async (`ws_connect`)** | ✅ | ✅ | ❌ | ❌ | ❌ |
-| **Streaming + Multipart + mTLS + CA** | ✅ **Full Native Rust** | ✅ | 🔶 | 🔶 | ✅ | ✅ |
-| **Cookie `clear()` + `resp.challenge`** | ✅ **Deep Jar Clear + WAF Detector** | 🔶 | 🔶 | ❌ | 🔶 | 🔶 |
+| **Streaming + Multipart + mTLS + Digest** | ✅ **Full Native Rust + RFC 7616** | ✅ | 🔶 | 🔶 | ✅ | ✅ |
+| **Auto-Retry + Proxy Pool + WAF Detector**| ✅ **`retries`, `proxies_pool`, `challenge`** | 🔶 | 🔶 | ❌ | 🔶 | 🔶 |
 | **No Memory Leaks** | ✅ **Rust RAII (Zero GC Lag)** | ✅ | ✅ | ❌ | ✅ | ✅ |
 
 ---
@@ -200,6 +201,23 @@ with http_tls.Session(impersonate="chrome_149") as s:
     with s.ws_connect("wss://echo.websocket.org") as ws:
         ws.send_text("hello over BoringSSL Chrome TLS")
         print(ws.recv_text())
+
+# Custom JA3 / TLS options, exact header order, DNS origin override & IPv6 binding
+with http_tls.Session(
+    base_url="https://api.example.com",
+    header_order=["Host", "User-Agent", "Accept", "Accept-Language"],
+    ja3="771,4865-4866-4867-49195-49199,0-23-65281,29-23-24,0",
+    resolve={"api.example.com": "1.2.3.4"},
+    local_address="2001:db8::1",
+    retries=3,
+    retry_on_challenge=True,
+    rotate_impersonate=True,
+    proxies_pool=["http://p1:8080", "http://p2:8080"],
+    auth=http_tls.DigestAuth("user", "pass"),
+    tls_info=True,
+) as s:
+    r = s.get("/v1/status")
+    print(r.remote_addr, len(r.history), bool(r.peer_certificate))
 ```
 
 ---

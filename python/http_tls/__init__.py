@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 import sys
-from http_tls import challenge, exceptions, requests, status_codes, structures
+from http_tls import auth, challenge, exceptions, requests, status_codes, structures
+from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
 from http_tls.exceptions import (
     ConnectTimeout,
     ConnectionError,
@@ -34,6 +35,7 @@ from http_tls.requests import (
     get,
     head,
     options,
+    parse_ja3_to_tls_options,
     patch,
     post,
     put,
@@ -46,17 +48,22 @@ from http_tls.structures import CaseInsensitiveDict
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "0.4.0"
+    __version__ = "0.5.0"
 
 sys.modules["http_tls.requests"] = requests
 
 __all__ = [
     "requests",
+    "auth",
     "challenge",
     "codes",
     "exceptions",
     "structures",
     "CaseInsensitiveDict",
+    "AuthBase",
+    "BasicAuth",
+    "BearerAuth",
+    "DigestAuth",
     "RequestException",
     "HTTPError",
     "ConnectionError",
@@ -74,6 +81,7 @@ __all__ = [
     "AsyncWebSocket",
     "Cookies",
     "BrowserType",
+    "parse_ja3_to_tls_options",
     "request",
     "get",
     "post",

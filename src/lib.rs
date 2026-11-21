@@ -6,21 +6,25 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wreq::cookie::Jar;
-use wreq::header::{HeaderMap, HeaderName, HeaderValue};
+use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
+use wreq::http2::Http2Options;
 use wreq::multipart::{Form, Part};
-use wreq::redirect::Policy;
+use wreq::redirect::{History, Policy};
 use wreq::tls::trust::{CertStore, Identity};
+use wreq::tls::{AlpnProtocol, TlsInfo, TlsOptions, TlsVersion};
 use wreq::ws::message::{CloseCode, Message};
 use wreq::{Client, Method, Proxy, RequestBuilder, Version};
 use wreq_util::{Emulation, Platform, Profile};
 
 type BodyStream = Pin<Box<dyn Stream<Item = wreq::Result<Bytes>> + Send + 'static>>;
 type MultipartItem = (String, Option<String>, Vec<u8>, Option<String>);
+type HistoryTuple = (u16, String, String, HashMap<String, String>);
 
 // ---------------------------------------------------------------------------
 // Shared Tokio runtime via pyo3-async-runtimes (used by both sync & async).
@@ -108,7 +112,6 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
 
     let platform = platform_from_name(&lower);
 
-    // Chrome family (including forward versions 150-152 using Chrome149 BoringSSL + patched UA/CH)
     if lower == "chrome" || lower == "default" {
         return ResolvedEmulation {
             emulation: Emulation::builder()
@@ -185,7 +188,6 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
         };
     }
 
-    // Edge family
     if lower.starts_with("edge") {
         let digits: String = lower.chars().filter(|c| c.is_ascii_digit()).collect();
         let ver: u32 = digits.parse().unwrap_or(148);
@@ -224,7 +226,6 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
         };
     }
 
-    // Firefox / Tor family
     if lower.starts_with("firefox") || lower.starts_with("tor") {
         let digits: String = lower.chars().filter(|c| c.is_ascii_digit()).collect();
         let ver: u32 = if lower.starts_with("tor") { 128 } else { digits.parse().unwrap_or(151) };
@@ -267,7 +268,6 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
         };
     }
 
-    // Safari family
     if lower.starts_with("safari") {
         let is_ios = lower.contains("ios");
         let is_ipad = lower.contains("ipad");
@@ -316,7 +316,6 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
         };
     }
 
-    // Opera family
     if lower.starts_with("opera") {
         let digits: String = lower.chars().filter(|c| c.is_ascii_digit()).collect();
         let ver: u32 = digits.parse().unwrap_or(131);
@@ -345,7 +344,6 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
         };
     }
 
-    // OkHttp family
     if lower.starts_with("okhttp") {
         let clean = lower.replace("okhttp", "").replace('_', "").replace('.', "");
         let profile = match clean.as_str() {
@@ -365,7 +363,6 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
         };
     }
 
-    // Fallback: latest Chrome149
     ResolvedEmulation {
         emulation: Emulation::builder()
             .profile(Profile::Chrome149)
@@ -374,6 +371,138 @@ fn resolve_emulation(preset: &str) -> ResolvedEmulation {
         ua_override: None,
         sec_ch_ua_override: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Custom TLS & HTTP/2 options + OrigHeaderMap builders
+// ---------------------------------------------------------------------------
+fn parse_tls_version(s: &str) -> PyResult<TlsVersion> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1.0" | "tls1.0" | "tls_1_0" => Ok(TlsVersion::TLS_1_0),
+        "1.1" | "tls1.1" | "tls_1_1" => Ok(TlsVersion::TLS_1_1),
+        "1.2" | "tls1.2" | "tls_1_2" => Ok(TlsVersion::TLS_1_2),
+        "1.3" | "tls1.3" | "tls_1_3" => Ok(TlsVersion::TLS_1_3),
+        other => Err(PyValueError::new_err(format!("Unsupported TLS version '{other}'"))),
+    }
+}
+
+fn parse_tls_options(d: &Bound<'_, PyDict>) -> PyResult<TlsOptions> {
+    let mut b = TlsOptions::builder();
+    if let Some(v) = d.get_item("cipher_list")? {
+        b = b.cipher_list(v.extract::<String>()?);
+    }
+    if let Some(v) = d.get_item("curves_list")? {
+        b = b.curves_list(v.extract::<String>()?);
+    }
+    if let Some(v) = d.get_item("sigalgs_list")? {
+        b = b.sigalgs_list(v.extract::<String>()?);
+    }
+    if let Some(v) = d.get_item("alpn")? {
+        let items: Vec<String> = v.extract()?;
+        let mut protos = Vec::new();
+        for p in items {
+            match p.trim().to_ascii_lowercase().as_str() {
+                "h2" | "http2" | "http/2" => protos.push(AlpnProtocol::HTTP2),
+                "http/1.1" | "http1" | "h1" => protos.push(AlpnProtocol::HTTP1),
+                "h3" | "http3" | "http/3" => protos.push(AlpnProtocol::HTTP3),
+                other => return Err(PyValueError::new_err(format!("Unsupported ALPN protocol '{other}'"))),
+            }
+        }
+        b = b.alpn_protocols(protos);
+    }
+    if let Some(v) = d.get_item("min_tls_version")? {
+        b = b.min_tls_version(parse_tls_version(&v.extract::<String>()?)?);
+    }
+    if let Some(v) = d.get_item("max_tls_version")? {
+        b = b.max_tls_version(parse_tls_version(&v.extract::<String>()?)?);
+    }
+    if let Some(v) = d.get_item("grease_enabled")? {
+        b = b.grease_enabled(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("permute_extensions")? {
+        b = b.permute_extensions(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("enable_ech_grease")? {
+        b = b.enable_ech_grease(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("enable_ocsp_stapling")? {
+        b = b.enable_ocsp_stapling(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("enable_signed_cert_timestamps")? {
+        b = b.enable_signed_cert_timestamps(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("alps_use_new_codepoint")? {
+        b = b.alps_use_new_codepoint(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("session_ticket")? {
+        b = b.session_ticket(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("pre_shared_key")? {
+        b = b.pre_shared_key(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("preserve_tls13_cipher_list")? {
+        b = b.preserve_tls13_cipher_list(v.extract::<bool>()?);
+    }
+    Ok(b.build())
+}
+
+fn parse_http2_options(d: &Bound<'_, PyDict>) -> PyResult<Http2Options> {
+    let mut b = Http2Options::builder();
+    if let Some(v) = d.get_item("header_table_size")? {
+        b = b.header_table_size(v.extract::<u32>()?);
+    }
+    if let Some(v) = d.get_item("enable_push")? {
+        b = b.enable_push(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("max_concurrent_streams")? {
+        b = b.max_concurrent_streams(v.extract::<u32>()?);
+    }
+    if let Some(v) = d.get_item("initial_window_size")? {
+        b = b.initial_window_size(v.extract::<u32>()?);
+    }
+    if let Some(v) = d.get_item("initial_connection_window_size")? {
+        b = b.initial_connection_window_size(v.extract::<u32>()?);
+    }
+    if let Some(v) = d.get_item("max_frame_size")? {
+        b = b.max_frame_size(v.extract::<u32>()?);
+    }
+    if let Some(v) = d.get_item("max_header_list_size")? {
+        b = b.max_header_list_size(v.extract::<u32>()?);
+    }
+    Ok(b.build())
+}
+
+fn build_orig_headers(order: &[String]) -> OrigHeaderMap {
+    let mut map = OrigHeaderMap::new();
+    for name in order {
+        map.insert(name.clone());
+    }
+    map
+}
+
+fn parse_resolve_map(d: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Vec<SocketAddr>)>> {
+    let mut out = Vec::new();
+    for (k, v) in d {
+        let domain = k.extract::<String>()?;
+        let raw_list: Vec<String> = if let Ok(s) = v.extract::<String>() {
+            vec![s]
+        } else {
+            v.extract::<Vec<String>>()?
+        };
+        let mut addrs = Vec::with_capacity(raw_list.len());
+        for entry in raw_list {
+            let sa = if let Ok(s) = SocketAddr::from_str(&entry) {
+                s
+            } else if let Ok(ip) = IpAddr::from_str(&entry) {
+                SocketAddr::new(ip, 0)
+            } else {
+                return Err(PyValueError::new_err(format!("Invalid IP/SocketAddr '{entry}' for resolve['{domain}']")));
+            };
+            addrs.push(sa);
+        }
+        out.push((domain, addrs));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +550,30 @@ fn collect_cookies(jar: &Jar, uri_str: &str, h: &HeaderMap) -> HashMap<String, S
         }
     }
     out
+}
+
+fn collect_history(resp: &wreq::Response) -> Vec<HistoryTuple> {
+    match resp.extensions().get::<History>() {
+        None => Vec::new(),
+        Some(h) => h
+            .into_iter()
+            .map(|e| {
+                (
+                    e.status.as_u16(),
+                    e.previous.to_string(),
+                    e.uri.to_string(),
+                    collect_headers(&e.headers),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn extract_peer_cert(resp: &wreq::Response) -> Option<Vec<u8>> {
+    resp.extensions()
+        .get::<TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .map(|b| b.to_vec())
 }
 
 fn charset_of(h: &HeaderMap) -> Option<&'static Encoding> {
@@ -501,6 +654,11 @@ pub struct NativeResponse {
     pub cookies: HashMap<String, String>,
     #[pyo3(get)]
     pub http_version: String,
+    #[pyo3(get)]
+    pub remote_addr: Option<String>,
+    pub peer_certificate: Option<Vec<u8>>,
+    #[pyo3(get)]
+    pub history: Vec<HistoryTuple>,
 }
 
 #[pymethods]
@@ -508,6 +666,11 @@ impl NativeResponse {
     #[getter]
     pub fn content<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.content)
+    }
+
+    #[getter]
+    pub fn peer_certificate<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.peer_certificate.as_ref().map(|b| PyBytes::new(py, b))
     }
 
     pub fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -543,11 +706,21 @@ pub struct NativeStream {
     pub cookies: HashMap<String, String>,
     #[pyo3(get)]
     pub http_version: String,
+    #[pyo3(get)]
+    pub remote_addr: Option<String>,
+    pub peer_certificate: Option<Vec<u8>>,
+    #[pyo3(get)]
+    pub history: Vec<HistoryTuple>,
     inner: Arc<tokio::sync::Mutex<Option<BodyStream>>>,
 }
 
 #[pymethods]
 impl NativeStream {
+    #[getter]
+    pub fn peer_certificate<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.peer_certificate.as_ref().map(|b| PyBytes::new(py, b))
+    }
+
     pub fn read_chunk(&self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
         let rt = runtime();
         let inner = Arc::clone(&self.inner);
@@ -763,7 +936,7 @@ impl NativeWebSocket {
 }
 
 // ---------------------------------------------------------------------------
-// Session (BoringSSL native TLS + H2 + Cookie Jar + Sync/Async + Multipart + WS)
+// Session
 // ---------------------------------------------------------------------------
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct ClientKey {
@@ -779,7 +952,21 @@ pub struct NativeSession {
     ua_override: Option<String>,
     sec_ch_ua_override: Option<String>,
     default_headers: HeaderMap,
+    header_order: Option<Vec<String>>,
+    tls_options: Option<TlsOptions>,
+    http2_options: Option<Http2Options>,
+    http1_only: bool,
+    http2_only: bool,
+    resolve_entries: Vec<(String, Vec<SocketAddr>)>,
+    local_address: Option<IpAddr>,
+    #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
+    interface: Option<String>,
+    tls_info: bool,
     timeout: Duration,
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    pool_max_idle_per_host: Option<usize>,
+    pool_idle_timeout: Option<Duration>,
     max_redirects: usize,
     ca_bundle: Option<Vec<u8>>,
     identity_pair: Option<(Vec<u8>, Vec<u8>)>,
@@ -808,14 +995,51 @@ impl NativeSession {
             .timeout(self.timeout)
             .tls_cert_verification(verify)
             .tls_verify_hostname(verify)
+            .tls_info(self.tls_info)
             .redirect(if self.follow_redirects {
                 Policy::limited(self.max_redirects)
             } else {
                 Policy::none()
             });
 
+        if let Some(ct) = self.connect_timeout {
+            b = b.connect_timeout(ct);
+        }
+        if let Some(rt) = self.read_timeout {
+            b = b.read_timeout(rt);
+        }
+        if let Some(n) = self.pool_max_idle_per_host {
+            b = b.pool_max_idle_per_host(n);
+        }
+        if let Some(it) = self.pool_idle_timeout {
+            b = b.pool_idle_timeout(it);
+        }
+        if let Some(ref opts) = self.tls_options {
+            b = b.tls_options(opts.clone());
+        }
+        if let Some(ref h2) = self.http2_options {
+            b = b.http2_options(h2.clone());
+        }
+        if self.http1_only {
+            b = b.http1_only();
+        } else if self.http2_only {
+            b = b.http2_only();
+        }
+        if let Some(ref order) = self.header_order {
+            b = b.orig_headers(build_orig_headers(order));
+        }
         if !self.default_headers.is_empty() {
             b = b.default_headers(self.default_headers.clone());
+        }
+        for (domain, addrs) in &self.resolve_entries {
+            b = b.resolve_to_addrs(domain.clone(), addrs.iter().copied());
+        }
+        if let Some(ip) = self.local_address {
+            b = b.local_address(ip);
+        }
+        #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
+        if let Some(ref iface) = self.interface {
+            b = b.interface(iface.clone());
         }
         if let Some(ca_raw) = effective_ca {
             b = b.tls_cert_store(build_cert_store(ca_raw)?);
@@ -852,6 +1076,9 @@ impl NativeSession {
         allow_redirects: Option<bool>,
         verify: Option<bool>,
         ca_bundle: Option<Vec<u8>>,
+        header_order: Option<Vec<String>>,
+        impersonate_override: Option<String>,
+        local_address_override: Option<String>,
     ) -> PyResult<RequestBuilder> {
         let m = Method::from_str(&method.to_uppercase())
             .map_err(|e| PyValueError::new_err(format!("Invalid HTTP method: {e}")))?;
@@ -892,14 +1119,30 @@ impl NativeSession {
                 .map_err(|e| PyValueError::new_err(format!("Invalid proxy '{p}': {}", error_chain(&e))))?;
             rb = rb.proxy(px);
         }
+        if let Some(la) = local_address_override {
+            let ip = IpAddr::from_str(&la)
+                .map_err(|e| PyValueError::new_err(format!("Invalid local_address '{la}': {e}")))?;
+            rb = rb.local_address(ip);
+        }
 
-        // Apply forward-version UA/Sec-CH-UA patch if preset > wreq-util's built-in cap
-        if let Some(ref ua) = self.ua_override {
+        let (ua_ov, ch_ov) = if let Some(ref preset) = impersonate_override {
+            let res = resolve_emulation(preset);
+            rb = rb.emulation(res.emulation);
+            (res.ua_override, res.sec_ch_ua_override)
+        } else {
+            (self.ua_override.clone(), self.sec_ch_ua_override.clone())
+        };
+
+        if let Some(ref order) = header_order {
+            rb = rb.orig_headers(build_orig_headers(order));
+        }
+
+        if let Some(ref ua) = ua_ov {
             if let Ok(hv) = HeaderValue::from_str(ua) {
                 rb = rb.header(wreq::header::USER_AGENT, hv);
             }
         }
-        if let Some(ref ch) = self.sec_ch_ua_override {
+        if let Some(ref ch) = ch_ov {
             if let (Ok(hn), Ok(hv)) = (HeaderName::from_str("sec-ch-ua"), HeaderValue::from_str(ch)) {
                 rb = rb.header(hn, hv);
             }
@@ -945,6 +1188,9 @@ async fn finish_response(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeRe
     let status_code = resp.status().as_u16();
     let http_version = version_str(resp.version());
     let final_url = resp.uri().to_string();
+    let remote_addr = resp.remote_addr().map(|a| a.to_string());
+    let peer_certificate = extract_peer_cert(&resp);
+    let history = collect_history(&resp);
     let hdrs = resp.headers().clone();
     let bytes = resp.bytes().await.map_err(net_err)?;
     let elapsed = start.elapsed().as_secs_f64();
@@ -960,6 +1206,9 @@ async fn finish_response(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeRe
         encoding,
         elapsed,
         http_version,
+        remote_addr,
+        peer_certificate,
+        history,
     })
 }
 
@@ -970,6 +1219,9 @@ async fn start_stream(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeStrea
     let status_code = resp.status().as_u16();
     let http_version = version_str(resp.version());
     let final_url = resp.uri().to_string();
+    let remote_addr = resp.remote_addr().map(|a| a.to_string());
+    let peer_certificate = extract_peer_cert(&resp);
+    let history = collect_history(&resp);
     let hdrs = resp.headers().clone();
     let encoding = charset_of(&hdrs)
         .map(|e| e.name().to_ascii_lowercase())
@@ -985,6 +1237,9 @@ async fn start_stream(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeStrea
         url: final_url,
         elapsed,
         http_version,
+        remote_addr,
+        peer_certificate,
+        history,
         inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
     })
 }
@@ -1002,7 +1257,20 @@ impl NativeSession {
         headers = None,
         ca_bundle = None,
         client_cert = None,
-        client_key = None
+        client_key = None,
+        header_order = None,
+        tls_options = None,
+        http2_options = None,
+        http1_only = false,
+        http2_only = false,
+        resolve = None,
+        local_address = None,
+        interface = None,
+        tls_info = false,
+        connect_timeout = None,
+        read_timeout = None,
+        pool_max_idle_per_host = None,
+        pool_idle_timeout = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1016,6 +1284,19 @@ impl NativeSession {
         ca_bundle: Option<Vec<u8>>,
         client_cert: Option<Vec<u8>>,
         client_key: Option<Vec<u8>>,
+        header_order: Option<Vec<String>>,
+        tls_options: Option<&Bound<'_, PyDict>>,
+        http2_options: Option<&Bound<'_, PyDict>>,
+        http1_only: bool,
+        http2_only: bool,
+        resolve: Option<&Bound<'_, PyDict>>,
+        local_address: Option<String>,
+        interface: Option<String>,
+        tls_info: bool,
+        connect_timeout: Option<f64>,
+        read_timeout: Option<f64>,
+        pool_max_idle_per_host: Option<usize>,
+        pool_idle_timeout: Option<f64>,
     ) -> PyResult<Self> {
         let mut default_headers = HeaderMap::new();
         for (k, v) in dict_pairs(headers)? {
@@ -1040,6 +1321,30 @@ impl NativeSession {
                 .map_err(|e| PyValueError::new_err(format!("Invalid proxy '{p}': {}", error_chain(&e))))?;
         }
 
+        let parsed_tls = match tls_options {
+            Some(d) => Some(parse_tls_options(d)?),
+            None => None,
+        };
+        let parsed_h2 = match http2_options {
+            Some(d) => Some(parse_http2_options(d)?),
+            None => None,
+        };
+        let resolve_entries = match resolve {
+            Some(d) => parse_resolve_map(d)?,
+            None => Vec::new(),
+        };
+        let parsed_local_addr = match local_address {
+            Some(ref s) => Some(
+                IpAddr::from_str(s)
+                    .map_err(|e| PyValueError::new_err(format!("Invalid local_address '{s}': {e}")))?,
+            ),
+            None => None,
+        };
+        #[cfg(not(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos")))]
+        if interface.is_some() {
+            return Err(PyValueError::new_err("interface binding is supported on Linux/macOS/Android/FreeBSD; use local_address on Windows"));
+        }
+
         let resolved = resolve_emulation(impersonate);
 
         Ok(NativeSession {
@@ -1049,7 +1354,21 @@ impl NativeSession {
             ua_override: resolved.ua_override,
             sec_ch_ua_override: resolved.sec_ch_ua_override,
             default_headers,
+            header_order,
+            tls_options: parsed_tls,
+            http2_options: parsed_h2,
+            http1_only,
+            http2_only,
+            resolve_entries,
+            local_address: parsed_local_addr,
+            #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
+            interface,
+            tls_info,
             timeout: Duration::from_secs_f64(timeout.max(0.05)),
+            connect_timeout: connect_timeout.map(|t| Duration::from_secs_f64(t.max(0.05))),
+            read_timeout: read_timeout.map(|t| Duration::from_secs_f64(t.max(0.05))),
+            pool_max_idle_per_host,
+            pool_idle_timeout: pool_idle_timeout.map(|t| Duration::from_secs_f64(t.max(0.05))),
             max_redirects,
             ca_bundle,
             identity_pair,
@@ -1063,7 +1382,8 @@ impl NativeSession {
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
-        verify = None, ca_bundle = None
+        verify = None, ca_bundle = None, header_order = None, impersonate = None,
+        local_address = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn request(
@@ -1082,10 +1402,13 @@ impl NativeSession {
         allow_redirects: Option<bool>,
         verify: Option<bool>,
         ca_bundle: Option<Vec<u8>>,
+        header_order: Option<Vec<String>>,
+        impersonate: Option<String>,
+        local_address: Option<String>,
     ) -> PyResult<NativeResponse> {
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
-            allow_redirects, verify, ca_bundle,
+            allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
         py.allow_threads(move || runtime().block_on(finish_response(rb, jar)))
@@ -1094,7 +1417,8 @@ impl NativeSession {
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
-        verify = None, ca_bundle = None
+        verify = None, ca_bundle = None, header_order = None, impersonate = None,
+        local_address = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn async_request<'py>(
@@ -1113,10 +1437,13 @@ impl NativeSession {
         allow_redirects: Option<bool>,
         verify: Option<bool>,
         ca_bundle: Option<Vec<u8>>,
+        header_order: Option<Vec<String>>,
+        impersonate: Option<String>,
+        local_address: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
-            allow_redirects, verify, ca_bundle,
+            allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
         pyo3_async_runtimes::tokio::future_into_py(py, finish_response(rb, jar))
@@ -1125,7 +1452,8 @@ impl NativeSession {
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
-        verify = None, ca_bundle = None
+        verify = None, ca_bundle = None, header_order = None, impersonate = None,
+        local_address = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn request_stream(
@@ -1144,10 +1472,13 @@ impl NativeSession {
         allow_redirects: Option<bool>,
         verify: Option<bool>,
         ca_bundle: Option<Vec<u8>>,
+        header_order: Option<Vec<String>>,
+        impersonate: Option<String>,
+        local_address: Option<String>,
     ) -> PyResult<NativeStream> {
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
-            allow_redirects, verify, ca_bundle,
+            allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
         py.allow_threads(move || runtime().block_on(start_stream(rb, jar)))
@@ -1156,7 +1487,8 @@ impl NativeSession {
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
-        verify = None, ca_bundle = None
+        verify = None, ca_bundle = None, header_order = None, impersonate = None,
+        local_address = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn async_request_stream<'py>(
@@ -1175,10 +1507,13 @@ impl NativeSession {
         allow_redirects: Option<bool>,
         verify: Option<bool>,
         ca_bundle: Option<Vec<u8>>,
+        header_order: Option<Vec<String>>,
+        impersonate: Option<String>,
+        local_address: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
-            allow_redirects, verify, ca_bundle,
+            allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
         pyo3_async_runtimes::tokio::future_into_py(py, start_stream(rb, jar))
