@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import datetime as _dt
 from enum import Enum
 import inspect
 import json as _json
@@ -49,7 +50,7 @@ try:
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.5.0"
+    __version__ = "0.6.0"
 
     def _rust_presets() -> List[str]:
         return []
@@ -753,6 +754,19 @@ def _build_history_responses(raw_history: Sequence[Tuple[int, str, str, Dict[str
     ]
 
 
+_INLINE_COOKIE_RE = re.compile(
+    r"""document\.cookie\s*=\s*["']([A-Za-z0-9_\-\.]+)=([^;"']+)""",
+    re.IGNORECASE,
+)
+
+
+def _try_extract_inline_cookie(text: str) -> Dict[str, str]:
+    """Extract simple inline JS `document.cookie = 'k=v; ...'` tokens (e.g. CDN77 / lightweight interstitials)."""
+    if not text:
+        return {}
+    return {m.group(1): m.group(2) for m in _INLINE_COOKIE_RE.finditer(text[:16384])}
+
+
 class Session:
     """HTTP Session: 100% drop-in for requests.Session, httpx.Client, and curl_cffi.requests.Session."""
 
@@ -785,6 +799,12 @@ class Session:
         local_address: Optional[str] = None,
         interface: Optional[str] = None,
         tls_info: bool = False,
+        keylog_file: Optional[str] = None,
+        system_dns: bool = False,
+        record_har: bool = False,
+        flare_solverr_url: Optional[str] = None,
+        solver: Optional[Callable[[str, Response], Any]] = None,
+        storage_state: Optional[Union[str, Dict[str, Any]]] = None,
         pool_max_idle_per_host: Optional[int] = None,
         pool_idle_timeout: Optional[float] = None,
         retries: int = 0,
@@ -814,6 +834,12 @@ class Session:
         self.retry_statuses = tuple(retry_statuses)
         self.retry_on_challenge = bool(retry_on_challenge)
         self.rotate_impersonate = bool(rotate_impersonate)
+        self.keylog_file = keylog_file
+        self.system_dns = bool(system_dns)
+        self.record_har = bool(record_har)
+        self.har_entries: List[Dict[str, Any]] = []
+        self.flare_solverr_url = flare_solverr_url
+        self.solver = solver
         self.proxies_pool: List[str] = list(proxies_pool) if proxies_pool else []
         self._proxy_idx = 0
         self.event_hooks: Dict[str, List[Callable[..., Any]]] = {
@@ -873,7 +899,11 @@ class Session:
                 read_timeout=read_timeout,
                 pool_max_idle_per_host=pool_max_idle_per_host,
                 pool_idle_timeout=pool_idle_timeout,
+                keylog_file=keylog_file,
+                system_dns=self.system_dns,
             )
+        if storage_state is not None:
+            self.load_storage_state(storage_state)
 
     @property
     def mode(self) -> str:
@@ -900,6 +930,246 @@ class Session:
 
     def clear_cookies(self) -> None:
         self.cookies.clear()
+
+    def load_storage_state(self, state: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """Load Playwright / Camoufox `storage_state.json` (path or dict) into this Session."""
+        data = _json.loads(_read_file(state).decode("utf-8")) if isinstance(state, str) else dict(state)
+        ua = data.get("user_agent") or data.get("userAgent")
+        if ua:
+            self.headers["User-Agent"] = str(ua)
+        if isinstance(data.get("headers"), dict):
+            self.headers.update(data["headers"])
+
+        raw_cookies = data.get("cookies", [])
+        if isinstance(raw_cookies, dict):
+            for k, v in raw_cookies.items():
+                self.cookies[str(k)] = str(v)
+        elif isinstance(raw_cookies, list):
+            for c in raw_cookies:
+                if not isinstance(c, dict) or "name" not in c or "value" not in c:
+                    continue
+                name, val = str(c["name"]), str(c["value"])
+                self.cookies[name] = val
+                if self._mode == "rust":
+                    dom = str(c.get("domain") or "").lstrip(".")
+                    path = str(c.get("path") or "/")
+                    if dom:
+                        parts = [f"{name}={val}", f"Domain={dom}", f"Path={path}"]
+                        if c.get("secure"):
+                            parts.append("Secure")
+                        if c.get("httpOnly"):
+                            parts.append("HttpOnly")
+                        scheme = "https" if c.get("secure", True) else "http"
+                        self._session.add_raw_cookie("; ".join(parts), f"{scheme}://{dom}{path}")
+        return data
+
+    def save_storage_state(self, path: Optional[str] = None) -> Dict[str, Any]:
+        """Export current session cookies and User-Agent in Playwright `storage_state.json` format."""
+        seen: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        if self._mode == "rust" and hasattr(self._session, "all_cookies"):
+            for name, val, dom, cpath, sec, ho in self._session.all_cookies():
+                seen[(name, dom, cpath)] = {
+                    "name": name,
+                    "value": val,
+                    "domain": dom,
+                    "path": cpath or "/",
+                    "expires": -1,
+                    "httpOnly": bool(ho),
+                    "secure": bool(sec),
+                    "sameSite": "Lax",
+                }
+        existing_names = {k[0] for k in seen}
+        for name, val in self.cookies.items():
+            if name not in existing_names:
+                seen[(name, "", "/")] = {
+                    "name": name,
+                    "value": val,
+                    "domain": "",
+                    "path": "/",
+                    "expires": -1,
+                    "httpOnly": False,
+                    "secure": False,
+                    "sameSite": "Lax",
+                }
+        state: Dict[str, Any] = {
+            "cookies": list(seen.values()),
+            "origins": [],
+        }
+        ua = self.headers.get("user-agent")
+        if ua:
+            state["user_agent"] = ua
+        if path is not None:
+            with open(path, "w", encoding="utf-8") as fh:
+                _json.dump(state, fh, indent=2)
+        return state
+
+    def _record_har_entry(self, method: str, url: str, req_headers: Optional[Dict[str, str]], resp: Response) -> None:
+        if not self.record_har:
+            return
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        server_ip = (resp.remote_addr or "").rsplit(":", 1)[0]
+        self.har_entries.append(
+            {
+                "startedDateTime": now_iso,
+                "time": round(resp.elapsed * 1000.0, 3),
+                "serverIPAddress": server_ip,
+                "request": {
+                    "method": method.upper(),
+                    "url": url,
+                    "httpVersion": resp.http_version,
+                    "headers": [{"name": k, "value": v} for k, v in (req_headers or {}).items()],
+                    "cookies": [{"name": k, "value": v} for k, v in self.cookies.items()],
+                    "queryString": [],
+                    "headersSize": -1,
+                    "bodySize": 0,
+                },
+                "response": {
+                    "status": resp.status_code,
+                    "statusText": resp.reason,
+                    "httpVersion": resp.http_version,
+                    "headers": [{"name": k, "value": v} for k, v in resp.headers.items()],
+                    "cookies": [{"name": k, "value": v} for k, v in resp.cookies.items()],
+                    "content": {
+                        "size": len(resp._content or b""),
+                        "mimeType": resp.headers.get("content-type", "application/octet-stream"),
+                        "text": resp.text if resp._content is not None else "",
+                    },
+                    "redirectURL": resp.headers.get("location", ""),
+                    "headersSize": -1,
+                    "bodySize": len(resp._content or b""),
+                },
+                "cache": {},
+                "timings": {"send": 0, "wait": round(resp.elapsed * 1000.0, 3), "receive": 0},
+            }
+        )
+
+    def export_har(self, path: Optional[str] = None) -> Dict[str, Any]:
+        """Export recorded requests/responses as a standard HAR 1.2 dictionary (and write to `path` if given)."""
+        har = {
+            "log": {
+                "version": "1.2",
+                "creator": {"name": "http_tls", "version": __version__},
+                "entries": list(self.har_entries),
+            }
+        }
+        if path is not None:
+            with open(path, "w", encoding="utf-8") as fh:
+                _json.dump(har, fh, indent=2)
+        return har
+
+    def clear_har(self) -> None:
+        """Clear recorded HAR entries."""
+        self.har_entries.clear()
+
+    def solve_challenge(self, url_or_resp: Union[str, Response]) -> bool:
+        """Attempt to solve an anti-bot challenge via inline JS extraction, custom `solver`, or `flare_solverr_url`."""
+        if isinstance(url_or_resp, Response):
+            resp = url_or_resp
+            target_url = resp.url
+        else:
+            target_url = self._resolve_url(url_or_resp)
+            resp = self.get(target_url)
+
+        inline = _try_extract_inline_cookie(resp.text)
+        if inline:
+            self.cookies.update(inline)
+            if self._mode == "rust":
+                for k, v in inline.items():
+                    self._session.add_raw_cookie(f"{k}={v}; Path=/", target_url)
+            return True
+
+        if self.solver is not None:
+            state = self.solver(target_url, resp)
+            if isinstance(state, dict):
+                self.load_storage_state(state)
+                return True
+
+        if self.flare_solverr_url:
+            fs_resp = self.post(
+                self.flare_solverr_url,
+                json={"cmd": "request.get", "url": target_url, "maxTimeout": 60000},
+            )
+            if fs_resp.status_code == 200:
+                sol = fs_resp.json().get("solution", {})
+                self.load_storage_state(
+                    {"cookies": sol.get("cookies", []), "user_agent": sol.get("userAgent")}
+                )
+                return True
+        return False
+
+    def gather(
+        self,
+        urls_or_specs: Sequence[Union[str, Dict[str, Any]]],
+        concurrency: int = 50,
+        **common_kwargs: Any,
+    ) -> List[Response]:
+        """Execute a batch of requests in parallel on the Rust Tokio runtime without writing async/await.
+
+        Accepts URLs `["/a", "/b"]` or dicts `[{"method": "POST", "url": "/a", "json": {...}}]`.
+        Returns `List[Response]` in the exact input order.
+        """
+        if self._mode != "rust":
+            return [
+                self.request(
+                    spec.get("method", "GET") if isinstance(spec, dict) else common_kwargs.get("method", "GET"),
+                    spec["url"] if isinstance(spec, dict) else spec,
+                    **{**common_kwargs, **(spec if isinstance(spec, dict) else {})},
+                )
+                for spec in urls_or_specs
+            ]
+
+        auth_obj = _coerce_auth(common_kwargs.get("auth", self.auth))
+        native_specs: List[Dict[str, Any]] = []
+        meta_list: List[Tuple[str, str, Optional[Dict[str, str]]]] = []
+
+        for item in urls_or_specs:
+            if isinstance(item, str):
+                spec = dict(common_kwargs)
+                method = str(spec.pop("method", "GET"))
+                raw_url = item
+            else:
+                spec = {**common_kwargs, **item}
+                method = str(spec.pop("method", "GET"))
+                raw_url = str(spec.pop("url"))
+
+            full_url = self._resolve_url(raw_url)
+            item_proxy = spec.get("proxy") or (self._next_pool_proxy() if not spec.get("proxies") else None)
+            item_auth = _coerce_auth(spec["auth"]) if "auth" in spec else auth_obj
+            args = self._build_native_args(
+                method=method,
+                url=full_url,
+                params=spec.get("params"),
+                headers=spec.get("headers"),
+                cookies=spec.get("cookies"),
+                data=spec.get("data"),
+                json=spec.get("json"),
+                files=spec.get("files"),
+                timeout=spec.get("timeout"),
+                verify=spec.get("verify"),
+                proxies=spec.get("proxies"),
+                proxy=item_proxy,
+                allow_redirects=spec.get("allow_redirects", spec.get("follow_redirects")),
+                auth_obj=item_auth,
+                header_order=spec.get("header_order"),
+                impersonate_override=spec.get("impersonate"),
+                local_address=spec.get("local_address"),
+            )
+            native_specs.append(args)
+            meta_list.append((method, full_url, args.get("headers")))
+
+        try:
+            natives = self._session.gather(native_specs, concurrency=max(1, int(concurrency)))
+        except (RuntimeError, OSError) as exc:
+            raise _translate_error(exc) from exc
+
+        out: List[Response] = []
+        for (m, u, h), nat in zip(meta_list, natives):
+            resp = self._wrap_native(nat, stream=False, is_async=False)
+            self._record_har_entry(m, u, h, resp)
+            if self.event_hooks["response"]:
+                self._run_sync_hooks("response", resp)
+            out.append(resp)
+        return out
 
     def _build_native_args(
         self,
@@ -1094,6 +1364,11 @@ class Session:
                         resp = self._wrap_native(call(**args), stream=stream, is_async=False)
 
                 if attempt + 1 < max_attempts and self._should_retry_resp(resp):
+                    if resp.challenge is not None or _try_extract_inline_cookie(resp.text):
+                        try:
+                            self.solve_challenge(resp)
+                        except Exception:
+                            pass
                     _time.sleep(self._backoff_delay(attempt))
                     continue
                 break
@@ -1116,6 +1391,7 @@ class Session:
                 raise
 
         assert resp is not None, last_exc
+        self._record_har_entry(method, full_url, req_headers, resp)
         if self.event_hooks["response"]:
             self._run_sync_hooks("response", resp)
         return resp
@@ -1253,6 +1529,18 @@ class AsyncSession:
     def clear_cookies(self) -> None:
         self._sync_session.clear_cookies()
 
+    def load_storage_state(self, state: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+        return self._sync_session.load_storage_state(state)
+
+    def save_storage_state(self, path: Optional[str] = None) -> Dict[str, Any]:
+        return self._sync_session.save_storage_state(path)
+
+    def export_har(self, path: Optional[str] = None) -> Dict[str, Any]:
+        return self._sync_session.export_har(path)
+
+    def clear_har(self) -> None:
+        self._sync_session.clear_har()
+
     async def _run_async_hooks(self, kind: str, payload: Any) -> None:
         for hook in self._sync_session.event_hooks.get(kind, ()):
             res = hook(payload)
@@ -1350,6 +1638,7 @@ class AsyncSession:
                 raise mapped from exc
 
         assert resp is not None
+        s._record_har_entry(method, full_url, req_headers, resp)
         if s.event_hooks["response"]:
             await self._run_async_hooks("response", resp)
         return resp
@@ -1480,6 +1769,19 @@ def head(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs
 
 def options(url: str, impersonate: Union[str, BrowserType] = "chrome_152", **kwargs: Any) -> Response:
     return request("OPTIONS", url, impersonate=impersonate, **kwargs)
+
+
+def gather(
+    urls_or_specs: Sequence[Union[str, Dict[str, Any]]],
+    concurrency: int = 50,
+    impersonate: Union[str, BrowserType] = "chrome_152",
+    **kwargs: Any,
+) -> List[Response]:
+    """Execute a batch of requests in parallel on the Rust Tokio runtime without async/await."""
+    session_kw = {k: kwargs[k] for k in _SESSION_KEYS if k in kwargs and kwargs[k] is not None}
+    req_kw = {k: v for k, v in kwargs.items() if k not in _REQ_SKIP_KEYS}
+    with Session(impersonate=impersonate, **session_kw) as s:
+        return s.gather(urls_or_specs, concurrency=concurrency, **req_kw)
 
 
 Client = Session

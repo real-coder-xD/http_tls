@@ -47,13 +47,15 @@ Tested against `https://tls.peet.ws/api/all` (the canonical TLS fingerprint diag
 
 ### 🏆 Complete Feature Comparison Matrix
 
-| Feature | **`http_tls` (v0.5.0)** | `curl_cffi` | `primp` / `rnet` | `tls-client` | `httpx` | `requests` |
+| Feature | **`http_tls` (v0.6.0)** | `curl_cffi` | `primp` / `rnet` | `tls-client` | `httpx` | `requests` |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Standalone BoringSSL TLS / JA4** | ✅ **100+ Presets + Custom JA3/TLS** | ✅ | ✅ | ✅ (Go utls) | ❌ | ❌ |
-| **True Native Async (No ThreadPool)** | ✅ **Tokio ↔ asyncio (`pyo3-async`)** | ✅ | ✅ | ❌ | ✅ | ❌ |
+| **True Native Async + Sync `gather()`** | ✅ **Tokio Async & Sync Parallel Batch** | 🔶 (Async only) | 🔶 | ❌ | 🔶 | ❌ |
 | **HTTP/2 & Exact Header Order** | ✅ **Akamai H2 + `header_order`** | ✅ | ✅ | ✅ | ✅ | ❌ |
 | **Triple API (`requests`+`httpx`+`cffi`)**| ✅ **`base_url`, `history`, `hooks`** | 🔶 | ❌ | ❌ | 🔶 | 🔶 |
-| **DNS `resolve`, IPv6 `local_address`** | ✅ **Native Socket/DNS Binding** | ✅ | 🔶 | ❌ | ❌ | ❌ |
+| **Hickory DNS + `resolve` + IPv6 Bind** | ✅ **Async Rust DNS + Socket Bind** | 🔶 | 🔶 | ❌ | ❌ | ❌ |
+| **Playwright `storage_state` + Solver** | ✅ **`load/save_storage_state` + Bridge**| ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Wireshark `keylog` + HAR 1.2 Export** | ✅ **`keylog_file` + `export_har()`** | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **TLS-Impersonated WebSockets** | ✅ **Sync & Async (`ws_connect`)** | ✅ | ✅ | ❌ | ❌ | ❌ |
 | **Streaming + Multipart + mTLS + Digest** | ✅ **Full Native Rust + RFC 7616** | ✅ | 🔶 | 🔶 | ✅ | ✅ |
 | **Auto-Retry + Proxy Pool + WAF Detector**| ✅ **`retries`, `proxies_pool`, `challenge`** | 🔶 | 🔶 | ❌ | 🔶 | 🔶 |
@@ -218,6 +220,18 @@ with http_tls.Session(
 ) as s:
     r = s.get("/v1/status")
     print(r.remote_addr, len(r.history), bool(r.peer_certificate))
+
+# Endgame v0.6.0: Parallel Tokio gather() for Sync code, Playwright storage_state, HAR 1.2 & Wireshark KeyLog
+with http_tls.Session(
+    impersonate="chrome_149",
+    storage_state="playwright_state.json",  # optional: load cf_clearance + cookies + UA
+    record_har=True,
+    keylog_file="sslkeys.log",              # decrypt TLS traffic in Wireshark
+) as s:
+    # Fire 50 URLs in parallel on Rust Tokio from plain synchronous Python (no async/await needed!)
+    responses = s.gather([f"https://httpbin.org/get?i={i}" for i in range(50)], concurrency=25)
+    s.save_storage_state("playwright_state.json")
+    s.export_har("session_trace.har")
 ```
 
 ---

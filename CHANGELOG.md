@@ -2,6 +2,14 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [0.6.0] - 2026-11-21
+
+### Added
+- **Parallel Tokio `gather()` for Sync Python (`session.gather(urls, concurrency=50)` & `http_tls.gather(...)`):** Execute hundreds of requests in parallel on the Rust Tokio multi-thread runtime from synchronous code without writing `async/await` (releases the GIL and preserves exact input order).
+- **Playwright / Camoufox `storage_state.json` Integration & Challenge Solver Bridge:** `session.load_storage_state()`, `session.save_storage_state()`, `storage_state=` constructor support, `session.solve_challenge()`, inline JS cookie extractor, custom `solver=` callback, and `flare_solverr_url=` automatic retry integration.
+- **Built-in Async Hickory DNS (`hickory-dns`):** Non-blocking Rust DNS resolution enabled by default (configurable via `system_dns=True`).
+- **Reverse Engineering Toolkit (`keylog_file` & HAR 1.2 Recorder):** NSS TLS KeyLog output (`keylog_file=` / `SSLKEYLOGFILE`) for live Wireshark TLS decryption, plus `record_har=True`, `session.export_har("trace.har")`, and `session.clear_har()`.
+
 ## [0.5.0] - 2026-11-21
 
 ### Added

@@ -16,6 +16,7 @@ use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq::http2::Http2Options;
 use wreq::multipart::{Form, Part};
 use wreq::redirect::{History, Policy};
+use wreq::tls::keylog::KeyLog;
 use wreq::tls::trust::{CertStore, Identity};
 use wreq::tls::{AlpnProtocol, TlsInfo, TlsOptions, TlsVersion};
 use wreq::ws::message::{CloseCode, Message};
@@ -961,6 +962,8 @@ pub struct NativeSession {
     #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
     interface: Option<String>,
     tls_info: bool,
+    keylog_file: Option<String>,
+    system_dns: bool,
     timeout: Duration,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
@@ -1035,6 +1038,14 @@ impl NativeSession {
         }
         if let Some(ip) = self.local_address {
             b = b.local_address(ip);
+        }
+        if let Some(ref kl) = self.keylog_file {
+            b = b.tls_keylog(KeyLog::from_file(kl));
+        } else if std::env::var("SSLKEYLOGFILE").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            b = b.tls_keylog(KeyLog::from_env());
+        }
+        if self.system_dns {
+            b = b.no_hickory_dns();
         }
         #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
         if let Some(ref iface) = self.interface {
@@ -1136,18 +1147,26 @@ impl NativeSession {
             rb = rb.orig_headers(build_orig_headers(order));
         }
 
-        if let Some(ref ua) = ua_ov {
-            if let Ok(hv) = HeaderValue::from_str(ua) {
-                rb = rb.header(wreq::header::USER_AGENT, hv);
+        let caller_hdrs = dict_pairs(headers)?;
+        let has_caller_ua = caller_hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+        let has_caller_ch = caller_hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("sec-ch-ua"));
+
+        if !has_caller_ua {
+            if let Some(ref ua) = ua_ov {
+                if let Ok(hv) = HeaderValue::from_str(ua) {
+                    rb = rb.header(wreq::header::USER_AGENT, hv);
+                }
             }
         }
-        if let Some(ref ch) = ch_ov {
-            if let (Ok(hn), Ok(hv)) = (HeaderName::from_str("sec-ch-ua"), HeaderValue::from_str(ch)) {
-                rb = rb.header(hn, hv);
+        if !has_caller_ch {
+            if let Some(ref ch) = ch_ov {
+                if let (Ok(hn), Ok(hv)) = (HeaderName::from_str("sec-ch-ua"), HeaderValue::from_str(ch)) {
+                    rb = rb.header(hn, hv);
+                }
             }
         }
 
-        for (k, v) in dict_pairs(headers)? {
+        for (k, v) in caller_hdrs {
             if let (Ok(hn), Ok(hv)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
                 rb = rb.header(hn, hv);
             }
@@ -1269,7 +1288,9 @@ impl NativeSession {
         connect_timeout = None,
         read_timeout = None,
         pool_max_idle_per_host = None,
-        pool_idle_timeout = None
+        pool_idle_timeout = None,
+        keylog_file = None,
+        system_dns = false
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1296,6 +1317,8 @@ impl NativeSession {
         read_timeout: Option<f64>,
         pool_max_idle_per_host: Option<usize>,
         pool_idle_timeout: Option<f64>,
+        keylog_file: Option<String>,
+        system_dns: bool,
     ) -> PyResult<Self> {
         let mut default_headers = HeaderMap::new();
         for (k, v) in dict_pairs(headers)? {
@@ -1363,6 +1386,8 @@ impl NativeSession {
             #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
             interface,
             tls_info,
+            keylog_file,
+            system_dns,
             timeout: Duration::from_secs_f64(timeout.max(0.05)),
             connect_timeout: connect_timeout.map(|t| Duration::from_secs_f64(t.max(0.05))),
             read_timeout: read_timeout.map(|t| Duration::from_secs_f64(t.max(0.05))),
@@ -1594,6 +1619,106 @@ impl NativeSession {
 
     pub fn cookies_for(&self, url: &str) -> PyResult<HashMap<String, String>> {
         Ok(collect_cookies(&self.jar, url, &HeaderMap::new()))
+    }
+
+    /// Return all cookies in the jar as (name, value, domain, path, secure, http_only).
+    pub fn all_cookies(&self) -> Vec<(String, String, String, String, bool, bool)> {
+        self.jar
+            .get_all()
+            .map(|c| {
+                (
+                    c.name().to_string(),
+                    c.value().to_string(),
+                    c.domain().unwrap_or("").to_string(),
+                    c.path().unwrap_or("/").to_string(),
+                    c.secure(),
+                    c.http_only(),
+                )
+            })
+            .collect()
+    }
+
+    /// Insert a raw Set-Cookie style string scoped to `url`.
+    pub fn add_raw_cookie(&self, cookie_header: &str, url: &str) {
+        self.jar.add(cookie_header.to_string(), url);
+    }
+
+    /// Execute a batch of requests concurrently on the Rust Tokio multi-thread pool,
+    /// releasing the GIL and returning responses in the exact input order.
+    #[pyo3(signature = (specs, concurrency = 50))]
+    pub fn gather(
+        &self,
+        py: Python<'_>,
+        specs: &Bound<'_, PyList>,
+        concurrency: usize,
+    ) -> PyResult<Vec<NativeResponse>> {
+        let mut builders = Vec::with_capacity(specs.len());
+        for item in specs.iter() {
+            let d = item.downcast::<PyDict>()?;
+            let method: String = d
+                .get_item("method")?
+                .map(|v| v.extract())
+                .transpose()?
+                .unwrap_or_else(|| "GET".to_string());
+            let url: String = d
+                .get_item("url")?
+                .ok_or_else(|| PyValueError::new_err("gather spec missing 'url'"))?
+                .extract()?;
+            let params_any = d.get_item("params")?;
+            let params = params_any.as_ref().and_then(|v| v.downcast::<PyDict>().ok());
+            let headers_any = d.get_item("headers")?;
+            let headers = headers_any.as_ref().and_then(|v| v.downcast::<PyDict>().ok());
+            let cookies_any = d.get_item("cookies")?;
+            let cookies = cookies_any.as_ref().and_then(|v| v.downcast::<PyDict>().ok());
+            let data: Option<Vec<u8>> = d.get_item("data")?.and_then(|v| v.extract().ok());
+            let json_str: Option<String> = d.get_item("json")?.and_then(|v| v.extract().ok());
+            let files_any = d.get_item("files")?;
+            let files = files_any.as_ref().and_then(|v| v.downcast::<PyList>().ok());
+            let timeout: Option<f64> = d.get_item("timeout")?.and_then(|v| v.extract().ok());
+            let proxy: Option<String> = d.get_item("proxy")?.and_then(|v| v.extract().ok());
+            let allow_redirects: Option<bool> = d.get_item("allow_redirects")?.and_then(|v| v.extract().ok());
+            let verify: Option<bool> = d.get_item("verify")?.and_then(|v| v.extract().ok());
+            let ca_bundle: Option<Vec<u8>> = d.get_item("ca_bundle")?.and_then(|v| v.extract().ok());
+            let header_order: Option<Vec<String>> = d.get_item("header_order")?.and_then(|v| v.extract().ok());
+            let impersonate: Option<String> = d.get_item("impersonate")?.and_then(|v| v.extract().ok());
+            let local_address: Option<String> = d.get_item("local_address")?.and_then(|v| v.extract().ok());
+
+            let rb = self.prepare(
+                &method,
+                &url,
+                params,
+                headers,
+                cookies,
+                data,
+                json_str.as_deref(),
+                files,
+                timeout,
+                proxy,
+                allow_redirects,
+                verify,
+                ca_bundle,
+                header_order,
+                impersonate,
+                local_address,
+            )?;
+            builders.push(rb);
+        }
+
+        let jar = Arc::clone(&self.jar);
+        let limit = concurrency.max(1);
+        py.allow_threads(move || {
+            runtime().block_on(async move {
+                let results: Vec<PyResult<NativeResponse>> = futures_util::stream::iter(
+                    builders
+                        .into_iter()
+                        .map(|rb| finish_response(rb, Arc::clone(&jar))),
+                )
+                .buffered(limit)
+                .collect()
+                .await;
+                results.into_iter().collect()
+            })
+        })
     }
 
     pub fn clear_cookies(&self) {

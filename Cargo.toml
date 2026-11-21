@@ -1,6 +1,6 @@
 [package]
 name = "http_tls"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Rust native BoringSSL TLS & HTTP/2 browser-impersonating core for http_tls"
 license = "MIT"
@@ -16,6 +16,7 @@ tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 wreq = { version = "0.16.4", features = [
     "webpki-roots",
     "tokio-rt",
+    "hickory-dns",
     "cookies",
     "gzip",
     "brotli",

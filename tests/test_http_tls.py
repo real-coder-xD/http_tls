@@ -642,3 +642,92 @@ def test_high_concurrency_stress_and_no_memory_leak(http_server):
     delta_bytes = sum(stat.size_diff for stat in snap2.compare_to(snap1, "lineno") if stat.size_diff > 0)
     # After GC, 300 concurrent completed requests must retain < 4 MB in Python heap
     assert delta_bytes < 4 * 1024 * 1024, f"Unexpected memory retention: {delta_bytes} bytes"
+
+
+# ---------------------------------------------------------------------------
+# 7. Endgame Features: Rust Sync gather(), storage_state, Auto-Solver, HAR & KeyLog
+# ---------------------------------------------------------------------------
+def test_sync_rust_gather_parallel_and_order(http_server):
+    base, _port = http_server
+    with Session(base_url=base, impersonate="chrome_149") as s:
+        urls = [f"/echo?id={i}" for i in range(40)]
+        resps = s.gather(urls, concurrency=20)
+        assert len(resps) == 40
+        assert [r.json()["path"] for r in resps] == urls
+
+        # Mixed GET + POST spec dicts
+        mixed = s.gather(
+            [
+                "/echo?step=1",
+                {"method": "POST", "url": "/upload", "json": {"batch": True}},
+            ],
+            concurrency=5,
+        )
+        assert mixed[0].json()["path"] == "/echo?step=1"
+        assert '"batch"' in mixed[1].json()["body"]
+
+
+def test_storage_state_playwright_roundtrip_and_auto_solver(http_server):
+    base, _port = http_server
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = os.path.join(tmp, "storage_state.json")
+        with Session(base_url=base) as s1:
+            s1.get("/set")
+            s1.headers["User-Agent"] = "CustomCamoufox/1.0"
+            saved = s1.save_storage_state(state_file)
+            assert any(c["name"] == "a" and c["value"] == "1" for c in saved["cookies"])
+            assert saved["user_agent"] == "CustomCamoufox/1.0"
+
+        # Load storage_state into a brand-new Session
+        with Session(base_url=base, storage_state=state_file) as s2:
+            assert s2.cookies.get("a") == "1"
+            assert s2.headers["User-Agent"] == "CustomCamoufox/1.0"
+            echo = s2.get("/echo").json()
+            assert echo["ua"] == "CustomCamoufox/1.0"
+            assert "a=1" in echo["cookie"]
+
+    # Custom challenge solver callback invoked automatically on retry_on_challenge
+    _FLAKY_COUNTER["cf"] = 0
+    solved_calls = []
+
+    def fake_harvester(url, resp):
+        solved_calls.append((url, resp.challenge))
+        return {
+            "cookies": [{"name": "cf_clearance", "value": "cleared-token-999", "domain": "127.0.0.1", "path": "/"}],
+            "user_agent": "HarvesterBrowser/149.0",
+        }
+
+    with Session(base_url=base, retries=1, retry_backoff=0.01, retry_on_challenge=True, solver=fake_harvester) as s:
+        r = s.get("/cf_flaky")
+        assert r.status_code == 200
+        assert len(solved_calls) == 1 and solved_calls[0][1] == "cloudflare"
+        assert s.cookies["cf_clearance"] == "cleared-token-999"
+
+
+def test_har_recording_and_export(http_server):
+    base, _port = http_server
+    with tempfile.TemporaryDirectory() as tmp:
+        har_path = os.path.join(tmp, "trace.har")
+        with Session(base_url=base, record_har=True) as s:
+            s.get("/echo?har=1")
+            s.post("/upload", json={"har": 2})
+            har = s.export_har(har_path)
+            assert har["log"]["version"] == "1.2"
+            assert len(har["log"]["entries"]) == 2
+            assert har["log"]["entries"][0]["request"]["method"] == "GET"
+            assert har["log"]["entries"][1]["request"]["method"] == "POST"
+            assert os.path.exists(har_path)
+            s.clear_har()
+            assert len(s.har_entries) == 0
+
+
+@pytest.mark.skipif(os.environ.get("HTTP_TLS_OFFLINE") == "1", reason="Offline mode")
+def test_tls_keylog_file_and_hickory_dns():
+    with tempfile.TemporaryDirectory() as tmp:
+        kl_path = os.path.join(tmp, "sslkeys.log")
+        with Session(impersonate="chrome_149", keylog_file=kl_path, timeout=15) as s:
+            r = s.get("https://www.example.com/")
+            assert r.status_code == 200
+        # Give async keylog writer channel a brief moment to flush
+        time.sleep(0.1)
+        assert os.path.exists(kl_path) and os.path.getsize(kl_path) > 0

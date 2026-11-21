@@ -32,6 +32,7 @@ from http_tls.requests import (
     Session,
     WebSocket,
     delete,
+    gather,
     get,
     head,
     options,
@@ -48,7 +49,7 @@ from http_tls.structures import CaseInsensitiveDict
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "0.5.0"
+    __version__ = "0.6.0"
 
 sys.modules["http_tls.requests"] = requests
 
@@ -82,6 +83,7 @@ __all__ = [
     "Cookies",
     "BrowserType",
     "parse_ja3_to_tls_options",
+    "gather",
     "request",
     "get",
     "post",
