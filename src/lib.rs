@@ -1,4 +1,6 @@
-// Language: Rust 2021 | File: src/lib.rs | Target: Python PyO3 ABI3 Extension | Runtime: Tokio + wreq (BoringSSL) + quinn/h3 (UDP QUIC)
+// Language: Rust 2021 | File: src/lib.rs | Target: Python PyO3 ABI3 Extension | Runtime: Tokio + wreq (BoringSSL) + quinn/h3 (BoringSSL UDP QUIC)
+mod quic_boring;
+
 use bytes::{Buf, Bytes};
 use encoding_rs::{Encoding, UTF_8};
 use futures_util::{Stream, StreamExt};
@@ -860,56 +862,8 @@ fn build_identity(cert_pem: &[u8], key_pem: &[u8]) -> PyResult<Identity> {
 }
 
 // ---------------------------------------------------------------------------
-// Native UDP QUIC / HTTP/3 Engine (quinn + h3 + h3-quinn + Chromium profile)
+// Native UDP QUIC / HTTP/3 Engine (quinn + h3 + h3-quinn + BoringSSL btls-sys)
 // ---------------------------------------------------------------------------
-#[derive(Debug)]
-struct NoCertVerifier(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 #[derive(Clone)]
 struct H3RequestSpec {
     method: String,
@@ -927,7 +881,7 @@ struct H3RequestSpec {
     resolve_entries: Vec<(String, Vec<SocketAddr>)>,
     local_address: Option<IpAddr>,
     tls_info: bool,
-    enable_keylog: bool,
+    keylog_file: Option<String>,
     preset: String,
     ua_override: Option<String>,
     sec_ch_ua_override: Option<String>,
@@ -1075,61 +1029,21 @@ fn decompress_h3_body(raw: Vec<u8>, content_encoding: Option<&str>) -> Vec<u8> {
 }
 
 fn build_h3_client_config(
+    preset: &str,
     verify: bool,
     ca_bundle: Option<&[u8]>,
     identity_pair: Option<&(Vec<u8>, Vec<u8>)>,
-    enable_keylog: bool,
+    keylog_file: Option<&str>,
 ) -> PyResult<quinn::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| PyRuntimeError::new_err(format!("[builder] QUIC TLS 1.3 init failed: {e}")))?;
-
-    let mut tls_config = if verify {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        if let Some(ca_raw) = ca_bundle {
-            let mut reader = std::io::BufReader::new(ca_raw);
-            let mut added = false;
-            for cert in rustls_pemfile::certs(&mut reader).flatten() {
-                let _ = roots.add(cert);
-                added = true;
-            }
-            if !added {
-                let _ = roots.add(rustls::pki_types::CertificateDer::from(ca_raw.to_vec()));
-            }
-        }
-        let want_verifier = builder.with_root_certificates(roots);
-        if let Some((cert_pem, key_pem)) = identity_pair {
-            let mut creader = std::io::BufReader::new(&cert_pem[..]);
-            let certs: Vec<_> = rustls_pemfile::certs(&mut creader).flatten().collect();
-            let mut kreader = std::io::BufReader::new(&key_pem[..]);
-            let key = rustls_pemfile::private_key(&mut kreader)
-                .ok()
-                .flatten()
-                .ok_or_else(|| PyValueError::new_err("Invalid client private key PEM for HTTP/3"))?;
-            want_verifier
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| PyValueError::new_err(format!("HTTP/3 client auth rejected: {e}")))?
-        } else {
-            want_verifier.with_no_client_auth()
-        }
-    } else {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertVerifier(provider)))
-            .with_no_client_auth()
-    };
-
-    tls_config.alpn_protocols = vec![b"h3".to_vec()];
-    tls_config.enable_early_data = true;
-    if enable_keylog {
-        tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
-    }
-
-    let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
-        .map_err(|e| PyRuntimeError::new_err(format!("[builder] QUIC crypto config failed: {e}")))?;
-    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_tls));
+    let boring_cfg = quic_boring::BoringQuicClientConfig::new(
+        preset,
+        verify,
+        ca_bundle,
+        identity_pair,
+        keylog_file,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("[builder] BoringSSL QUIC init failed: {e}")))?;
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(boring_cfg));
 
     // Chromium QUIC transport parameters (0x0039)
     let mut transport = quinn::TransportConfig::default();
@@ -1285,14 +1199,18 @@ async fn acquire_h3_conn(
     };
 
     let client_cfg = build_h3_client_config(
+        &spec.preset,
         spec.verify,
         spec.ca_bundle.as_deref(),
         spec.identity_pair.as_ref(),
-        spec.enable_keylog,
+        spec.keylog_file.as_deref(),
     )?;
 
-    let mut endpoint = quinn::Endpoint::client(bind_addr)
+    let udp_sock = std::net::UdpSocket::bind(bind_addr)
         .map_err(|e| PyRuntimeError::new_err(format!("[connect] UDP socket bind failed on {bind_addr}: {e}")))?;
+    let ep_cfg = quinn::EndpointConfig::new(Arc::new(quic_boring::BoringHmacKey::random()));
+    let mut endpoint = quinn::Endpoint::new(ep_cfg, None, udp_sock, Arc::new(quinn::TokioRuntime))
+        .map_err(|e| PyRuntimeError::new_err(format!("[connect] QUIC endpoint init failed on {bind_addr}: {e}")))?;
     endpoint.set_default_client_config(client_cfg);
 
     let clean_sni = host.trim_matches(|c| c == '[' || c == ']');
@@ -1323,8 +1241,8 @@ async fn acquire_h3_conn(
     let remote_addr_str = Some(conn.remote_address().to_string());
     let peer_cert_der = if spec.tls_info {
         conn.peer_identity()
-            .and_then(|any| any.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
-            .and_then(|certs| certs.into_iter().next().map(|c| c.as_ref().to_vec()))
+            .and_then(|any| any.downcast::<Vec<Vec<u8>>>().ok())
+            .and_then(|certs| certs.into_iter().next())
     } else {
         None
     };
@@ -2408,10 +2326,6 @@ impl NativeSession {
         let eff_connect_timeout = self
             .connect_timeout
             .unwrap_or_else(|| eff_timeout.min(Duration::from_secs(10)));
-        let enable_keylog = self.keylog_file.is_some()
-            || std::env::var("SSLKEYLOGFILE")
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false);
 
         Ok(Some(H3RequestSpec {
             method: method.to_uppercase(),
@@ -2429,7 +2343,7 @@ impl NativeSession {
             resolve_entries: self.resolve_entries.clone(),
             local_address: eff_local_addr,
             tls_info: self.tls_info,
-            enable_keylog,
+            keylog_file: self.keylog_file.clone(),
             preset: preset_name,
             ua_override: ua_ov,
             sec_ch_ua_override: ch_ov,

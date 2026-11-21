@@ -1,6 +1,6 @@
 [package]
 name = "http_tls"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 description = "Rust native BoringSSL TLS & HTTP/2 browser-impersonating core for http_tls"
 license = "MIT"
@@ -36,12 +36,12 @@ bytes = "1"
 encoding_rs = "0.8"
 url = "2.5"
 http = "1"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+btls-sys = "0.5.6"
+webpki-root-certs = "1.0"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+quinn-proto = { version = "0.11", default-features = false }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1.0"
-rustls-pemfile = "2"
 flate2 = "1"
 brotli = "8"
 zstd = "0.14"

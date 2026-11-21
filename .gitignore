@@ -24,5 +24,6 @@ ENV/
 # IDE
 .idea/
 .vscode/
+.clangd
 *.swp
 *.swo
