@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "http-tls"
-version = "0.3.2"
-description = "High-performance Rust-powered TLS & Browser Impersonating HTTP client for Python"
+version = "0.4.0"
+description = "Standalone Rust + BoringSSL TLS (JA3/JA4) & HTTP/2 Browser Impersonating HTTP client for Python"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -19,8 +19,9 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Byte-exact browser TLS/HTTP2 fingerprints via libcurl-impersonate.
-impersonate = ["curl_cffi>=0.17"]
+curl_cffi = ["curl_cffi>=0.17"]
+impersonate = []
+test = ["pytest>=8.0", "cryptography>=42.0", "certifi"]
 
 [project.urls]
 Homepage = "https://github.com/real-coder-xD/http_tls"

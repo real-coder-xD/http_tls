@@ -2,8 +2,8 @@
 
 # ⚡ http_tls
 
-**High-performance Rust-powered HTTP client with byte-exact TLS (JA3/JA4) & HTTP/2 fingerprint impersonation.**  
-*100% Drop-in replacement for both `requests` and `curl_cffi`.*
+**Standalone Rust + BoringSSL HTTP client with byte-exact TLS (JA3/JA4) & HTTP/2 fingerprint impersonation, native Tokio async, streaming, multipart uploads, and WebSockets.**  
+*100% Drop-in replacement for `requests`, `httpx`, and `curl_cffi` — zero external C runtime dependencies.*
 
 [![CI & Release Wheels](https://github.com/real-coder-xD/http_tls/actions/workflows/release.yml/badge.svg)](https://github.com/real-coder-xD/http_tls/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -47,15 +47,16 @@ Tested against `https://tls.peet.ws/api/all` (the canonical TLS fingerprint diag
 
 ### 🏆 Complete Feature Comparison Matrix
 
-| Feature | **`http_tls`** | `requests` | `httpx` | `curl_cffi` | `tls-client` |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **TLS Fingerprinting** | ✅ **50+ (Chrome 152)** | ❌ | ❌ | ✅ | ✅ |
-| **Async Support** | ✅ **Native Tokio (No GIL)** | ❌ | ✅ | ✅ | ❌ |
-| **HTTP/2 Fingerprint** | ✅ **`m,a,s,p` + Frames** | ❌ | ✅ | ✅ | ✅ |
-| **`httpx`-like API** | ✅ **`Client` / `AsyncClient`** | ❌ | ✅ | ❌ | ❌ |
-| **Cookie `clear()` Works** | ✅ **Deep Sync (Core + Memory)**| ✅ | ✅ | ✅ | ❌ |
-| **No Memory Leaks** | ✅ **Rust RAII (Zero GC Lag)** | ✅ | ✅ | ✅ | ❌ |
-| **Auto-download Binary** | ✅ **Prebuilt ABI3 Wheels** | N/A | N/A | ✅ | ❌ |
+| Feature | **`http_tls` (v0.4.0)** | `curl_cffi` | `primp` / `rnet` | `tls-client` | `httpx` | `requests` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Standalone BoringSSL TLS / JA4** | ✅ **100+ Presets (Zero external deps)** | ✅ | ✅ | ✅ (Go utls) | ❌ | ❌ |
+| **True Native Async (No ThreadPool)** | ✅ **Tokio ↔ asyncio (`pyo3-async`)** | ✅ | ✅ | ❌ | ✅ | ❌ |
+| **HTTP/2 Akamai Fingerprint** | ✅ **`m,a,s,p` + Frame Settings** | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Triple API (`requests`+`httpx`+`cffi`)**| ✅ **100% Drop-in** | 🔶 | ❌ | ❌ | 🔶 | 🔶 |
+| **TLS-Impersonated WebSockets** | ✅ **Sync & Async (`ws_connect`)** | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **Streaming + Multipart + mTLS + CA** | ✅ **Full Native Rust** | ✅ | 🔶 | 🔶 | ✅ | ✅ |
+| **Cookie `clear()` + `resp.challenge`** | ✅ **Deep Jar Clear + WAF Detector** | 🔶 | 🔶 | ❌ | 🔶 | 🔶 |
+| **No Memory Leaks** | ✅ **Rust RAII (Zero GC Lag)** | ✅ | ✅ | ❌ | ✅ | ✅ |
 
 ---
 
@@ -174,22 +175,31 @@ asyncio.run(main())
 
 ---
 
-## 🎛️ Dual-Engine Architecture
+## 🎛️ Standalone Rust + BoringSSL Architecture
 
-`http_tls` gives you explicit control over the network engine:
+As of `v0.4.0`, `http_tls` embeds **BoringSSL (`btls`)** and custom HTTP/2 frame emulation directly inside its Rust core (`wreq` + `wreq-util` + Tokio). Installing `pip install http-tls` alone delivers 100% byte-exact Chrome/Safari/Firefox/Edge/Opera/OkHttp JA3/JA4 fingerprints without requiring `curl_cffi`.
 
 ```python
 import http_tls
 
-# Engine 1: 'impersonate' (Default / Auto)
-# 100% byte-exact TLS & H2 frames to bypass Cloudflare Bot Management & Akamai.
-with http_tls.Session(impersonate="chrome_152", engine="impersonate") as s:
-    resp = s.get("https://www.upwork.com")
+# Default: Standalone Rust BoringSSL engine (byte-exact JA4 + H2, zero external deps)
+with http_tls.Session(impersonate="chrome_149") as s:
+    resp = s.get("https://tls.peet.ws/api/all")
+    print(resp.http_version, resp.json()["tls"]["ja4"])
 
-# Engine 2: 'rust'
-# Pure Rust Tokio + Rustls runtime. Maximum memory safety and zero external C dependencies.
-with http_tls.Session(impersonate="chrome_152", engine="rust") as s:
-    resp = s.get("https://httpbin.org/get")
+# Multipart file upload
+with http_tls.Session() as s:
+    r = s.post(
+        "https://httpbin.org/post",
+        data={"note": "hello"},
+        files={"file": ("demo.txt", b"payload", "text/plain")},
+    )
+
+# TLS-Impersonated WebSocket (sync & async)
+with http_tls.Session(impersonate="chrome_149") as s:
+    with s.ws_connect("wss://echo.websocket.org") as ws:
+        ws.send_text("hello over BoringSSL Chrome TLS")
+        print(ws.recv_text())
 ```
 
 ---

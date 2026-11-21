@@ -12,25 +12,33 @@ permissions:
 
 jobs:
   build-wheels:
-    name: Build Wheels on ${{ matrix.os }} (${{ matrix.target }})
+    name: Build & Test Wheels on ${{ matrix.os }} (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Windows
+          # Windows (MSVC + BoringSSL)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          # Linux
+            run_tests: true
+          # Linux x86_64 (manylinux + BoringSSL)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+            manylinux: auto
+            run_tests: true
+          # Linux aarch64 (native ARM64 runner for clean BoringSSL build)
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          # macOS
+            manylinux: auto
+            run_tests: true
+          # macOS Intel & Apple Silicon
           - os: macos-latest
             target: x86_64-apple-darwin
+            run_tests: false
           - os: macos-latest
             target: aarch64-apple-darwin
+            run_tests: true
 
     steps:
       - uses: actions/checkout@v4
@@ -38,14 +46,39 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
+
+      - name: Install Windows BoringSSL build deps (NASM + LLVM)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm llvm --no-progress -y
+          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || '' }}
           args: --release --out dist
-          sccache: 'true'
+          before-script-linux: |
+            if command -v yum >/dev/null 2>&1; then
+              yum install -y cmake perl-core clang-devel llvm-devel || true
+            elif command -v dnf >/dev/null 2>&1; then
+              dnf install -y cmake perl-core clang-devel llvm-devel || true
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install -y cmake perl libclang-dev clang || true
+            fi
+
+      - name: Run pytest test suite against built wheel
+        if: ${{ matrix.run_tests }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest cryptography certifi
+          python -m pip install dist/*.whl
+          python -m pytest -v tests/
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4

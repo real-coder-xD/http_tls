@@ -1,8 +1,8 @@
 [package]
 name = "http_tls"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
-description = "Rust native core for http_tls Python library"
+description = "Rust native BoringSSL TLS & HTTP/2 browser-impersonating core for http_tls"
 license = "MIT"
 
 [lib]
@@ -11,9 +11,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
-tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "time"] }
-reqwest = { version = "0.13", default-features = false, features = [
-    "rustls",
+pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
+wreq = { version = "0.16.4", features = [
+    "webpki-roots",
+    "tokio-rt",
     "cookies",
     "gzip",
     "brotli",
@@ -21,18 +23,20 @@ reqwest = { version = "0.13", default-features = false, features = [
     "zstd",
     "socks",
     "json",
-    "http2"
+    "form",
+    "multipart",
+    "stream",
+    "ws",
+    "charset"
 ] }
+wreq-util = "0.2.1"
+futures-util = "0.3"
 bytes = "1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 encoding_rs = "0.8"
 url = "2.5"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = "thin"
 codegen-units = 1
-# unwind (default) so an unexpected panic surfaces as a Python exception
-# instead of aborting the interpreter.
 strip = true

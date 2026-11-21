@@ -1,8 +1,9 @@
-"""http_tls: High-performance Rust & TLS Fingerprint Impersonating HTTP client for Python.
+"""http_tls: Standalone Rust + BoringSSL TLS & HTTP/2 Fingerprint Impersonating HTTP client for Python.
 
-100% Drop-in replacement for both `requests` and `curl_cffi.requests`:
+100% Drop-in replacement for `requests`, `httpx`, and `curl_cffi`:
     import http_tls as requests
-    from http_tls import requests
+    import http_tls as httpx
+    from http_tls import requests, BrowserType
 """
 
 from __future__ import annotations
@@ -22,11 +23,13 @@ from http_tls.exceptions import (
 from http_tls.requests import (
     AsyncClient,
     AsyncSession,
+    AsyncWebSocket,
     BrowserType,
     Client,
     Cookies,
     Response,
     Session,
+    WebSocket,
     delete,
     get,
     head,
@@ -40,18 +43,16 @@ from http_tls.requests import (
 from http_tls.status_codes import codes
 from http_tls.structures import CaseInsensitiveDict
 
-# Package version
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "0.3.2"
+    __version__ = "0.4.0"
 
-# Register module alias in sys.modules so `import http_tls.requests as requests` works
 sys.modules["http_tls.requests"] = requests
 
 __all__ = [
-    # Requests compatibility
     "requests",
+    "challenge",
     "codes",
     "exceptions",
     "structures",
@@ -64,12 +65,13 @@ __all__ = [
     "ReadTimeout",
     "SSLError",
     "TooManyRedirects",
-    # Main classes & funcs
     "Response",
     "Session",
     "AsyncSession",
     "Client",
     "AsyncClient",
+    "WebSocket",
+    "AsyncWebSocket",
     "Cookies",
     "BrowserType",
     "request",
