@@ -1185,34 +1185,93 @@ async fn resolve_h3_target(
         .ok_or_else(|| PyRuntimeError::new_err(format!("[connect] No addresses resolved for '{lookup_target}'")))
 }
 
-async fn execute_h3_single_hop(
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct H3PoolKey {
+    host: String,
+    port: u16,
+    verify: bool,
+    local_address: Option<IpAddr>,
+    ca_hash: Option<Vec<u8>>,
+}
+
+struct PooledH3Conn {
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    driver_handle: tokio::task::JoinHandle<()>,
+    remote_addr: Option<String>,
+    peer_certificate: Option<Vec<u8>>,
+}
+
+impl PooledH3Conn {
+    fn is_alive(&self) -> bool {
+        self.conn.close_reason().is_none() && !self.driver_handle.is_finished()
+    }
+
+    fn close(&self) {
+        self.driver_handle.abort();
+        self.endpoint.close(0u32.into(), b"close");
+    }
+}
+
+type H3Pool = Arc<tokio::sync::Mutex<HashMap<H3PoolKey, PooledH3Conn>>>;
+
+fn clear_h3_pool_sync(h3_pool: &H3Pool) {
+    if let Ok(mut guard) = h3_pool.try_lock() {
+        for (_, entry) in guard.drain() {
+            entry.close();
+        }
+        return;
+    }
+    let pool = Arc::clone(h3_pool);
+    runtime().spawn(async move {
+        let mut guard = pool.lock().await;
+        for (_, entry) in guard.drain() {
+            entry.close();
+        }
+    });
+}
+
+async fn acquire_h3_conn(
     spec: &H3RequestSpec,
-    current_url: &url::Url,
-    method_str: &str,
-    body_opt: Option<&[u8]>,
-    jar: &Arc<Jar>,
-    port_override: Option<u16>,
+    host: &str,
+    port: u16,
+    h3_pool: &H3Pool,
 ) -> PyResult<(
-    u16,
-    HeaderMap,
-    HashMap<String, String>,
-    Vec<u8>,
+    H3PoolKey,
+    h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     Option<String>,
     Option<Vec<u8>>,
+    bool,
 )> {
-    if current_url.scheme() != "https" {
-        return Err(PyRuntimeError::new_err(
-            "[connect] HTTP/3 (QUIC) requires an https:// URL",
-        ));
+    let key = H3PoolKey {
+        host: host.to_ascii_lowercase(),
+        port,
+        verify: spec.verify,
+        local_address: spec.local_address,
+        ca_hash: spec.ca_bundle.clone(),
+    };
+
+    {
+        let mut pool = h3_pool.lock().await;
+        if let Some(entry) = pool.get(&key) {
+            if entry.is_alive() {
+                return Ok((
+                    key,
+                    entry.send_request.clone(),
+                    entry.remote_addr.clone(),
+                    entry.peer_certificate.clone(),
+                    true,
+                ));
+            }
+        }
+        if let Some(stale) = pool.remove(&key) {
+            stale.close();
+        }
     }
-    let host = current_url
-        .host_str()
-        .ok_or_else(|| PyValueError::new_err("HTTP/3 URL missing host"))?
-        .to_string();
-    let port = port_override.or_else(|| current_url.port()).unwrap_or(443);
 
     let prefer_v6 = spec.local_address.map(|ip| ip.is_ipv6());
-    let remote_sa = resolve_h3_target(&host, port, &spec.resolve_entries, prefer_v6).await?;
+    let remote_sa = resolve_h3_target(host, port, &spec.resolve_entries, prefer_v6).await?;
 
     let bind_addr = match spec.local_address {
         Some(ip) => SocketAddr::new(ip, 0),
@@ -1244,6 +1303,7 @@ async fn execute_h3_single_hop(
     let conn = match tokio::time::timeout(spec.connect_timeout, connecting).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
+            endpoint.close(0u32.into(), b"handshake_err");
             let low = e.to_string().to_lowercase();
             let tag = if low.contains("certificate") || low.contains("tls") || low.contains("crypto") {
                 "ssl"
@@ -1253,9 +1313,10 @@ async fn execute_h3_single_hop(
             return Err(PyRuntimeError::new_err(format!("[{tag}] QUIC handshake failed: {e}")));
         }
         Err(_) => {
+            endpoint.close(0u32.into(), b"timeout");
             return Err(PyRuntimeError::new_err(
                 "[connect_timeout] QUIC UDP handshake timed out",
-            ))
+            ));
         }
     };
 
@@ -1268,16 +1329,71 @@ async fn execute_h3_single_hop(
         None
     };
 
-    let quinn_conn = h3_quinn::Connection::new(conn);
-    let (mut driver, mut send_request) = h3::client::new(quinn_conn)
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("[connect] HTTP/3 session init failed: {e}")))?;
+    let quinn_conn = h3_quinn::Connection::new(conn.clone());
+    let (mut driver, send_request) = h3::client::new(quinn_conn).await.map_err(|e| {
+        endpoint.close(0u32.into(), b"h3_init_err");
+        PyRuntimeError::new_err(format!("[connect] HTTP/3 session init failed: {e}"))
+    })?;
 
     let driver_handle = tokio::spawn(async move {
         let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
 
-    // Assemble request URI & browser-accurate headers
+    let pooled_sr = send_request.clone();
+    {
+        let mut pool = h3_pool.lock().await;
+        if pool.len() >= 16 {
+            for (_, old) in pool.drain() {
+                old.close();
+            }
+        }
+        if let Some(prev) = pool.insert(
+            key.clone(),
+            PooledH3Conn {
+                endpoint,
+                conn,
+                send_request,
+                driver_handle,
+                remote_addr: remote_addr_str.clone(),
+                peer_certificate: peer_cert_der.clone(),
+            },
+        ) {
+            prev.close();
+        }
+    }
+
+    Ok((key, pooled_sr, remote_addr_str, peer_cert_der, false))
+}
+
+#[allow(clippy::type_complexity)]
+async fn execute_h3_single_hop(
+    spec: &H3RequestSpec,
+    current_url: &url::Url,
+    method_str: &str,
+    body_opt: Option<&[u8]>,
+    jar: &Arc<Jar>,
+    h3_pool: &H3Pool,
+    port_override: Option<u16>,
+) -> PyResult<(
+    u16,
+    HeaderMap,
+    HashMap<String, String>,
+    Vec<u8>,
+    Option<String>,
+    Option<Vec<u8>>,
+)> {
+    if current_url.scheme() != "https" {
+        return Err(PyRuntimeError::new_err(
+            "[connect] HTTP/3 (QUIC) requires an https:// URL",
+        ));
+    }
+    let host = current_url
+        .host_str()
+        .ok_or_else(|| PyValueError::new_err("HTTP/3 URL missing host"))?
+        .to_string();
+    let port = port_override.or_else(|| current_url.port()).unwrap_or(443);
+
+    // Assemble request URI & browser-accurate headers once
     let path_and_query = match current_url.query() {
         Some(q) => format!("{}?{}", current_url.path(), q),
         None => current_url.path().to_string(),
@@ -1319,7 +1435,6 @@ async fn execute_h3_single_hop(
     // Attach cookies from shared RFC 6265 Jar
     let jar_cookies: Vec<String> = jar
         .matches(current_url.as_str())
-        .into_iter()
         .map(|c| format!("{}={}", c.name(), c.value()))
         .collect();
     if !jar_cookies.is_empty() {
@@ -1345,105 +1460,154 @@ async fn execute_h3_single_hop(
         });
     }
 
-    let mut req_builder = http::Request::builder().method(method).uri(uri);
-    for (k, v) in &merged {
-        if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("transfer-encoding") {
-            continue;
-        }
-        if let (Ok(hn), Ok(hv)) = (
-            http::header::HeaderName::from_bytes(k.as_bytes()),
-            http::header::HeaderValue::from_str(v),
-        ) {
-            req_builder = req_builder.header(hn, hv);
-        }
-    }
-    let req = req_builder
-        .body(())
-        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 request build error: {e}")))?;
+    for attempt in 0..2 {
+        let (key, mut send_request, remote_addr_str, peer_cert_der, reused) =
+            acquire_h3_conn(spec, &host, port, h3_pool).await?;
 
-    let mut stream = send_request
-        .send_request(req)
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 send_request failed: {e}")))?;
-
-    if let Some(body_bytes) = body_opt {
-        if !body_bytes.is_empty() {
-            stream
-                .send_data(Bytes::copy_from_slice(body_bytes))
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 send_data failed: {e}")))?;
-        }
-    }
-    stream
-        .finish()
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 stream finish failed: {e}")))?;
-
-    let resp = stream
-        .recv_response()
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_response failed: {e}")))?;
-
-    let status_code = resp.status().as_u16();
-    let mut wreq_headers = HeaderMap::new();
-    let mut headers_map: HashMap<String, String> = HashMap::new();
-    let mut content_encoding: Option<String> = None;
-
-    for (name, value) in resp.headers() {
-        let name_s = name.as_str().to_string();
-        let val_s = String::from_utf8_lossy(value.as_bytes()).into_owned();
-        if name_s.eq_ignore_ascii_case("set-cookie") {
-            jar.add(val_s.clone(), current_url.as_str());
-        }
-        if name_s.eq_ignore_ascii_case("content-encoding") {
-            content_encoding = Some(val_s.clone());
-        }
-        if let (Ok(wn), Ok(wv)) = (
-            HeaderName::from_str(&name_s),
-            HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            wreq_headers.append(wn, wv);
-        }
-        match headers_map.get_mut(&name_s) {
-            Some(existing) => {
-                existing.push_str(", ");
-                existing.push_str(&val_s);
+        let mut req_builder = http::Request::builder().method(method.clone()).uri(uri.clone());
+        for (k, v) in &merged {
+            if k.eq_ignore_ascii_case("host")
+                || k.eq_ignore_ascii_case("connection")
+                || k.eq_ignore_ascii_case("transfer-encoding")
+            {
+                continue;
             }
-            None => {
-                headers_map.insert(name_s, val_s);
+            if let (Ok(hn), Ok(hv)) = (
+                http::header::HeaderName::from_bytes(k.as_bytes()),
+                http::header::HeaderValue::from_str(v),
+            ) {
+                req_builder = req_builder.header(hn, hv);
             }
         }
-    }
+        let req = req_builder
+            .body(())
+            .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 request build error: {e}")))?;
 
-    let mut raw_body = Vec::new();
-    while let Some(mut chunk) = stream
-        .recv_data()
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_data failed: {e}")))?
-    {
-        while chunk.has_remaining() {
-            let slice = chunk.chunk();
-            raw_body.extend_from_slice(slice);
-            let len = slice.len();
-            chunk.advance(len);
+        let mut stream = match send_request.send_request(req).await {
+            Ok(s) => s,
+            Err(e) => {
+                if reused && attempt == 0 {
+                    let mut pool = h3_pool.lock().await;
+                    if let Some(stale) = pool.remove(&key) {
+                        stale.close();
+                    }
+                    continue;
+                }
+                return Err(PyRuntimeError::new_err(format!(
+                    "[request] HTTP/3 send_request failed: {e}"
+                )));
+            }
+        };
+
+        if let Some(body_bytes) = body_opt {
+            if !body_bytes.is_empty() {
+                if let Err(e) = stream.send_data(Bytes::copy_from_slice(body_bytes)).await {
+                    if reused && attempt == 0 {
+                        let mut pool = h3_pool.lock().await;
+                        if let Some(stale) = pool.remove(&key) {
+                            stale.close();
+                        }
+                        continue;
+                    }
+                    return Err(PyRuntimeError::new_err(format!(
+                        "[request] HTTP/3 send_data failed: {e}"
+                    )));
+                }
+            }
         }
+        if let Err(e) = stream.finish().await {
+            if reused && attempt == 0 {
+                let mut pool = h3_pool.lock().await;
+                if let Some(stale) = pool.remove(&key) {
+                    stale.close();
+                }
+                continue;
+            }
+            return Err(PyRuntimeError::new_err(format!(
+                "[request] HTTP/3 stream finish failed: {e}"
+            )));
+        }
+
+        let resp = match stream.recv_response().await {
+            Ok(r) => r,
+            Err(e) => {
+                if reused && attempt == 0 {
+                    let mut pool = h3_pool.lock().await;
+                    if let Some(stale) = pool.remove(&key) {
+                        stale.close();
+                    }
+                    continue;
+                }
+                return Err(PyRuntimeError::new_err(format!(
+                    "[request] HTTP/3 recv_response failed: {e}"
+                )));
+            }
+        };
+
+        let status_code = resp.status().as_u16();
+        let mut wreq_headers = HeaderMap::new();
+        let mut headers_map: HashMap<String, String> = HashMap::new();
+        let mut content_encoding: Option<String> = None;
+
+        for (name, value) in resp.headers() {
+            let name_s = name.as_str().to_string();
+            let val_s = String::from_utf8_lossy(value.as_bytes()).into_owned();
+            if name_s.eq_ignore_ascii_case("set-cookie") {
+                jar.add(val_s.clone(), current_url.as_str());
+            }
+            if name_s.eq_ignore_ascii_case("content-encoding") {
+                content_encoding = Some(val_s.clone());
+            }
+            if let (Ok(wn), Ok(wv)) = (
+                HeaderName::from_str(&name_s),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                wreq_headers.append(wn, wv);
+            }
+            match headers_map.get_mut(&name_s) {
+                Some(existing) => {
+                    existing.push_str(", ");
+                    existing.push_str(&val_s);
+                }
+                None => {
+                    headers_map.insert(name_s, val_s);
+                }
+            }
+        }
+
+        let mut raw_body = Vec::new();
+        while let Some(mut chunk) = stream
+            .recv_data()
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_data failed: {e}")))?
+        {
+            while chunk.has_remaining() {
+                let slice = chunk.chunk();
+                raw_body.extend_from_slice(slice);
+                let len = slice.len();
+                chunk.advance(len);
+            }
+        }
+
+        let decoded_bytes = decompress_h3_body(raw_body, content_encoding.as_deref());
+        return Ok((
+            status_code,
+            wreq_headers,
+            headers_map,
+            decoded_bytes,
+            remote_addr_str,
+            peer_cert_der,
+        ));
     }
 
-    driver_handle.abort();
-    endpoint.close(0u32.into(), b"done");
-
-    let decoded_bytes = decompress_h3_body(raw_body, content_encoding.as_deref());
-    Ok((
-        status_code,
-        wreq_headers,
-        headers_map,
-        decoded_bytes,
-        remote_addr_str,
-        peer_cert_der,
-    ))
+    Err(PyRuntimeError::new_err("[connect] HTTP/3 connection retry exhausted"))
 }
 
-async fn execute_h3_request(spec: H3RequestSpec, jar: Arc<Jar>) -> PyResult<NativeResponse> {
+async fn execute_h3_request(
+    spec: H3RequestSpec,
+    jar: Arc<Jar>,
+    h3_pool: H3Pool,
+) -> PyResult<NativeResponse> {
     let start = Instant::now();
     let fut = async {
         let mut current_url = spec.url.clone();
@@ -1460,6 +1624,7 @@ async fn execute_h3_request(spec: H3RequestSpec, jar: Arc<Jar>) -> PyResult<Nati
                     &current_method,
                     current_body.as_deref(),
                     &jar,
+                    &h3_pool,
                     hop_port,
                 )
                 .await?;
@@ -1851,6 +2016,7 @@ struct EmulationState {
 pub struct NativeSession {
     jar: Arc<Jar>,
     clients: Mutex<HashMap<ClientKey, Client>>,
+    h3_pool: H3Pool,
     emu_state: Mutex<EmulationState>,
     default_headers: HeaderMap,
     header_order: Option<Vec<String>>,
@@ -2277,10 +2443,11 @@ async fn finish_dual_response(
     rb: RequestBuilder,
     h3_spec: Option<H3RequestSpec>,
     jar: Arc<Jar>,
+    h3_pool: H3Pool,
 ) -> PyResult<NativeResponse> {
     if let Some(spec) = h3_spec {
         let strict = spec.strict_h3;
-        match execute_h3_request(spec, Arc::clone(&jar)).await {
+        match execute_h3_request(spec, Arc::clone(&jar), h3_pool).await {
             Ok(resp) => return Ok(resp),
             Err(e) if strict => return Err(e),
             Err(_) => {}
@@ -2293,10 +2460,11 @@ async fn start_dual_stream(
     rb: RequestBuilder,
     h3_spec: Option<H3RequestSpec>,
     jar: Arc<Jar>,
+    h3_pool: H3Pool,
 ) -> PyResult<NativeStream> {
     if let Some(spec) = h3_spec {
         let strict = spec.strict_h3;
-        match execute_h3_request(spec, Arc::clone(&jar)).await {
+        match execute_h3_request(spec, Arc::clone(&jar), h3_pool).await {
             Ok(resp) => {
                 let body_bytes = Bytes::from(resp.content);
                 let stream: BodyStream =
@@ -2502,6 +2670,7 @@ impl NativeSession {
         Ok(NativeSession {
             jar: Arc::new(Jar::default()),
             clients: Mutex::new(HashMap::new()),
+            h3_pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             emu_state: Mutex::new(EmulationState {
                 emulation: resolved.emulation,
                 ua_override: resolved.ua_override,
@@ -2593,7 +2762,8 @@ impl NativeSession {
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
-        py.allow_threads(move || runtime().block_on(finish_dual_response(rb, h3_spec, jar)))
+        let h3_pool = Arc::clone(&self.h3_pool);
+        py.allow_threads(move || runtime().block_on(finish_dual_response(rb, h3_spec, jar, h3_pool)))
     }
 
     #[pyo3(signature = (
@@ -2650,7 +2820,8 @@ impl NativeSession {
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
-        pyo3_async_runtimes::tokio::future_into_py(py, finish_dual_response(rb, h3_spec, jar))
+        let h3_pool = Arc::clone(&self.h3_pool);
+        pyo3_async_runtimes::tokio::future_into_py(py, finish_dual_response(rb, h3_spec, jar, h3_pool))
     }
 
     #[pyo3(signature = (
@@ -2707,7 +2878,8 @@ impl NativeSession {
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
-        py.allow_threads(move || runtime().block_on(start_dual_stream(rb, h3_spec, jar)))
+        let h3_pool = Arc::clone(&self.h3_pool);
+        py.allow_threads(move || runtime().block_on(start_dual_stream(rb, h3_spec, jar, h3_pool)))
     }
 
     #[pyo3(signature = (
@@ -2764,7 +2936,8 @@ impl NativeSession {
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
-        pyo3_async_runtimes::tokio::future_into_py(py, start_dual_stream(rb, h3_spec, jar))
+        let h3_pool = Arc::clone(&self.h3_pool);
+        pyo3_async_runtimes::tokio::future_into_py(py, start_dual_stream(rb, h3_spec, jar, h3_pool))
     }
 
     #[pyo3(signature = (url, headers = None, proxy = None, verify = None))]
@@ -2942,6 +3115,7 @@ impl NativeSession {
         }
         let mut cache = self.clients.lock().unwrap_or_else(|p| p.into_inner());
         cache.clear();
+        clear_h3_pool_sync(&self.h3_pool);
     }
 
     /// Execute a batch of requests concurrently on the Rust Tokio multi-thread pool,
@@ -3028,13 +3202,16 @@ impl NativeSession {
         }
 
         let jar = Arc::clone(&self.jar);
+        let h3_pool = Arc::clone(&self.h3_pool);
         let limit = concurrency.max(1);
         py.allow_threads(move || {
             runtime().block_on(async move {
                 let results: Vec<PyResult<NativeResponse>> = futures_util::stream::iter(
                     builders
                         .into_iter()
-                        .map(|(rb, h3_spec)| finish_dual_response(rb, h3_spec, Arc::clone(&jar))),
+                        .map(|(rb, h3_spec)| {
+                            finish_dual_response(rb, h3_spec, Arc::clone(&jar), Arc::clone(&h3_pool))
+                        }),
                 )
                 .buffered(limit)
                 .collect()
@@ -3051,10 +3228,15 @@ impl NativeSession {
     pub fn close(&self) {
         let mut cache = self.clients.lock().unwrap_or_else(|p| p.into_inner());
         cache.clear();
+        clear_h3_pool_sync(&self.h3_pool);
     }
 
     pub fn client_cache_len(&self) -> usize {
         self.clients.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub fn h3_pool_len(&self) -> usize {
+        self.h3_pool.try_lock().map(|g| g.len()).unwrap_or(0)
     }
 
     #[getter]

@@ -504,13 +504,24 @@ def test_warm_solver_proxy_isolation_cdp_context_and_alt_svc():
 
 
 def test_http3_udp_quic_wire_transport_and_alt_svc_auto_upgrade():
-    # 1. Explicit http3=True: first request goes straight over UDP QUIC (HTTP/3)
+    # 1. Explicit http3=True: first request goes straight over UDP QUIC (HTTP/3) and pools the QUIC connection
     with Session(impersonate="chrome_149", http3=True, tls_info=True, timeout=10.0) as s3:
         r3 = s3.get("https://www.cloudflare.com/cdn-cgi/trace")
         assert r3.status_code == 200
         assert r3.http_version == "HTTP/3"
         assert "http=http/3" in r3.text
         assert r3.peer_certificate is not None and len(r3.peer_certificate) > 100
+        assert s3._session.h3_pool_len() == 1
+
+        # Subsequent HTTP/3 requests multiplex on the same pooled UDP QUIC connection (0-RTT)
+        r3_mux = s3.get("https://www.cloudflare.com/cdn-cgi/trace")
+        assert r3_mux.status_code == 200
+        assert r3_mux.http_version == "HTTP/3"
+        assert "http=http/3" in r3_mux.text
+        assert s3._session.h3_pool_len() == 1
+
+    # Session.close() must cleanly close & drain all pooled UDP QUIC endpoints
+    assert s3._session.h3_pool_len() == 0
 
     # 2. Automatic Alt-Svc: h3=":443" upgrade on default Session()
     with Session(impersonate="chrome_149", timeout=10.0) as s:
@@ -524,6 +535,7 @@ def test_http3_udp_quic_wire_transport_and_alt_svc_auto_upgrade():
         assert r2.status_code == 200
         assert r2.http_version == "HTTP/3"
         assert "http=http/3" in r2.text
+        assert s._session.h3_pool_len() == 1
 
 
 def test_soak_stability_pool_cleanup_and_bounded_memory(fast_server: str):
