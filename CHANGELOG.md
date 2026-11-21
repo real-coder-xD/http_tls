@@ -2,6 +2,11 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [0.6.3] - 2026-11-21
+
+### Documentation
+- Updated `README.md` with monospace technical glyphs (`✓`, `◐`, `✗`, `◈`, `▸`), `flat-square` badges, compact top navigation bar, Architecture Under the Hood diagram, and focused head-to-head comparison against TLS-fingerprinting clients (`curl_cffi`, `primp`/`rnet`, `tls-client`).
+
 ## [0.6.2] - 2026-11-21
 
 ### Documentation & Packaging
