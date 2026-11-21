@@ -39,7 +39,7 @@ _CHALLENGE_TITLE_MARKERS = (
 )
 
 
-def _has_clearance(cookies: Sequence[Dict[str, Any]], names: Iterable[str]) -> bool:
+def _has_clearance(cookies: Sequence[Any], names: Iterable[str]) -> bool:
     prefixes = tuple(n.lower() for n in names)
     for c in cookies:
         cname = str(c.get("name", "")).lower()
@@ -89,7 +89,7 @@ class BestDriverSolver:
             extra_args=self.extra_args,
         ) as browser:
             tab = await browser.get(url, wait_until="domcontentloaded")
-            cookies: List[Dict[str, Any]] = []
+            cookies: Sequence[Any] = []
             while _time.monotonic() < deadline:
                 cookies = await tab.get_cookies([url])
                 title = (await tab.title() or "").strip().lower()
@@ -100,7 +100,8 @@ class BestDriverSolver:
                 await tab.sleep(0.5)
             ua = await tab.evaluate("navigator.userAgent")
             cookies = await tab.get_cookies([url])
-            return {"cookies": cookies, "user_agent": str(ua) if ua else None}
+            return {"cookies": list(cookies), "user_agent": str(ua) if ua else None}
+        raise RuntimeError("BestDriverSolver failed to initialize browser")
 
     def __call__(self, url: str, resp: Any = None) -> Any:
         try:
@@ -153,7 +154,7 @@ class PlaywrightSolver:
                 ctx = browser.new_context()
                 page = ctx.new_page()
                 page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
-                cookies: List[Dict[str, Any]] = []
+                cookies: Sequence[Any] = []
                 while _time.monotonic() < deadline:
                     cookies = ctx.cookies([url])
                     title = (page.title() or "").strip().lower()
@@ -164,7 +165,7 @@ class PlaywrightSolver:
                     page.wait_for_timeout(500)
                 ua = page.evaluate("() => navigator.userAgent")
                 cookies = ctx.cookies([url])
-                return {"cookies": cookies, "user_agent": str(ua) if ua else None}
+                return {"cookies": list(cookies), "user_agent": str(ua) if ua else None}
             finally:
                 browser.close()
 

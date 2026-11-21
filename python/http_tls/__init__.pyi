@@ -1,8 +1,7 @@
+from enum import Enum
 from typing import Any, AsyncContextManager, AsyncIterator, Callable, ContextManager, Dict, Iterator, List, Optional, Sequence, Tuple, Union
-from http_tls import auth, challenge, exceptions, requests, solvers, status_codes, structures
+from http_tls import auth, challenge, exceptions, status_codes, structures
 from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
-from http_tls.requests import BrowserType
-from http_tls.status_codes import codes
 from http_tls.exceptions import (
     ConnectError,
     ConnectTimeout,
@@ -19,10 +18,160 @@ from http_tls.exceptions import (
     TimeoutException,
     TooManyRedirects,
 )
-from http_tls.solvers import BestDriverSolver, FlareSolverrSolver, PlaywrightSolver
+from http_tls.status_codes import codes
 from http_tls.structures import CaseInsensitiveDict
 
 __version__: str
+requests: Any
+solvers: Any
+
+class BrowserType(str, Enum):
+    chrome152 = "chrome_152"
+    chrome152_macos = "chrome_152_macos"
+    chrome151 = "chrome_151"
+    chrome151_macos = "chrome_151_macos"
+    chrome150 = "chrome_150"
+    chrome149 = "chrome_149"
+    chrome148 = "chrome_148"
+    chrome147 = "chrome_147"
+    chrome146 = "chrome_146"
+    chrome145 = "chrome_145"
+    chrome144 = "chrome_144"
+    chrome143 = "chrome_143"
+    chrome142 = "chrome_142"
+    chrome141 = "chrome_141"
+    chrome140 = "chrome_140"
+    chrome139 = "chrome_139"
+    chrome138 = "chrome_138"
+    chrome137 = "chrome_137"
+    chrome136 = "chrome_136"
+    chrome135 = "chrome_135"
+    chrome134 = "chrome_134"
+    chrome133 = "chrome_133"
+    chrome132 = "chrome_132"
+    chrome131 = "chrome_131"
+    chrome131_android = "chrome_131_android"
+    chrome130 = "chrome_130"
+    chrome129 = "chrome_129"
+    chrome128 = "chrome_128"
+    chrome127 = "chrome_127"
+    chrome126 = "chrome_126"
+    chrome124 = "chrome_124"
+    chrome123 = "chrome_123"
+    chrome120 = "chrome_120"
+    chrome119 = "chrome_119"
+    chrome116 = "chrome_116"
+    chrome114 = "chrome_114"
+    chrome110 = "chrome_110"
+    chrome107 = "chrome_107"
+    chrome104 = "chrome_104"
+    chrome100 = "chrome_100"
+    edge152 = "edge_152"
+    edge148 = "edge_148"
+    edge147 = "edge_147"
+    edge146 = "edge_146"
+    edge145 = "edge_145"
+    edge142 = "edge_142"
+    edge136 = "edge_136"
+    edge134 = "edge_134"
+    edge131 = "edge_131"
+    edge127 = "edge_127"
+    edge122 = "edge_122"
+    edge101 = "edge_101"
+    safari27 = "safari_27"
+    safari26_4 = "safari_26_4"
+    safari26_3 = "safari_26_3"
+    safari26_2 = "safari_26_2"
+    safari26_1 = "safari_26_1"
+    safari26 = "safari_26"
+    safari_ios_26_2 = "safari_ios_26_2"
+    safari_ios_26 = "safari_ios_26"
+    safari18_5 = "safari_18_5"
+    safari184 = "safari_18_4"
+    safari180 = "safari_18"
+    safari18 = "safari_18"
+    safari170 = "safari_17"
+    safari17 = "safari_17"
+    safari155 = "safari_15_5"
+    firefox155 = "firefox_155"
+    firefox154 = "firefox_154"
+    firefox153 = "firefox_153"
+    firefox151 = "firefox_151"
+    firefox150 = "firefox_150"
+    firefox149 = "firefox_149"
+    firefox148 = "firefox_148"
+    firefox147 = "firefox_147"
+    firefox146 = "firefox_146"
+    firefox145 = "firefox_145"
+    firefox144 = "firefox_144"
+    firefox143 = "firefox_143"
+    firefox142 = "firefox_142"
+    firefox139 = "firefox_139"
+    firefox136 = "firefox_136"
+    firefox135 = "firefox_135"
+    firefox133 = "firefox_133"
+    firefox128 = "firefox_128"
+    firefox117 = "firefox_117"
+    firefox109 = "firefox_109"
+    opera131 = "opera_131"
+    opera130 = "opera_130"
+    opera128 = "opera_128"
+    opera124 = "opera_124"
+    opera120 = "opera_120"
+    opera116 = "opera_116"
+    okhttp5 = "okhttp_5"
+    okhttp4_12 = "okhttp_4_12"
+    okhttp4_10 = "okhttp_4_10"
+    tor145 = "tor_14_5"
+    random = "random"
+    weighted_random = "weighted_random"
+
+class BestDriverSolver:
+    headless: bool
+    timeout: float
+    proxy: Optional[str]
+    wait_cookies: Tuple[str, ...]
+    browser_path: Optional[str]
+    extra_args: Optional[List[str]]
+    def __init__(
+        self,
+        headless: bool = True,
+        timeout: float = 30.0,
+        proxy: Optional[str] = None,
+        wait_cookies: Sequence[str] = ...,
+        browser_path: Optional[str] = None,
+        extra_args: Optional[Sequence[str]] = None,
+    ) -> None: ...
+    async def asolve(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
+    def __call__(self, url: str, resp: Any = None) -> Any: ...
+
+class PlaywrightSolver:
+    headless: bool
+    timeout: float
+    proxy: Optional[str]
+    wait_cookies: Tuple[str, ...]
+    browser_type: str
+    def __init__(
+        self,
+        headless: bool = True,
+        timeout: float = 30.0,
+        proxy: Optional[str] = None,
+        wait_cookies: Sequence[str] = ...,
+        browser_type: str = "chromium",
+    ) -> None: ...
+    def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
+
+class FlareSolverrSolver:
+    endpoint: str
+    max_timeout_ms: int
+    proxy: Optional[str]
+    def __init__(
+        self,
+        endpoint: str = "http://localhost:8191/v1",
+        max_timeout_ms: int = 60000,
+        proxy: Optional[str] = None,
+    ) -> None: ...
+    def __call__(self, url: str, resp: Any = None) -> Dict[str, Any]: ...
 
 def supported_presets() -> List[str]: ...
 def is_verified_preset(preset: str) -> bool: ...

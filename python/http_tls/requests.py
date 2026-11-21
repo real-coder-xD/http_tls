@@ -62,11 +62,12 @@ except ImportError:
 
 
 # Optional legacy curl_cffi backend (only used when explicitly requested via engine="curl_cffi")
+_CffiSession: Any = None
 try:
-    from curl_cffi.requests.session import Session as _CffiSession
+    from curl_cffi.requests.session import Session as _ImportedCffiSession
+    _CffiSession = _ImportedCffiSession
     _HAS_CFFI = True
 except ImportError:
-    _CffiSession = None
     _HAS_CFFI = False
 
 
@@ -1703,10 +1704,11 @@ class Session:
 
         # Request hooks receive a mutable context dict
         if self.event_hooks["request"]:
-            ctx = {"method": method, "url": full_url, "headers": req_headers, "params": params}
+            ctx: Dict[str, Any] = {"method": method, "url": full_url, "headers": req_headers, "params": params}
             self._run_sync_hooks("request", ctx)
             method, full_url, req_headers, params = ctx["method"], ctx["url"], ctx["headers"], ctx["params"]
 
+        resp: Optional[Response] = None
         if self.transport is not None:
             merged_hdrs = dict(self.headers.items())
             merged_hdrs.update(req_headers)
@@ -1730,7 +1732,6 @@ class Session:
 
         max_attempts = 1 if stream else (1 + self.retries)
         last_exc: Optional[BaseException] = None
-        resp: Optional[Response] = None
 
         for attempt in range(max_attempts):
             attempt_proxy = proxy or (self._next_pool_proxy() if not proxies else None)
@@ -1849,7 +1850,7 @@ class Session:
             except Exception:
                 pass
         self.cookies.update(got)
-        common = dict(
+        common: Dict[str, Any] = dict(
             status_code=r.status_code,
             headers=dict(r.headers),
             url=str(r.url),
@@ -2070,10 +2071,11 @@ class AsyncSession:
         )
 
         if s.event_hooks["request"]:
-            ctx = {"method": method, "url": full_url, "headers": req_headers, "params": params}
+            ctx: Dict[str, Any] = {"method": method, "url": full_url, "headers": req_headers, "params": params}
             await self._run_async_hooks("request", ctx)
             method, full_url, req_headers, params = ctx["method"], ctx["url"], ctx["headers"], ctx["params"]
 
+        resp: Optional[Response] = None
         if s.transport is not None:
             merged_hdrs = dict(s.headers.items())
             merged_hdrs.update(req_headers)
@@ -2096,7 +2098,6 @@ class AsyncSession:
             return resp
 
         max_attempts = 1 if stream else (1 + s.retries)
-        resp: Optional[Response] = None
 
         for attempt in range(max_attempts):
             attempt_proxy = proxy or (s._next_pool_proxy() if not proxies else None)
