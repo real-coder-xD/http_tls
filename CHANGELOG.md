@@ -2,6 +2,37 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [0.8.2] - 2026-11-21
+
+### 100% Pure BoringSSL QUIC TLS 1.3 & RFC 9001 Crypto Provider
+- **Zero `rustls` / Zero `ring` on HTTP/3 (`src/quic_boring.rs`):** Replaced `rustls-ring` inside `quinn` with a custom `quinn_proto::crypto::{ClientConfig, Session, PacketKey, HeaderKey, HmacKey}` driven directly by the embedded BoringSSL (`btls-sys 0.5.6`) via `SSL_CTX_set_quic_method` and `SSL_set_quic_transport_params`.
+- **Byte-Exact Chromium QUIC Initial `ClientHello`:** Emits native BoringSSL GREASE, extension permutation, Post-Quantum **`X25519MLKEM768`**, ECH GREASE, ALPS `h3` (`17613`), RFC 8879 Brotli/Zlib/Zstd certificate compression, and Chromium QUIC transport parameters (`0x0039`). Verified live against Cloudflare (`http=http/3`, `tls=TLSv1.3`, `kex=X25519MLKEM768`) and Google (`200 HTTP/3`).
+- **Pure BoringSSL RFC 9001 Packet & Header Protection:** Uses BoringSSL `EVP_AEAD_CTX_seal_scatter` / `EVP_AEAD_CTX_open`, `HKDF_extract` / `HKDF_expand`, `AES_encrypt`, `CRYPTO_chacha_20`, and `HMAC` + `RAND_bytes`.
+
+## [0.8.1] - 2026-11-21
+
+### Multiplexed HTTP/3 QUIC Connection Pooling (`H3Pool`)
+- **0-RTT Stream Multiplexing (`H3Pool`):** Pooled open `quinn::Endpoint` + `h3::client::SendRequest` handles per `(host, port, verify, local_address, ca_hash)` inside `NativeSession` (bounded to 16 origins), multiplexing subsequent and concurrent `gather()` HTTP/3 requests on the same UDP QUIC connection with automatic stale-connection eviction and clean teardown on `Session.close()` / `set_impersonate()`.
+- **Clean `cargo clippy -- -D warnings` Gate:** Resolved all Clippy diagnostics across Rust targets.
+
+## [0.8.0] - 2026-11-21
+
+### Native UDP QUIC / HTTP/3 Wire Transport & Automatic `Alt-Svc` Upgrade
+- **Dual-Stack Engine (`wreq` TCP + `quinn`/`h3` UDP):** Added `http3=True`, `http3_only=True`, and default `auto_upgrade_h3=True` with automatic `Alt-Svc: h3=":443"` UDP QUIC upgrade and RFC 8305 Happy Eyeballs fallback to TCP HTTP/2 when UDP 443 is blocked.
+- **Full Feature Parity on HTTP/3:** Transparent `br`/`gzip`/`deflate`/`zstd` decompression, shared RFC 6265 Cookie Jar synchronization, `resolve`, `local_address`, `verify=False`, custom CA bundles, mTLS, `SSLKEYLOGFILE`, and `peer_certificate` extraction.
+
+## [0.7.3] - 2026-11-21
+
+### Strict Pyrefly & PEP 561 Stub Hardening
+- Configured `[tool.pyrefly] search-path = ["python"]` in `pyproject.toml`, fixed `Response.aiter_*` async iterator stub signatures, added `Session.har_entries` & `Cookies.list_records`, and upgraded `CaseInsensitiveDict` `keys()`/`values()`/`items()` to return genuine dict views (`0 errors` in both `mypy` and `pyrefly`).
+
+## [0.7.2] - 2026-11-21
+
+### Warm Solver Parity, CDP Per-Proxy Isolation & Sticky Proxy Retry
+- Added `keep_warm=True`, `close()`/`aclose()`, and context-manager lifecycle to `PlaywrightSolver`.
+- Added per-proxy isolation to `BestDriverSolver(keep_warm=True)` via CDP `Target.createBrowserContext(proxyServer=..., disposeOnDetach=True)` and bounded LRU `_warm_browsers` pooling.
+- Added `resp.proxy`, sticky proxy & preset pinning during challenge retries, and RFC 7838 `resp.alt_svc` / `session.alt_svc_cache`.
+
 ## [0.7.1] - 2026-11-21
 
 ### Fingerprint Synchronization, Solver Hardening & RFC 6265 Cookie Isolation

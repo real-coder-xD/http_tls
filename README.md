@@ -2,9 +2,9 @@
 
 # `http_tls`
 
-**Rust & BoringSSL TLS (JA3/JA4) and HTTP/2 Impersonating HTTP Client for Python**
+**Rust & Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 Impersonating HTTP Client for Python**
 
-*Byte-exact browser fingerprints, native Tokio async, and GIL-free parallel batching — a drop-in replacement for `requests`, `httpx`, and `curl_cffi` shipped as one self-contained ABI3 wheel.*
+*Byte-exact browser fingerprints across HTTP/1.1, HTTP/2, and pure BoringSSL UDP QUIC HTTP/3 (`X25519MLKEM768`), native Tokio async, and GIL-free parallel batching — a drop-in replacement for `requests`, `httpx`, and `curl_cffi` shipped as one self-contained ABI3 wheel.*
 
 [![PyPI version](https://img.shields.io/pypi/v/http-tls?style=flat-square&color=blue)](https://pypi.org/project/http-tls/)
 [![Python](https://img.shields.io/badge/python-3.8%20--%203.14-blue.svg?style=flat-square)](https://www.python.org/)
@@ -73,9 +73,11 @@ Head-to-head against Python HTTP clients that impersonate browser TLS (JA3/JA4) 
 
 | Capability | http_tls | curl_cffi | primp / rnet | tls-client |
 | :--- | :--- | :--- | :--- | :--- |
-| Fingerprint engine | Rust + BoringSSL (`wreq`) | libcurl-impersonate (C/CFFI) | Rust + BoringSSL | Go `utls` (CGo) |
+| Fingerprint engine | Rust + Pure BoringSSL (`wreq` + `btls-sys`) | libcurl-impersonate (C/CFFI) | Rust + BoringSSL | Go `utls` (CGo) |
 | Browser TLS / JA4 / HTTP/2 presets | `✓` 100+ incl. Safari iOS, OkHttp, Tor | `✓` | `✓` | `✓` |
-| Custom JA3, TLS & H2 Options | `✓` | `✓` | `◐` | `✓` |
+| Native HTTP/3 (UDP QUIC + `X25519MLKEM768`) | `✓` Pure BoringSSL `quinn`+`h3` + `H3Pool` | `◐` ngtcp2 | `✗` | `✗` |
+| Automatic `Alt-Svc: h3=":443"` Upgrade | `✓` w/ TCP H2 Happy Eyeballs fallback | `✗` | `✗` | `✗` |
+| Custom JA3, Akamai H2, TLS & H2 Options | `✓` | `✓` | `◐` | `✓` |
 | Exact Wire Header Order (`OrigHeaderMap`) | `✓` | `◐` | `✓` | `✓` |
 | Native Event-Loop Async | `✓` Tokio | `✓` libcurl | `✓` Tokio | `✗` |
 | Sync Parallel `gather()` (No `async/await`) | `✓` Rust Tokio | `✗` | `✗` | `✗` |
@@ -109,6 +111,28 @@ Measured directly using the standalone Rust BoringSSL engine (`engine="rust"`, z
 | `firefox_151` | HTTP/2 | `t13d1717h2_5b57614c22b0_3cbfd9057e0d` | `1:65536;2:0;4:131072;5:16384\|12517377\|0\|m,p,a,s` |
 | `opera_131` | HTTP/2 | `t13d1516h2_8daaf6152771_02713d6af862` | `1:65536;2:0;4:6291456;6:262144\|15663105\|0\|m,a,s,p` |
 | `okhttp_5` | HTTP/2 | `t13d1613h2_46e7e9700bed_eca864cca44a` | `4:16777216\|16711681\|0\|m,p,a,s` |
+
+### 1b. Live Pure BoringSSL HTTP/3 (UDP QUIC) Verification (`https://www.cloudflare.com/cdn-cgi/trace`)
+
+Unlike Rust clients that fall back to `rustls` for QUIC, `http_tls` drives `quinn` + `h3` directly through **BoringSSL (`SSL_CTX_set_quic_method`)** with Chrome GREASE, extension permutation, Post-Quantum `X25519MLKEM768`, ECH GREASE, ALPS `h3`, Brotli cert compression, and Chromium QUIC transport parameters (`0x0039`), pooling open QUIC connections in `H3Pool`:
+
+```python
+import http_tls
+
+# 1. Explicit UDP QUIC HTTP/3 from the very first request
+with http_tls.Session(impersonate="chrome_149", http3=True) as s:
+    r = s.get("https://www.cloudflare.com/cdn-cgi/trace")
+    # r.http_version == "HTTP/3"
+    # Cloudflare trace confirms:
+    #   http=http/3
+    #   tls=TLSv1.3
+    #   kex=X25519MLKEM768
+
+# 2. Automatic Alt-Svc: h3=":443" upgrade on default Session()
+with http_tls.Session(impersonate="chrome_149") as s:
+    r1 = s.head("https://www.cloudflare.com/")          # HTTP/2 -> caches Alt-Svc: h3=":443"
+    r2 = s.get("https://www.cloudflare.com/cdn-cgi/trace")  # Auto-upgrades to UDP QUIC HTTP/3
+```
 
 ### 2. Throughput, Latency & Python Heap Usage (`https://www.cloudflare.com/cdn-cgi/trace`)
 
@@ -576,14 +600,15 @@ Every preset returned by `http_tls.supported_presets()` is a **verified native B
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │          Shared Tokio Multi-Thread Runtime           │  │
 │  │  ▸ wreq HTTP/1.1 + HTTP/2 engine (OrigHeaderMap)     │  │
+│  │  ▸ quinn + h3 UDP QUIC HTTP/3 engine + H3Pool        │  │
+│  │  ▸ Pure BoringSSL (btls-sys): GREASE · ALPS · MLKEM  │  │
 │  │  ▸ wreq-util browser emulation (100+ presets)        │  │
-│  │  ▸ BoringSSL: JA3/JA4 · GREASE · ALPS · MLKEM768     │  │
 │  │  ▸ Hickory async DNS · resolve · local_address       │  │
-│  │  ▸ Cookie jar · multipart · WebSocket · KeyLog       │  │
-│  │  ▸ Buffered gather() scheduler (input order kept)    │  │
+│  │  ▸ RFC 6265 Cookie jar · multipart · WebSocket       │  │
+│  │  ▸ Buffered gather() scheduler (H2 + H3 multiplexed) │  │
 │  └──────────────────────────┬───────────────────────────┘  │
 └─────────────────────────────┼──────────────────────────────┘
-                              │ TLS 1.3 ClientHello + HTTP/2 SETTINGS frames
+                              │ TCP TLS 1.3 / HTTP/2  +  UDP QUIC / HTTP/3
                               ▼
 ┌────────────────────────────────────────────────────────────┐
 │                  Target Server / WAF Edge                  │
@@ -596,7 +621,8 @@ Every preset returned by `http_tls.supported_presets()` is a **verified native B
 
 | File | Responsibility |
 | :--- | :--- |
-| `src/lib.rs` | PyO3 module: `NativeSession`, sync/async request paths, streaming, `gather()` scheduler, WebSocket bridge, TLS/H2 option builders, DNS overrides, KeyLog wiring. |
+| `src/lib.rs` | PyO3 module: `NativeSession`, sync/async request paths, streaming, `gather()` scheduler, `H3Pool`, WebSocket bridge, TLS/H2 option builders, DNS overrides, KeyLog wiring. |
+| `src/quic_boring.rs` | Pure BoringSSL (`btls-sys`) `quinn_proto::crypto` provider: `SSL_CTX_set_quic_method`, Chromium QUIC Initial `ClientHello` (`X25519MLKEM768`, GREASE, ALPS `h3`, ECH GREASE, Brotli cert compression), RFC 9001 AEAD/HP. |
 | `python/http_tls/requests.py` | Public API: `Session`, `AsyncSession`, `Client`, `AsyncClient`, `Response`, `Cookies`, retries, proxy pool, HAR recorder, `storage_state`, solver bridge, `event_hooks`. |
 | `python/http_tls/auth.py` | `AuthBase`, `BasicAuth`, `BearerAuth`, RFC 7616 `DigestAuth` (sync & async). |
 | `python/http_tls/challenge.py` | Interstitial detector for Cloudflare, DDoS-Guard, DataDome, PerimeterX, Imperva, Sucuri, Vercel, Akamai. |
@@ -624,7 +650,8 @@ Every preset returned by `http_tls.supported_presets()` is a **verified native B
 | `params` / `cookies` | `dict` | `None` | Default query parameters and session cookies |
 | `auth` | `tuple \| AuthBase` | `None` | `(user, pass)`, `BasicAuth`, `BearerAuth`, or `DigestAuth` |
 | `ja3` / `akamai_h2` / `tls_options` / `http2_options` | `str \| dict` | `None` | Custom JA3, Akamai H2 string, and full BoringSSL / H2 overrides |
-| `http1_only` / `http2_only` | `bool` | `False` | Force HTTP/1.1 or HTTP/2 transport |
+| `http1_only` / `http2_only` / `http3` / `http3_only` | `bool` | `False` | Force HTTP/1.1, HTTP/2, or pure BoringSSL UDP QUIC HTTP/3 |
+| `auto_upgrade_h3` | `bool` | `True` | Automatically upgrade to UDP QUIC HTTP/3 on `Alt-Svc: h3` (w/ TCP fallback) |
 | `resolve` | `dict[str, str \| list]` | `None` | Custom DNS / origin IP mapping (`{"host": "ip"}`) |
 | `local_address` / `interface` | `str` | `None` | Bind outbound IPv4/IPv6 address or network interface |
 | `system_dns` | `bool` | `False` | Disable built-in Hickory async DNS and use OS resolver |
