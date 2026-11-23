@@ -4,7 +4,7 @@
 
 **Rust & Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 Impersonating HTTP Client for Python**
 
-*Byte-exact browser fingerprints across HTTP/1.1, HTTP/2, and pure BoringSSL UDP QUIC HTTP/3 (`X25519MLKEM768`), native Tokio async, and GIL-free parallel batching — a drop-in replacement for `requests`, `httpx`, and `curl_cffi` shipped as one self-contained ABI3 wheel.*
+*Byte-exact browser fingerprints across HTTP/1.1, HTTP/2, and pure BoringSSL UDP QUIC HTTP/3 (**Real ECH `sni=encrypted`**, Post-Quantum `X25519MLKEM768`, **HTTP/3 over SOCKS5 UDP Associate**), native Tokio async, and GIL-free parallel batching — a drop-in replacement for `requests`, `httpx`, and `curl_cffi` shipped as one self-contained ABI3 wheel.*
 
 [![PyPI version](https://img.shields.io/pypi/v/http-tls?style=flat-square&color=blue)](https://pypi.org/project/http-tls/)
 [![Python](https://img.shields.io/badge/python-3.8%20--%203.14-blue.svg?style=flat-square)](https://www.python.org/)
@@ -42,7 +42,7 @@ pip install http-tls
 | **Async & DNS Stack** | Native Rust Tokio runtime (`pyo3-async-runtimes`) + Hickory async DNS |
 | **Drop-in API Compatibility** | `requests`, `httpx` (`Client`, `AsyncClient`, `stream`), and `curl_cffi` (`BrowserType`, `impersonate`) |
 | **Sync Parallelism** | `session.gather(urls, concurrency=50)` — GIL-free multi-request batching without `async/await` |
-| **Fingerprinting & HTTP/3** | 100+ browser presets, custom JA3, `tls_options`, `http2_options` (`akamai_h2`), UDP QUIC `http3=True` + auto `Alt-Svc: h3=":443"` upgrade |
+| **Fingerprinting & HTTP/3** | 100+ browser presets, custom JA3, `tls_options`, `http2_options` (`akamai_h2`), Pure BoringSSL UDP QUIC `http3=True`, **Real ECH (`ech=True` -> `sni=encrypted`)**, **SOCKS5 UDP Associate**, auto `Alt-Svc: h3=":443"` upgrade |
 | **WebSockets & Streaming** | TLS-impersonated sync/async WebSockets, sync/async streaming, multipart `files=` |
 | **Reverse Engineering & Ops** | Wireshark `SSLKEYLOGFILE` / `keylog_file`, HAR 1.2 export, Playwright `storage_state.json`, WAF `resp.challenge` detector |
 | **Python & Platform Support** | Python 3.8 – 3.14+ (ABI3 wheels) on Windows `x86_64`, Linux `manylinux_2_28` (`x86_64`, `aarch64`), macOS (`x86_64`, `arm64`) |
@@ -76,6 +76,8 @@ Head-to-head against Python HTTP clients that impersonate browser TLS (JA3/JA4) 
 | Fingerprint engine | Rust + Pure BoringSSL (`wreq` + `btls-sys`) | libcurl-impersonate (C/CFFI) | Rust + BoringSSL | Go `utls` (CGo) |
 | Browser TLS / JA4 / HTTP/2 presets | `✓` 100+ incl. Safari iOS, OkHttp, Tor | `✓` | `✓` | `✓` |
 | Native HTTP/3 (UDP QUIC + `X25519MLKEM768`) | `✓` Pure BoringSSL `quinn`+`h3` + `H3Pool` | `◐` ngtcp2 | `✗` | `✗` |
+| Real ECH (`sni=encrypted` via DoH Type 65) | `✓` `ech=True` + `resp.ech_accepted` | `✗` | `✗` | `✗` |
+| HTTP/3 (UDP QUIC) over SOCKS5 UDP Associate | `✓` RFC 1928/1929 `socks5://` / `socks5h://` | `✗` | `✗` | `✗` |
 | Automatic `Alt-Svc: h3=":443"` Upgrade | `✓` w/ TCP H2 Happy Eyeballs fallback | `✗` | `✗` | `✗` |
 | Custom JA3, Akamai H2, TLS & H2 Options | `✓` | `✓` | `◐` | `✓` |
 | Exact Wire Header Order (`OrigHeaderMap`) | `✓` | `◐` | `✓` | `✓` |
@@ -112,25 +114,38 @@ Measured directly using the standalone Rust BoringSSL engine (`engine="rust"`, z
 | `opera_131` | HTTP/2 | `t13d1516h2_8daaf6152771_02713d6af862` | `1:65536;2:0;4:6291456;6:262144\|15663105\|0\|m,a,s,p` |
 | `okhttp_5` | HTTP/2 | `t13d1613h2_46e7e9700bed_eca864cca44a` | `4:16777216\|16711681\|0\|m,p,a,s` |
 
-### 1b. Live Pure BoringSSL HTTP/3 (UDP QUIC) Verification (`https://www.cloudflare.com/cdn-cgi/trace`)
+### 1b. Live Pure BoringSSL HTTP/3 (UDP QUIC), Real ECH (`sni=encrypted`) & SOCKS5 UDP Associate
 
-Unlike Rust clients that fall back to `rustls` for QUIC, `http_tls` drives `quinn` + `h3` directly through **BoringSSL (`SSL_CTX_set_quic_method`)** with Chrome GREASE, extension permutation, Post-Quantum `X25519MLKEM768`, ECH GREASE, ALPS `h3`, Brotli cert compression, and Chromium QUIC transport parameters (`0x0039`), pooling open QUIC connections in `H3Pool`:
+Unlike Rust clients that fall back to `rustls` for QUIC, `http_tls` drives `quinn` + `h3` directly through **BoringSSL (`SSL_CTX_set_quic_method`)** with Chrome GREASE, extension permutation, Post-Quantum `X25519MLKEM768`, **Real ECH (`SSL_set1_ech_config_list` + DoH DNS Type 65 `HTTPS` record + automatic `SSL_get0_ech_retry_configs` retry)**, ALPS `h3`, Brotli cert compression, Chromium QUIC transport parameters (`0x0039`), `H3Pool` multiplexing, and **RFC 1928 / RFC 1929 SOCKS5 UDP Associate** proxying:
 
 ```python
 import http_tls
 
-# 1. Explicit UDP QUIC HTTP/3 from the very first request
-with http_tls.Session(impersonate="chrome_149", http3=True) as s:
-    r = s.get("https://www.cloudflare.com/cdn-cgi/trace")
+# 1. Real ECH (Encrypted Client Hello -> sni=encrypted) over Pure BoringSSL HTTP/3
+with http_tls.Session(impersonate="chrome_149", http3=True, ech=True) as s:
+    r = s.get("https://cloudflare-ech.com/cdn-cgi/trace")
     # r.http_version == "HTTP/3"
+    # r.ech_accepted == True
     # Cloudflare trace confirms:
     #   http=http/3
     #   tls=TLSv1.3
+    #   sni=encrypted
     #   kex=X25519MLKEM768
 
-# 2. Automatic Alt-Svc: h3=":443" upgrade on default Session()
+# 2. HTTP/3 (UDP QUIC) + Real ECH tunneled over an authenticated SOCKS5 UDP Associate proxy
+with http_tls.Session(
+    impersonate="chrome_149",
+    http3=True,
+    ech=True,
+    proxy="socks5://user:pass@127.0.0.1:1080",
+) as s:
+    r = s.get("https://cloudflare-ech.com/cdn-cgi/trace")
+    # Tunnels QUIC UDP datagrams through SOCKS5 CMD=0x03 (UDP ASSOCIATE)
+    # Automatic graceful fallback to TCP HTTP/2 if proxy rejects UDP ASSOCIATE (unless http3_only=True)
+
+# 3. Automatic Alt-Svc: h3=":443" upgrade on default Session()
 with http_tls.Session(impersonate="chrome_149") as s:
-    r1 = s.head("https://www.cloudflare.com/")          # HTTP/2 -> caches Alt-Svc: h3=":443"
+    r1 = s.head("https://www.cloudflare.com/")              # HTTP/2 -> caches Alt-Svc: h3=":443"
     r2 = s.get("https://www.cloudflare.com/cdn-cgi/trace")  # Auto-upgrades to UDP QUIC HTTP/3
 ```
 

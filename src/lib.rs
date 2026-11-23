@@ -1,5 +1,6 @@
-// Language: Rust 2021 | File: src/lib.rs | Target: Python PyO3 ABI3 Extension | Runtime: Tokio + wreq (BoringSSL) + quinn/h3 (BoringSSL UDP QUIC)
+// Language: Rust 2021 | File: src/lib.rs | Target: Python PyO3 ABI3 Extension | Runtime: Tokio + wreq (BoringSSL) + quinn/h3 (BoringSSL UDP QUIC + ECH + SOCKS5 UDP)
 mod quic_boring;
+mod socks5_udp;
 
 use bytes::{Buf, Bytes};
 use encoding_rs::{Encoding, UTF_8};
@@ -863,7 +864,117 @@ fn build_identity(cert_pem: &[u8], key_pem: &[u8]) -> PyResult<Identity> {
 
 // ---------------------------------------------------------------------------
 // Native UDP QUIC / HTTP/3 Engine (quinn + h3 + h3-quinn + BoringSSL btls-sys)
+// Includes Real ECH (RFC 9460 HTTPS/SVCB DoH Type 65) & SOCKS5 UDP Associate.
 // ---------------------------------------------------------------------------
+const DEFAULT_ECH_DOH_URL: &str = "https://cloudflare-dns.com/dns-query";
+
+type EchCache = Arc<tokio::sync::Mutex<HashMap<String, (Vec<u8>, Instant)>>>;
+
+fn decode_base64_ech(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b' ' | b'\r' | b'\n' | b'\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    if out.len() >= 4 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Extract `(ech_config_list_bytes, ttl_secs)` from a DoH JSON Type 65 (`HTTPS`) response.
+fn extract_ech_from_doh_json(body: &str) -> Option<(Vec<u8>, u64)> {
+    let mut ttl_secs: u64 = 300;
+    if let Some(ttl_pos) = body.find("\"TTL\":") {
+        let rest = body[ttl_pos + 6..].trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(parsed) = digits.parse::<u64>() {
+            ttl_secs = parsed.clamp(30, 3600);
+        }
+    }
+    // Look for `ech=<base64>` inside Answer HTTPS/SVCB record data
+    let mut search_from = 0;
+    while let Some(rel) = body[search_from..].find("ech=") {
+        let start = search_from + rel + 4;
+        let rest = &body[start..];
+        // Handle optional JSON-escaped quote `\"` or raw base64 token
+        let trimmed = rest.strip_prefix("\\\"").or_else(|| rest.strip_prefix('"')).unwrap_or(rest);
+        let b64: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'))
+            .collect();
+        if b64.len() >= 16 {
+            if let Some(decoded) = decode_base64_ech(&b64) {
+                return Some((decoded, ttl_secs));
+            }
+        }
+        search_from = start;
+    }
+    None
+}
+
+async fn fetch_ech_config_list(
+    host: &str,
+    doh_url: &str,
+    ech_cache: &EchCache,
+    doh_client: &Client,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let key = host.trim().to_ascii_lowercase();
+    if key.is_empty() || IpAddr::from_str(&key).is_ok() {
+        return None;
+    }
+    {
+        let cache = ech_cache.lock().await;
+        if let Some((bytes, exp)) = cache.get(&key) {
+            if Instant::now() < *exp {
+                return Some(bytes.clone());
+            }
+        }
+    }
+
+    let mut url = url::Url::parse(doh_url).ok()?;
+    url.query_pairs_mut()
+        .append_pair("name", &key)
+        .append_pair("type", "HTTPS");
+
+    let req = doh_client
+        .get(url.as_str())
+        .header(wreq::header::ACCEPT, "application/dns-json")
+        .timeout(timeout.min(Duration::from_secs(5)));
+
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    let (decoded, ttl) = extract_ech_from_doh_json(&body)?;
+    {
+        let mut cache = ech_cache.lock().await;
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(key, (decoded.clone(), Instant::now() + Duration::from_secs(ttl)));
+    }
+    Some(decoded)
+}
+
 #[derive(Clone)]
 struct H3RequestSpec {
     method: String,
@@ -880,6 +991,7 @@ struct H3RequestSpec {
     identity_pair: Option<(Vec<u8>, Vec<u8>)>,
     resolve_entries: Vec<(String, Vec<SocketAddr>)>,
     local_address: Option<IpAddr>,
+    proxy: Option<String>,
     tls_info: bool,
     keylog_file: Option<String>,
     preset: String,
@@ -887,6 +999,9 @@ struct H3RequestSpec {
     sec_ch_ua_override: Option<String>,
     alt_svc_port: Option<u16>,
     strict_h3: bool,
+    ech: bool,
+    ech_doh_url: String,
+    ech_config_list: Option<Vec<u8>>,
 }
 
 fn default_h3_browser_headers(
@@ -1028,12 +1143,15 @@ fn decompress_h3_body(raw: Vec<u8>, content_encoding: Option<&str>) -> Vec<u8> {
     raw
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_h3_client_config(
     preset: &str,
     verify: bool,
     ca_bundle: Option<&[u8]>,
     identity_pair: Option<&(Vec<u8>, Vec<u8>)>,
     keylog_file: Option<&str>,
+    ech_config_list: Option<Vec<u8>>,
+    ech_retry_out: Arc<Mutex<Option<Vec<u8>>>>,
 ) -> PyResult<quinn::ClientConfig> {
     let boring_cfg = quic_boring::BoringQuicClientConfig::new(
         preset,
@@ -1041,6 +1159,8 @@ fn build_h3_client_config(
         ca_bundle,
         identity_pair,
         keylog_file,
+        ech_config_list,
+        ech_retry_out,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("[builder] BoringSSL QUIC init failed: {e}")))?;
     let mut client_cfg = quinn::ClientConfig::new(Arc::new(boring_cfg));
@@ -1106,6 +1226,8 @@ struct H3PoolKey {
     verify: bool,
     local_address: Option<IpAddr>,
     ca_hash: Option<Vec<u8>>,
+    proxy: Option<String>,
+    ech: bool,
 }
 
 struct PooledH3Conn {
@@ -1115,6 +1237,7 @@ struct PooledH3Conn {
     driver_handle: tokio::task::JoinHandle<()>,
     remote_addr: Option<String>,
     peer_certificate: Option<Vec<u8>>,
+    ech_accepted: bool,
 }
 
 impl PooledH3Conn {
@@ -1146,16 +1269,20 @@ fn clear_h3_pool_sync(h3_pool: &H3Pool) {
     });
 }
 
+#[allow(clippy::type_complexity)]
 async fn acquire_h3_conn(
     spec: &H3RequestSpec,
     host: &str,
     port: u16,
     h3_pool: &H3Pool,
+    ech_cache: &EchCache,
+    doh_client: Option<&Client>,
 ) -> PyResult<(
     H3PoolKey,
     h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     Option<String>,
     Option<Vec<u8>>,
+    bool,
     bool,
 )> {
     let key = H3PoolKey {
@@ -1164,6 +1291,8 @@ async fn acquire_h3_conn(
         verify: spec.verify,
         local_address: spec.local_address,
         ca_hash: spec.ca_bundle.clone(),
+        proxy: spec.proxy.clone(),
+        ech: spec.ech || spec.ech_config_list.is_some(),
     };
 
     {
@@ -1175,6 +1304,7 @@ async fn acquire_h3_conn(
                     entry.send_request.clone(),
                     entry.remote_addr.clone(),
                     entry.peer_certificate.clone(),
+                    entry.ech_accepted,
                     true,
                 ));
             }
@@ -1187,58 +1317,139 @@ async fn acquire_h3_conn(
     let prefer_v6 = spec.local_address.map(|ip| ip.is_ipv6());
     let remote_sa = resolve_h3_target(host, port, &spec.resolve_entries, prefer_v6).await?;
 
-    let bind_addr = match spec.local_address {
-        Some(ip) => SocketAddr::new(ip, 0),
-        None => {
-            if remote_sa.is_ipv6() {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-            } else {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-            }
+    let mut active_ech: Option<Vec<u8>> = if let Some(ref explicit) = spec.ech_config_list {
+        Some(explicit.clone())
+    } else if spec.ech {
+        if let Some(dc) = doh_client {
+            fetch_ech_config_list(host, &spec.ech_doh_url, ech_cache, dc, spec.connect_timeout).await
+        } else {
+            None
         }
+    } else {
+        None
     };
 
-    let client_cfg = build_h3_client_config(
-        &spec.preset,
-        spec.verify,
-        spec.ca_bundle.as_deref(),
-        spec.identity_pair.as_ref(),
-        spec.keylog_file.as_deref(),
-    )?;
-
-    let udp_sock = std::net::UdpSocket::bind(bind_addr)
-        .map_err(|e| PyRuntimeError::new_err(format!("[connect] UDP socket bind failed on {bind_addr}: {e}")))?;
-    let ep_cfg = quinn::EndpointConfig::new(Arc::new(quic_boring::BoringHmacKey::random()));
-    let mut endpoint = quinn::Endpoint::new(ep_cfg, None, udp_sock, Arc::new(quinn::TokioRuntime))
-        .map_err(|e| PyRuntimeError::new_err(format!("[connect] QUIC endpoint init failed on {bind_addr}: {e}")))?;
-    endpoint.set_default_client_config(client_cfg);
-
     let clean_sni = host.trim_matches(|c| c == '[' || c == ']');
-    let connecting = endpoint
-        .connect(remote_sa, clean_sni)
-        .map_err(|e| PyRuntimeError::new_err(format!("[connect] QUIC connect init failed: {e}")))?;
+    let mut final_pair: Option<(quinn::Endpoint, quinn::Connection)> = None;
+    let mut last_err: Option<PyErr> = None;
 
-    let conn = match tokio::time::timeout(spec.connect_timeout, connecting).await {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            endpoint.close(0u32.into(), b"handshake_err");
-            let low = e.to_string().to_lowercase();
-            let tag = if low.contains("certificate") || low.contains("tls") || low.contains("crypto") {
-                "ssl"
-            } else {
-                "connect"
+    // Up to 2 attempts: second attempt runs only if BoringSSL returns ECH retry configs.
+    for ech_attempt in 0..2 {
+        let ech_retry_out: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let client_cfg = build_h3_client_config(
+            &spec.preset,
+            spec.verify,
+            spec.ca_bundle.as_deref(),
+            spec.identity_pair.as_ref(),
+            spec.keylog_file.as_deref(),
+            active_ech.clone(),
+            Arc::clone(&ech_retry_out),
+        )?;
+
+        let ep_cfg = quinn::EndpointConfig::new(Arc::new(quic_boring::BoringHmacKey::random()));
+        let mut endpoint = if let Some(ref proxy_url) = spec.proxy {
+            let socks5_sock = socks5_udp::Socks5UdpSocket::connect(
+                proxy_url,
+                spec.local_address,
+                spec.connect_timeout,
+            )
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "[connect] SOCKS5 UDP ASSOCIATE failed via '{proxy_url}': {e}"
+                ))
+            })?;
+            quinn::Endpoint::new_with_abstract_socket(
+                ep_cfg,
+                None,
+                Arc::new(socks5_sock),
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "[connect] QUIC SOCKS5 endpoint init failed: {e}"
+                ))
+            })?
+        } else {
+            let bind_addr = match spec.local_address {
+                Some(ip) => SocketAddr::new(ip, 0),
+                None => {
+                    if remote_sa.is_ipv6() {
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+                    } else {
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                    }
+                }
             };
-            return Err(PyRuntimeError::new_err(format!("[{tag}] QUIC handshake failed: {e}")));
+            let udp_sock = std::net::UdpSocket::bind(bind_addr).map_err(|e| {
+                PyRuntimeError::new_err(format!("[connect] UDP socket bind failed on {bind_addr}: {e}"))
+            })?;
+            quinn::Endpoint::new(ep_cfg, None, udp_sock, Arc::new(quinn::TokioRuntime)).map_err(|e| {
+                PyRuntimeError::new_err(format!("[connect] QUIC endpoint init failed on {bind_addr}: {e}"))
+            })?
+        };
+        endpoint.set_default_client_config(client_cfg);
+
+        let connecting = endpoint
+            .connect(remote_sa, clean_sni)
+            .map_err(|e| PyRuntimeError::new_err(format!("[connect] QUIC connect init failed: {e}")))?;
+
+        match tokio::time::timeout(spec.connect_timeout, connecting).await {
+            Ok(Ok(c)) => {
+                final_pair = Some((endpoint, c));
+                break;
+            }
+            Ok(Err(e)) => {
+                endpoint.close(0u32.into(), b"handshake_err");
+                if ech_attempt == 0 {
+                    let retry_cfg = ech_retry_out
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    if let Some(fresh) = retry_cfg {
+                        let mut cache = ech_cache.lock().await;
+                        cache.insert(
+                            host.to_ascii_lowercase(),
+                            (fresh.clone(), Instant::now() + Duration::from_secs(300)),
+                        );
+                        active_ech = Some(fresh);
+                        continue;
+                    }
+                }
+                let low = e.to_string().to_lowercase();
+                let tag = if low.contains("certificate") || low.contains("tls") || low.contains("crypto") || low.contains("ech") {
+                    "ssl"
+                } else {
+                    "connect"
+                };
+                last_err = Some(PyRuntimeError::new_err(format!("[{tag}] QUIC handshake failed: {e}")));
+                break;
+            }
+            Err(_) => {
+                endpoint.close(0u32.into(), b"timeout");
+                last_err = Some(PyRuntimeError::new_err(
+                    "[connect_timeout] QUIC UDP handshake timed out",
+                ));
+                break;
+            }
         }
-        Err(_) => {
-            endpoint.close(0u32.into(), b"timeout");
-            return Err(PyRuntimeError::new_err(
-                "[connect_timeout] QUIC UDP handshake timed out",
-            ));
+    }
+
+    let (endpoint, conn) = match final_pair {
+        Some(pair) => pair,
+        None => {
+            return Err(last_err.unwrap_or_else(|| {
+                PyRuntimeError::new_err("[connect] QUIC handshake failed")
+            }));
         }
     };
 
     let remote_addr_str = Some(conn.remote_address().to_string());
+    let ech_accepted = conn
+        .handshake_data()
+        .and_then(|any| any.downcast::<quic_boring::BoringHandshakeData>().ok())
+        .map(|d| d.ech_accepted)
+        .unwrap_or(false);
     let peer_cert_der = if spec.tls_info {
         conn.peer_identity()
             .and_then(|any| any.downcast::<Vec<Vec<u8>>>().ok())
@@ -1274,16 +1485,17 @@ async fn acquire_h3_conn(
                 driver_handle,
                 remote_addr: remote_addr_str.clone(),
                 peer_certificate: peer_cert_der.clone(),
+                ech_accepted,
             },
         ) {
             prev.close();
         }
     }
 
-    Ok((key, pooled_sr, remote_addr_str, peer_cert_der, false))
+    Ok((key, pooled_sr, remote_addr_str, peer_cert_der, ech_accepted, false))
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 async fn execute_h3_single_hop(
     spec: &H3RequestSpec,
     current_url: &url::Url,
@@ -1291,6 +1503,8 @@ async fn execute_h3_single_hop(
     body_opt: Option<&[u8]>,
     jar: &Arc<Jar>,
     h3_pool: &H3Pool,
+    ech_cache: &EchCache,
+    doh_client: Option<&Client>,
     port_override: Option<u16>,
 ) -> PyResult<(
     u16,
@@ -1299,6 +1513,7 @@ async fn execute_h3_single_hop(
     Vec<u8>,
     Option<String>,
     Option<Vec<u8>>,
+    bool,
 )> {
     if current_url.scheme() != "https" {
         return Err(PyRuntimeError::new_err(
@@ -1379,8 +1594,8 @@ async fn execute_h3_single_hop(
     }
 
     for attempt in 0..2 {
-        let (key, mut send_request, remote_addr_str, peer_cert_der, reused) =
-            acquire_h3_conn(spec, &host, port, h3_pool).await?;
+        let (key, mut send_request, remote_addr_str, peer_cert_der, ech_accepted, reused) =
+            acquire_h3_conn(spec, &host, port, h3_pool, ech_cache, doh_client).await?;
 
         let mut req_builder = http::Request::builder().method(method.clone()).uri(uri.clone());
         for (k, v) in &merged {
@@ -1515,6 +1730,7 @@ async fn execute_h3_single_hop(
             decoded_bytes,
             remote_addr_str,
             peer_cert_der,
+            ech_accepted,
         ));
     }
 
@@ -1525,6 +1741,8 @@ async fn execute_h3_request(
     spec: H3RequestSpec,
     jar: Arc<Jar>,
     h3_pool: H3Pool,
+    ech_cache: EchCache,
+    doh_client: Option<Client>,
 ) -> PyResult<NativeResponse> {
     let start = Instant::now();
     let fut = async {
@@ -1535,17 +1753,26 @@ async fn execute_h3_request(
         let mut hop_port = spec.alt_svc_port;
 
         for hop in 0..=spec.max_redirects {
-            let (status_code, wreq_hdrs, headers_map, body_bytes, remote_addr, peer_certificate) =
-                execute_h3_single_hop(
-                    &spec,
-                    &current_url,
-                    &current_method,
-                    current_body.as_deref(),
-                    &jar,
-                    &h3_pool,
-                    hop_port,
-                )
-                .await?;
+            let (
+                status_code,
+                wreq_hdrs,
+                headers_map,
+                body_bytes,
+                remote_addr,
+                peer_certificate,
+                ech_accepted,
+            ) = execute_h3_single_hop(
+                &spec,
+                &current_url,
+                &current_method,
+                current_body.as_deref(),
+                &jar,
+                &h3_pool,
+                &ech_cache,
+                doh_client.as_ref(),
+                hop_port,
+            )
+            .await?;
             hop_port = None;
 
             let is_redir = matches!(status_code, 301 | 302 | 303 | 307 | 308);
@@ -1599,6 +1826,7 @@ async fn execute_h3_request(
                 remote_addr,
                 peer_certificate,
                 history,
+                ech_accepted,
             });
         }
         Err(PyRuntimeError::new_err("[redirect] Too many redirects"))
@@ -1638,6 +1866,8 @@ pub struct NativeResponse {
     pub peer_certificate: Option<Vec<u8>>,
     #[pyo3(get)]
     pub history: Vec<HistoryTuple>,
+    #[pyo3(get)]
+    pub ech_accepted: bool,
 }
 
 #[pymethods]
@@ -1690,6 +1920,8 @@ pub struct NativeStream {
     pub peer_certificate: Option<Vec<u8>>,
     #[pyo3(get)]
     pub history: Vec<HistoryTuple>,
+    #[pyo3(get)]
+    pub ech_accepted: bool,
     inner: Arc<tokio::sync::Mutex<Option<BodyStream>>>,
 }
 
@@ -1935,6 +2167,7 @@ pub struct NativeSession {
     jar: Arc<Jar>,
     clients: Mutex<HashMap<ClientKey, Client>>,
     h3_pool: H3Pool,
+    ech_cache: EchCache,
     emu_state: Mutex<EmulationState>,
     default_headers: HeaderMap,
     header_order: Option<Vec<String>>,
@@ -1944,6 +2177,8 @@ pub struct NativeSession {
     http2_only: bool,
     http3: bool,
     http3_only: bool,
+    ech: bool,
+    ech_doh_url: String,
     resolve_entries: Vec<(String, Vec<SocketAddr>)>,
     local_address: Option<IpAddr>,
     #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
@@ -2226,20 +2461,27 @@ impl NativeSession {
         local_address_override: Option<String>,
         http3_override: Option<bool>,
         alt_svc_port: Option<u16>,
+        ech_override: Option<bool>,
+        ech_config_list: Option<Vec<u8>>,
     ) -> PyResult<Option<H3RequestSpec>> {
-        let want_h3 = http3_override.unwrap_or(self.http3 || self.http3_only);
+        let eff_ech = ech_override.unwrap_or(self.ech) || ech_config_list.is_some();
+        let want_h3 = http3_override.unwrap_or(self.http3 || self.http3_only || eff_ech);
         if !want_h3 || self.http1_only || self.http2_only {
             return Ok(None);
         }
-        let has_proxy = proxy.is_some() || self.default_proxy.is_some();
-        if has_proxy {
-            if self.http3_only {
-                return Err(PyRuntimeError::new_err(
-                    "[connect] http3_only=True cannot be used with an HTTP/SOCKS TCP proxy",
-                ));
+        let eff_proxy = proxy.or_else(|| self.default_proxy.clone());
+        let h3_proxy = match eff_proxy {
+            Some(ref p) if socks5_udp::is_socks5_proxy(p) => Some(p.clone()),
+            Some(_) => {
+                if self.http3_only {
+                    return Err(PyRuntimeError::new_err(
+                        "[connect] http3_only=True requires direct UDP or a socks5:// / socks5h:// UDP ASSOCIATE proxy",
+                    ));
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
+            None => None,
+        };
         if files.map(|f| !f.is_empty()).unwrap_or(false) {
             return Ok(None);
         }
@@ -2342,6 +2584,7 @@ impl NativeSession {
             identity_pair: self.identity_pair.clone(),
             resolve_entries: self.resolve_entries.clone(),
             local_address: eff_local_addr,
+            proxy: h3_proxy,
             tls_info: self.tls_info,
             keylog_file: self.keylog_file.clone(),
             preset: preset_name,
@@ -2349,6 +2592,9 @@ impl NativeSession {
             sec_ch_ua_override: ch_ov,
             alt_svc_port,
             strict_h3: self.http3_only,
+            ech: eff_ech,
+            ech_doh_url: self.ech_doh_url.clone(),
+            ech_config_list,
         }))
     }
 }
@@ -2358,10 +2604,12 @@ async fn finish_dual_response(
     h3_spec: Option<H3RequestSpec>,
     jar: Arc<Jar>,
     h3_pool: H3Pool,
+    ech_cache: EchCache,
+    doh_client: Option<Client>,
 ) -> PyResult<NativeResponse> {
     if let Some(spec) = h3_spec {
         let strict = spec.strict_h3;
-        match execute_h3_request(spec, Arc::clone(&jar), h3_pool).await {
+        match execute_h3_request(spec, Arc::clone(&jar), h3_pool, ech_cache, doh_client).await {
             Ok(resp) => return Ok(resp),
             Err(e) if strict => return Err(e),
             Err(_) => {}
@@ -2375,10 +2623,12 @@ async fn start_dual_stream(
     h3_spec: Option<H3RequestSpec>,
     jar: Arc<Jar>,
     h3_pool: H3Pool,
+    ech_cache: EchCache,
+    doh_client: Option<Client>,
 ) -> PyResult<NativeStream> {
     if let Some(spec) = h3_spec {
         let strict = spec.strict_h3;
-        match execute_h3_request(spec, Arc::clone(&jar), h3_pool).await {
+        match execute_h3_request(spec, Arc::clone(&jar), h3_pool, ech_cache, doh_client).await {
             Ok(resp) => {
                 let body_bytes = Bytes::from(resp.content);
                 let stream: BodyStream =
@@ -2394,6 +2644,7 @@ async fn start_dual_stream(
                     remote_addr: resp.remote_addr,
                     peer_certificate: resp.peer_certificate,
                     history: resp.history,
+                    ech_accepted: resp.ech_accepted,
                     inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
                 });
             }
@@ -2431,6 +2682,7 @@ async fn finish_response(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeRe
         remote_addr,
         peer_certificate,
         history,
+        ech_accepted: false,
     })
 }
 
@@ -2462,6 +2714,7 @@ async fn start_stream(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeStrea
         remote_addr,
         peer_certificate,
         history,
+        ech_accepted: false,
         inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
     })
 }
@@ -2487,6 +2740,8 @@ impl NativeSession {
         http2_only = false,
         http3 = false,
         http3_only = false,
+        ech = false,
+        ech_doh_url = None,
         resolve = None,
         local_address = None,
         interface = None,
@@ -2519,6 +2774,8 @@ impl NativeSession {
         http2_only: bool,
         http3: bool,
         http3_only: bool,
+        ech: bool,
+        ech_doh_url: Option<String>,
         resolve: Option<&Bound<'_, PyDict>>,
         local_address: Option<String>,
         interface: Option<String>,
@@ -2585,6 +2842,7 @@ impl NativeSession {
             jar: Arc::new(Jar::default()),
             clients: Mutex::new(HashMap::new()),
             h3_pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            ech_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             emu_state: Mutex::new(EmulationState {
                 emulation: resolved.emulation,
                 ua_override: resolved.ua_override,
@@ -2599,6 +2857,10 @@ impl NativeSession {
             http2_only,
             http3,
             http3_only,
+            ech,
+            ech_doh_url: ech_doh_url
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_ECH_DOH_URL.to_string()),
             resolve_entries,
             local_address: parsed_local_addr,
             #[cfg(any(target_os = "android", target_os = "freebsd", target_os = "ios", target_os = "linux", target_os = "macos"))]
@@ -2626,7 +2888,8 @@ impl NativeSession {
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
         verify = None, ca_bundle = None, header_order = None, impersonate = None,
-        local_address = None, http3 = None, alt_svc_port = None
+        local_address = None, http3 = None, alt_svc_port = None, ech = None,
+        ech_config_list = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn request(
@@ -2650,6 +2913,8 @@ impl NativeSession {
         local_address: Option<String>,
         http3: Option<bool>,
         alt_svc_port: Option<u16>,
+        ech: Option<bool>,
+        ech_config_list: Option<Vec<u8>>,
     ) -> PyResult<NativeResponse> {
         let h3_spec = self.prepare_h3(
             method,
@@ -2670,21 +2935,32 @@ impl NativeSession {
             local_address.clone(),
             http3,
             alt_svc_port,
+            ech,
+            ech_config_list,
         )?;
+        let doh_client = if h3_spec.as_ref().map(|s| s.ech && s.ech_config_list.is_none()).unwrap_or(false) {
+            Some(self.client_for(true, None)?)
+        } else {
+            None
+        };
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
         let h3_pool = Arc::clone(&self.h3_pool);
-        py.allow_threads(move || runtime().block_on(finish_dual_response(rb, h3_spec, jar, h3_pool)))
+        let ech_cache = Arc::clone(&self.ech_cache);
+        py.allow_threads(move || {
+            runtime().block_on(finish_dual_response(rb, h3_spec, jar, h3_pool, ech_cache, doh_client))
+        })
     }
 
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
         verify = None, ca_bundle = None, header_order = None, impersonate = None,
-        local_address = None, http3 = None, alt_svc_port = None
+        local_address = None, http3 = None, alt_svc_port = None, ech = None,
+        ech_config_list = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn async_request<'py>(
@@ -2708,6 +2984,8 @@ impl NativeSession {
         local_address: Option<String>,
         http3: Option<bool>,
         alt_svc_port: Option<u16>,
+        ech: Option<bool>,
+        ech_config_list: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let h3_spec = self.prepare_h3(
             method,
@@ -2728,21 +3006,33 @@ impl NativeSession {
             local_address.clone(),
             http3,
             alt_svc_port,
+            ech,
+            ech_config_list,
         )?;
+        let doh_client = if h3_spec.as_ref().map(|s| s.ech && s.ech_config_list.is_none()).unwrap_or(false) {
+            Some(self.client_for(true, None)?)
+        } else {
+            None
+        };
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
         let h3_pool = Arc::clone(&self.h3_pool);
-        pyo3_async_runtimes::tokio::future_into_py(py, finish_dual_response(rb, h3_spec, jar, h3_pool))
+        let ech_cache = Arc::clone(&self.ech_cache);
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            finish_dual_response(rb, h3_spec, jar, h3_pool, ech_cache, doh_client),
+        )
     }
 
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
         verify = None, ca_bundle = None, header_order = None, impersonate = None,
-        local_address = None, http3 = None, alt_svc_port = None
+        local_address = None, http3 = None, alt_svc_port = None, ech = None,
+        ech_config_list = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn request_stream(
@@ -2766,6 +3056,8 @@ impl NativeSession {
         local_address: Option<String>,
         http3: Option<bool>,
         alt_svc_port: Option<u16>,
+        ech: Option<bool>,
+        ech_config_list: Option<Vec<u8>>,
     ) -> PyResult<NativeStream> {
         let h3_spec = self.prepare_h3(
             method,
@@ -2786,21 +3078,32 @@ impl NativeSession {
             local_address.clone(),
             http3,
             alt_svc_port,
+            ech,
+            ech_config_list,
         )?;
+        let doh_client = if h3_spec.as_ref().map(|s| s.ech && s.ech_config_list.is_none()).unwrap_or(false) {
+            Some(self.client_for(true, None)?)
+        } else {
+            None
+        };
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
         let h3_pool = Arc::clone(&self.h3_pool);
-        py.allow_threads(move || runtime().block_on(start_dual_stream(rb, h3_spec, jar, h3_pool)))
+        let ech_cache = Arc::clone(&self.ech_cache);
+        py.allow_threads(move || {
+            runtime().block_on(start_dual_stream(rb, h3_spec, jar, h3_pool, ech_cache, doh_client))
+        })
     }
 
     #[pyo3(signature = (
         method, url, params = None, headers = None, cookies = None, data = None,
         json = None, files = None, timeout = None, proxy = None, allow_redirects = None,
         verify = None, ca_bundle = None, header_order = None, impersonate = None,
-        local_address = None, http3 = None, alt_svc_port = None
+        local_address = None, http3 = None, alt_svc_port = None, ech = None,
+        ech_config_list = None
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn async_request_stream<'py>(
@@ -2824,6 +3127,8 @@ impl NativeSession {
         local_address: Option<String>,
         http3: Option<bool>,
         alt_svc_port: Option<u16>,
+        ech: Option<bool>,
+        ech_config_list: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let h3_spec = self.prepare_h3(
             method,
@@ -2844,14 +3149,25 @@ impl NativeSession {
             local_address.clone(),
             http3,
             alt_svc_port,
+            ech,
+            ech_config_list,
         )?;
+        let doh_client = if h3_spec.as_ref().map(|s| s.ech && s.ech_config_list.is_none()).unwrap_or(false) {
+            Some(self.client_for(true, None)?)
+        } else {
+            None
+        };
         let rb = self.prepare(
             method, url, params, headers, cookies, data, json, files, timeout, proxy,
             allow_redirects, verify, ca_bundle, header_order, impersonate, local_address,
         )?;
         let jar = Arc::clone(&self.jar);
         let h3_pool = Arc::clone(&self.h3_pool);
-        pyo3_async_runtimes::tokio::future_into_py(py, start_dual_stream(rb, h3_spec, jar, h3_pool))
+        let ech_cache = Arc::clone(&self.ech_cache);
+        pyo3_async_runtimes::tokio::future_into_py(
+            py,
+            start_dual_stream(rb, h3_spec, jar, h3_pool, ech_cache, doh_client),
+        )
     }
 
     #[pyo3(signature = (url, headers = None, proxy = None, verify = None))]
@@ -3073,6 +3389,9 @@ impl NativeSession {
             let local_address: Option<String> = d.get_item("local_address")?.and_then(|v| v.extract().ok());
             let http3: Option<bool> = d.get_item("http3")?.and_then(|v| v.extract().ok());
             let alt_svc_port: Option<u16> = d.get_item("alt_svc_port")?.and_then(|v| v.extract().ok());
+            let ech: Option<bool> = d.get_item("ech")?.and_then(|v| v.extract().ok());
+            let ech_config_list: Option<Vec<u8>> =
+                d.get_item("ech_config_list")?.and_then(|v| v.extract().ok());
 
             let h3_spec = self.prepare_h3(
                 &method,
@@ -3093,6 +3412,8 @@ impl NativeSession {
                 local_address.clone(),
                 http3,
                 alt_svc_port,
+                ech,
+                ech_config_list,
             )?;
             let rb = self.prepare(
                 &method,
@@ -3115,17 +3436,33 @@ impl NativeSession {
             builders.push((rb, h3_spec));
         }
 
+        let need_doh = builders.iter().any(|(_, s)| {
+            s.as_ref()
+                .map(|sp| sp.ech && sp.ech_config_list.is_none())
+                .unwrap_or(false)
+        });
+        let doh_client = if need_doh {
+            Some(self.client_for(true, None)?)
+        } else {
+            None
+        };
         let jar = Arc::clone(&self.jar);
         let h3_pool = Arc::clone(&self.h3_pool);
+        let ech_cache = Arc::clone(&self.ech_cache);
         let limit = concurrency.max(1);
         py.allow_threads(move || {
             runtime().block_on(async move {
                 let results: Vec<PyResult<NativeResponse>> = futures_util::stream::iter(
-                    builders
-                        .into_iter()
-                        .map(|(rb, h3_spec)| {
-                            finish_dual_response(rb, h3_spec, Arc::clone(&jar), Arc::clone(&h3_pool))
-                        }),
+                    builders.into_iter().map(|(rb, h3_spec)| {
+                        finish_dual_response(
+                            rb,
+                            h3_spec,
+                            Arc::clone(&jar),
+                            Arc::clone(&h3_pool),
+                            Arc::clone(&ech_cache),
+                            doh_client.clone(),
+                        )
+                    }),
                 )
                 .buffered(limit)
                 .collect()

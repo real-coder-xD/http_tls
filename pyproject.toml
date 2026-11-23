@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "http-tls"
-version = "0.8.3"
-description = "Standalone Rust + Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 (X25519MLKEM768) Browser-Impersonating HTTP Client for Python (drop-in for requests, httpx, curl_cffi)"
+version = "1.0.0"
+description = "Standalone Rust + Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 (Real ECH, X25519MLKEM768, SOCKS5 UDP Associate) Browser-Impersonating HTTP Client for Python"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -14,6 +14,9 @@ keywords = [
     "http2",
     "http3",
     "quic",
+    "ech",
+    "encrypted-client-hello",
+    "socks5",
     "tls",
     "ja3",
     "ja4",
@@ -34,7 +37,7 @@ keywords = [
     "async",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",

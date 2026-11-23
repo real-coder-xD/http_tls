@@ -669,6 +669,14 @@ static BORING_QUIC_METHOD: ffi::SSL_QUIC_METHOD = ffi::SSL_QUIC_METHOD {
     send_alert: Some(quic_send_alert),
 };
 
+/// Handshake metadata exposed via `quinn::Connection::handshake_data()`.
+#[derive(Clone, Debug)]
+pub struct BoringHandshakeData {
+    #[allow(dead_code)]
+    pub protocol: Option<Vec<u8>>,
+    pub ech_accepted: bool,
+}
+
 // ---------------------------------------------------------------------------
 // BoringQuicClientConfig (implements quinn_proto::crypto::ClientConfig)
 // ---------------------------------------------------------------------------
@@ -678,6 +686,8 @@ pub struct BoringQuicClientConfig {
     verify: bool,
     chrome_alps: bool,
     ech_grease: bool,
+    ech_config_list: Option<Vec<u8>>,
+    ech_retry_out: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 // SAFETY: `SSL_CTX` is read-only after construction and safe for concurrent `SSL_new(ctx)`.
@@ -787,6 +797,8 @@ impl BoringQuicClientConfig {
         ca_bundle: Option<&[u8]>,
         identity_pair: Option<&(Vec<u8>, Vec<u8>)>,
         keylog_file: Option<&str>,
+        ech_config_list: Option<Vec<u8>>,
+        ech_retry_out: Arc<Mutex<Option<Vec<u8>>>>,
     ) -> Result<Self, String> {
         let lower = preset.trim().to_ascii_lowercase();
         let is_firefox = lower.starts_with("firefox") || lower.starts_with("tor");
@@ -891,6 +903,8 @@ impl BoringQuicClientConfig {
                 verify,
                 chrome_alps: !is_firefox && !is_safari,
                 ech_grease: !is_safari,
+                ech_config_list,
+                ech_retry_out,
             })
         }
     }
@@ -925,7 +939,15 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             ffi::SSL_set_connect_state(ssl);
             ffi::SSL_set_tlsext_host_name(ssl, c_sni.as_ptr());
 
-            if self.ech_grease {
+            let mut real_ech_set = false;
+            if let Some(ref ech_list) = self.ech_config_list {
+                if !ech_list.is_empty()
+                    && ffi::SSL_set1_ech_config_list(ssl, ech_list.as_ptr(), ech_list.len()) == 1
+                {
+                    real_ech_set = true;
+                }
+            }
+            if !real_ech_set && self.ech_grease {
                 ffi::SSL_set_enable_ech_grease(ssl, 1);
             }
             if self.chrome_alps {
@@ -990,6 +1012,19 @@ impl Drop for BoringQuicSession {
 }
 
 impl BoringQuicSession {
+    fn capture_ech_retry_configs(&self) {
+        unsafe {
+            let mut retry_ptr: *const u8 = ptr::null();
+            let mut retry_len: usize = 0;
+            ffi::SSL_get0_ech_retry_configs(self.ssl.as_ptr(), &mut retry_ptr, &mut retry_len);
+            if !retry_ptr.is_null() && retry_len > 0 {
+                let slice = std::slice::from_raw_parts(retry_ptr, retry_len).to_vec();
+                let mut guard = self._cfg.ech_retry_out.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = Some(slice);
+            }
+        }
+    }
+
     fn drive_handshake(&mut self) -> Result<(), TransportError> {
         unsafe {
             let ret = if ffi::SSL_is_init_finished(self.ssl.as_ptr()) == 1 {
@@ -998,6 +1033,7 @@ impl BoringQuicSession {
                 ffi::SSL_do_handshake(self.ssl.as_ptr())
             };
             if let Some(alert) = self.state.alert.take() {
+                self.capture_ech_retry_configs();
                 return Err(TransportError {
                     code: TransportErrorCode::crypto(alert),
                     frame: None,
@@ -1007,6 +1043,7 @@ impl BoringQuicSession {
             if ret <= 0 {
                 let err = ffi::SSL_get_error(self.ssl.as_ptr(), ret);
                 if err != ffi::SSL_ERROR_WANT_READ && err != ffi::SSL_ERROR_WANT_WRITE {
+                    self.capture_ech_retry_configs();
                     return Err(TransportError {
                         code: TransportErrorCode::crypto(0x50), // internal_error / handshake_failure
                         frame: None,
@@ -1049,7 +1086,11 @@ impl crypto::Session for BoringQuicSession {
         if !self.got_handshake_data {
             return None;
         }
-        Some(Box::new(self.alpn_protocol()))
+        let ech_accepted = unsafe { ffi::SSL_ech_accepted(self.ssl.as_ptr()) == 1 };
+        Some(Box::new(BoringHandshakeData {
+            protocol: self.alpn_protocol(),
+            ech_accepted,
+        }))
     }
 
     /// Returns `Vec<Vec<u8>>` containing DER-encoded peer certificates.

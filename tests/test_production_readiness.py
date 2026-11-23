@@ -604,3 +604,262 @@ def test_soak_stability_pool_cleanup_and_bounded_memory(fast_server: str):
 
     delta_kb = (cur_after - cur_before) / 1024.0
     assert delta_kb < 256.0, f"Unexpected Python heap growth after 600 requests: {delta_kb:.1f} KB"
+
+
+def _start_local_socks5_server(
+    username: str | None = None,
+    password: str | None = None,
+    allow_udp: bool = True,
+):
+    """Minimal RFC 1928 / RFC 1929 SOCKS5 server supporting TCP CONNECT (0x01) & UDP ASSOCIATE (0x03)."""
+    import select
+    import socket
+    import struct
+
+    stats = {"auth_ok": 0, "udp_assoc": 0, "udp_out": 0, "udp_in": 0, "tcp_connect": 0}
+    stop_event = threading.Event()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(32)
+    srv.settimeout(0.2)
+    port = srv.getsockname()[1]
+
+    def _recv_exact(sock: socket.socket, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise EOFError("closed")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _handle_client(conn: socket.socket) -> None:
+        udp_client_sock = None
+        udp_upstream_sock = None
+        try:
+            conn.settimeout(5.0)
+            ver, nmethods = _recv_exact(conn, 2)
+            if ver != 5:
+                return
+            methods = _recv_exact(conn, nmethods)
+            if username is not None:
+                if 2 not in methods:
+                    conn.sendall(b"\x05\xff")
+                    return
+                conn.sendall(b"\x05\x02")
+                aver, ulen = _recv_exact(conn, 2)
+                u = _recv_exact(conn, ulen).decode("utf-8", "replace")
+                plen = _recv_exact(conn, 1)[0]
+                p = _recv_exact(conn, plen).decode("utf-8", "replace")
+                if aver != 1 or u != username or p != (password or ""):
+                    conn.sendall(b"\x01\x01")
+                    return
+                stats["auth_ok"] += 1
+                conn.sendall(b"\x01\x00")
+            else:
+                if 0 not in methods:
+                    conn.sendall(b"\x05\xff")
+                    return
+                conn.sendall(b"\x05\x00")
+
+            ver, cmd, _rsv, atyp = _recv_exact(conn, 4)
+            if ver != 5:
+                return
+            if atyp == 1:
+                dst_host = socket.inet_ntoa(_recv_exact(conn, 4))
+            elif atyp == 3:
+                dlen = _recv_exact(conn, 1)[0]
+                dst_host = _recv_exact(conn, dlen).decode("utf-8", "replace")
+            elif atyp == 4:
+                dst_host = socket.inet_ntop(socket.AF_INET6, _recv_exact(conn, 16))
+            else:
+                conn.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+                return
+            dst_port = struct.unpack("!H", _recv_exact(conn, 2))[0]
+
+            if cmd == 1:
+                # TCP CONNECT (used e.g. for DoH / HTTP/2 fallback)
+                stats["tcp_connect"] += 1
+                upstream = socket.create_connection((dst_host, dst_port), timeout=5.0)
+                conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                conn.setblocking(False)
+                upstream.setblocking(False)
+                try:
+                    while not stop_event.is_set():
+                        rlist, _, _ = select.select([conn, upstream], [], [], 0.2)
+                        if not rlist:
+                            continue
+                        for s in rlist:
+                            data = s.recv(16384)
+                            if not data:
+                                return
+                            (upstream if s is conn else conn).sendall(data)
+                finally:
+                    upstream.close()
+                return
+
+            if cmd == 3:
+                if not allow_udp:
+                    conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+                    return
+                stats["udp_assoc"] += 1
+                udp_client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp_client_sock.bind(("127.0.0.1", 0))
+                relay_port = udp_client_sock.getsockname()[1]
+
+                udp_upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp_upstream_sock.bind(("0.0.0.0", 0))
+
+                # Deliberately return 0.0.0.0 as BND.ADDR to test RFC 1928 peer-IP substitution
+                conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00" + struct.pack("!H", relay_port))
+
+                client_udp_addr = None
+                conn.setblocking(False)
+                udp_client_sock.setblocking(False)
+                udp_upstream_sock.setblocking(False)
+
+                while not stop_event.is_set():
+                    rlist, _, _ = select.select([conn, udp_client_sock, udp_upstream_sock], [], [], 0.2)
+                    if not rlist:
+                        continue
+                    if conn in rlist:
+                        try:
+                            if not conn.recv(64):
+                                break
+                        except OSError:
+                            break
+                    if udp_client_sock in rlist:
+                        pkt, caddr = udp_client_sock.recvfrom(65535)
+                        client_udp_addr = caddr
+                        if len(pkt) < 10 or pkt[0] != 0 or pkt[1] != 0 or pkt[2] != 0:
+                            continue
+                        if pkt[3] == 1:
+                            t_ip = socket.inet_ntoa(pkt[4:8])
+                            t_port = struct.unpack("!H", pkt[8:10])[0]
+                            payload = pkt[10:]
+                            udp_upstream_sock.sendto(payload, (t_ip, t_port))
+                            stats["udp_out"] += 1
+                    if udp_upstream_sock in rlist:
+                        payload, saddr = udp_upstream_sock.recvfrom(65535)
+                        if client_udp_addr is not None:
+                            hdr = b"\x00\x00\x00\x01" + socket.inet_aton(saddr[0]) + struct.pack("!H", saddr[1])
+                            udp_client_sock.sendto(hdr + payload, client_udp_addr)
+                            stats["udp_in"] += 1
+                return
+
+            conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+        except Exception:
+            pass
+        finally:
+            for s in (udp_client_sock, udp_upstream_sock, conn):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+    def _accept_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                c, _ = srv.accept()
+                threading.Thread(target=_handle_client, args=(c,), daemon=True).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    t = threading.Thread(target=_accept_loop, daemon=True)
+    t.start()
+
+    def _shutdown() -> None:
+        stop_event.set()
+        try:
+            srv.close()
+        except OSError:
+            pass
+        t.join(timeout=1.0)
+
+    return port, stats, _shutdown
+
+
+def test_real_ech_encrypted_sni_over_boringssl_http3():
+    """Live test: Real ECH (DoH Type 65 HTTPS record -> SSL_set1_ech_config_list) -> sni=encrypted over HTTP/3."""
+    with Session(impersonate="chrome_149", http3=True, ech=False, timeout=15) as s_plain:
+        rp = s_plain.get("https://cloudflare-ech.com/cdn-cgi/trace")
+        assert rp.status_code == 200
+        assert rp.http_version == "HTTP/3"
+        assert rp.ech_accepted is False
+        assert "sni=plaintext" in rp.text
+
+    with Session(impersonate="chrome_149", http3=True, ech=True, timeout=15) as s:
+        r1 = s.get("https://cloudflare-ech.com/cdn-cgi/trace")
+        assert r1.status_code == 200
+        assert r1.http_version == "HTTP/3"
+        assert r1.ech_accepted is True
+        assert "http=http/3" in r1.text
+        assert "sni=encrypted" in r1.text
+        assert "kex=X25519MLKEM768" in r1.text
+        assert s._session.h3_pool_len() == 1
+
+        # Multiplexed reuse on the same ECH-established QUIC connection
+        r2 = s.get("https://cloudflare-ech.com/cdn-cgi/trace")
+        assert r2.status_code == 200
+        assert r2.http_version == "HTTP/3"
+        assert r2.ech_accepted is True
+        assert "sni=encrypted" in r2.text
+        assert s._session.h3_pool_len() == 1
+
+
+def test_http3_over_socks5_udp_associate_proxy():
+    """Live test: HTTP/3 (UDP QUIC) + Real ECH tunneled through an authenticated RFC 1928/1929 SOCKS5 UDP Associate proxy."""
+    port, stats, shutdown = _start_local_socks5_server(username="h3user", password="h3pass", allow_udp=True)
+    try:
+        proxy_url = f"socks5://h3user:h3pass@127.0.0.1:{port}"
+        with Session(impersonate="chrome_149", http3=True, http3_only=True, proxy=proxy_url, timeout=15) as s:
+            r = s.get("https://www.cloudflare.com/cdn-cgi/trace")
+            assert r.status_code == 200
+            assert r.http_version == "HTTP/3"
+            assert "http=http/3" in r.text
+            assert "kex=X25519MLKEM768" in r.text
+            assert stats["auth_ok"] >= 1
+            assert stats["udp_assoc"] >= 1
+            assert stats["udp_out"] > 0
+            assert stats["udp_in"] > 0
+
+        # Combined Real ECH + SOCKS5 UDP Associate (DoH over SOCKS5 TCP + QUIC over SOCKS5 UDP)
+        with Session(
+            impersonate="chrome_149",
+            http3=True,
+            http3_only=True,
+            ech=True,
+            proxy=proxy_url,
+            timeout=15,
+        ) as s_ech:
+            r_ech = s_ech.get("https://cloudflare-ech.com/cdn-cgi/trace")
+            assert r_ech.status_code == 200
+            assert r_ech.http_version == "HTTP/3"
+            assert r_ech.ech_accepted is True
+            assert "sni=encrypted" in r_ech.text
+    finally:
+        shutdown()
+
+
+def test_socks5_udp_associate_rejected_fallback_and_strict():
+    """When a SOCKS5 proxy rejects UDP ASSOCIATE (0x07), http3_only=True fails cleanly while http3=True falls back to TCP."""
+    from http_tls.exceptions import ConnectionError as HttpTlsConnectionError
+
+    port, stats, shutdown = _start_local_socks5_server(allow_udp=False)
+    try:
+        proxy_url = f"socks5://127.0.0.1:{port}"
+        with Session(impersonate="chrome_149", http3_only=True, proxy=proxy_url, timeout=10) as s_strict:
+            with pytest.raises(HttpTlsConnectionError, match="UDP ASSOCIATE"):
+                s_strict.get("https://www.cloudflare.com/cdn-cgi/trace")
+
+        with Session(impersonate="chrome_149", http3=True, http3_only=False, proxy=proxy_url, timeout=15) as s_fb:
+            r = s_fb.get("https://www.cloudflare.com/cdn-cgi/trace")
+            assert r.status_code == 200
+            assert r.http_version in ("HTTP/2", "HTTP/1.1")
+            assert stats["tcp_connect"] >= 1
+    finally:
+        shutdown()

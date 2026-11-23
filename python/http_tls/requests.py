@@ -53,7 +53,7 @@ try:
 except ImportError:
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "0.8.3"
+    __version__ = "1.0.0"
 
     def _rust_presets() -> List[str]:
         return []
@@ -821,6 +821,7 @@ class Response:
         peer_certificate: Optional[bytes] = None,
         history: Optional[List["Response"]] = None,
         proxy: Optional[str] = None,
+        ech_accepted: bool = False,
         *,
         raw_chunks: Optional[Iterator[bytes]] = None,
         async_stream: Optional[Any] = None,
@@ -837,6 +838,7 @@ class Response:
         self.peer_certificate = peer_certificate
         self.history: List["Response"] = history or []
         self.proxy: Optional[str] = proxy
+        self.ech_accepted: bool = ech_accepted
         self._raw_chunks = raw_chunks
         self._async_stream = async_stream
         self._closer = closer
@@ -1330,6 +1332,8 @@ class Session:
         http3: bool = False,
         http3_only: bool = False,
         auto_upgrade_h3: bool = True,
+        ech: bool = False,
+        ech_doh_url: str = "https://cloudflare-dns.com/dns-query",
         resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
         local_address: Optional[str] = None,
         interface: Optional[str] = None,
@@ -1394,8 +1398,10 @@ class Session:
         self.fetch_mode = fetch_mode
         self.transport = transport
         self._last_url: Optional[str] = None
-        self.http3 = http3 or http3_only
+        self.http3 = http3 or http3_only or ech
         self.http3_only = http3_only
+        self.ech = ech
+        self.ech_doh_url = ech_doh_url
         self.auto_upgrade_h3 = (
             auto_upgrade_h3
             and not http1_only
@@ -1475,6 +1481,8 @@ class Session:
                 http2_only=http2_only,
                 http3=self.http3,
                 http3_only=self.http3_only,
+                ech=self.ech,
+                ech_doh_url=self.ech_doh_url,
                 resolve=dict(resolve) if resolve else None,
                 local_address=local_address,
                 interface=interface,
@@ -1816,6 +1824,8 @@ class Session:
                 impersonate_override=spec.get("impersonate"),
                 local_address=spec.get("local_address"),
                 http3=spec.get("http3"),
+                ech=spec.get("ech"),
+                ech_config_list=spec.get("ech_config_list"),
             )
             native_specs.append(args)
             meta_list.append((method, full_url, args.get("headers")))
@@ -1854,6 +1864,8 @@ class Session:
         impersonate_override: Optional[str],
         local_address: Optional[str],
         http3: Optional[bool] = None,
+        ech: Optional[bool] = None,
+        ech_config_list: Optional[bytes] = None,
     ) -> Dict[str, Any]:
         req_headers = dict(self.headers.items())
         if headers:
@@ -1903,7 +1915,8 @@ class Session:
 
         has_alt_h3, alt_port = self._lookup_alt_svc_h3(url)
         eff_http3: Optional[bool] = http3
-        if eff_http3 is None and self.auto_upgrade_h3 and has_alt_h3 and not actual_proxy:
+        proxy_supports_h3 = not actual_proxy or actual_proxy.lower().startswith(("socks5://", "socks5h://"))
+        if eff_http3 is None and self.auto_upgrade_h3 and has_alt_h3 and proxy_supports_h3:
             eff_http3 = True
 
         return dict(
@@ -1925,6 +1938,8 @@ class Session:
             local_address=local_address,
             http3=eff_http3,
             alt_svc_port=alt_port,
+            ech=ech,
+            ech_config_list=ech_config_list,
         )
 
     def _wrap_native(self, native: Any, stream: bool, is_async: bool = False) -> Response:
@@ -1946,6 +1961,7 @@ class Session:
             remote_addr=getattr(native, "remote_addr", None),
             peer_certificate=bytes(peer_cert) if peer_cert is not None else None,
             history=hist,
+            ech_accepted=bool(getattr(native, "ech_accepted", False)),
         )
         if stream:
             out_resp = Response(
@@ -2006,6 +2022,8 @@ class Session:
         local_address: Optional[str] = None,
         fetch_mode: Optional[str] = None,
         http3: Optional[bool] = None,
+        ech: Optional[bool] = None,
+        ech_config_list: Optional[bytes] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response:
@@ -2070,7 +2088,7 @@ class Session:
                     args = self._build_native_args(
                         method, full_url, params, req_headers, cookies, data, json, files,
                         timeout, verify, proxies, attempt_proxy, allow_redirects, auth_obj,
-                        header_order, attempt_imp, local_address, http3,
+                        header_order, attempt_imp, local_address, http3, ech, ech_config_list,
                     )
                     call = self._session.request_stream if stream else self._session.request
                     resp = self._wrap_native(call(**args), stream=stream, is_async=False)
@@ -2087,7 +2105,7 @@ class Session:
                         args = self._build_native_args(
                             method, full_url, params, digest_hdrs, cookies, data, json, files,
                             timeout, verify, proxies, attempt_proxy, allow_redirects, None,
-                            header_order, attempt_imp, local_address, http3,
+                            header_order, attempt_imp, local_address, http3, ech, ech_config_list,
                         )
                         call = self._session.request_stream if stream else self._session.request
                         resp = self._wrap_native(call(**args), stream=stream, is_async=False)
@@ -2391,6 +2409,8 @@ class AsyncSession:
         local_address: Optional[str] = None,
         fetch_mode: Optional[str] = None,
         http3: Optional[bool] = None,
+        ech: Optional[bool] = None,
+        ech_config_list: Optional[bytes] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response:
@@ -2456,7 +2476,7 @@ class AsyncSession:
                 args = s._build_native_args(
                     method, full_url, params, req_headers, cookies, data, json, files,
                     timeout, verify, proxies, attempt_proxy, allow_redirects, auth_obj,
-                    header_order, attempt_imp, local_address, http3,
+                    header_order, attempt_imp, local_address, http3, ech, ech_config_list,
                 )
                 call = s._session.async_request_stream if stream else s._session.async_request
                 resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
@@ -2471,7 +2491,7 @@ class AsyncSession:
                         args = s._build_native_args(
                             method, full_url, params, digest_hdrs, cookies, data, json, files,
                             timeout, verify, proxies, attempt_proxy, allow_redirects, None,
-                            header_order, attempt_imp, local_address, http3,
+                            header_order, attempt_imp, local_address, http3, ech, ech_config_list,
                         )
                         call = s._session.async_request_stream if stream else s._session.async_request
                         resp = s._wrap_native(await call(**args), stream=stream, is_async=True)
@@ -2589,14 +2609,14 @@ _SESSION_KEYS = (
     "timeout", "connect_timeout", "read_timeout", "verify", "proxies", "proxy", "proxies_pool",
     "allow_redirects", "follow_redirects", "auth", "cert", "header_order", "tls_options", "ja3",
     "http2_options", "akamai_h2", "http1_only", "http2_only", "http3", "http3_only", "auto_upgrade_h3",
-    "resolve", "local_address", "interface",
+    "ech", "ech_doh_url", "resolve", "local_address", "interface",
     "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay", "tcp_keepalive",
     "auto_referer", "fetch_mode", "transport", "retries", "retry_backoff", "retry_statuses",
     "retry_on_challenge", "rotate_impersonate", "event_hooks", "engine",
 )
 _REQ_SKIP_KEYS = {
     "engine", "cert", "tls_options", "ja3", "http2_options", "akamai_h2", "http1_only", "http2_only",
-    "http3_only", "auto_upgrade_h3",
+    "http3_only", "auto_upgrade_h3", "ech_doh_url",
     "resolve", "interface", "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay",
     "tcp_keepalive", "auto_referer", "transport", "connect_timeout", "read_timeout", "proxies_pool",
     "retries", "retry_backoff", "retry_statuses", "retry_on_challenge", "rotate_impersonate",

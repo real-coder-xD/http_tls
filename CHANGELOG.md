@@ -2,6 +2,19 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [1.0.0] - 2026-11-23
+
+### Real ECH (`sni=encrypted`) & HTTP/3 over SOCKS5 UDP Associate
+- **Real Encrypted Client Hello (ECH — RFC 9460 / Draft ECH):** Added `ech=True`, `ech_doh_url=` (default `https://cloudflare-dns.com/dns-query`), per-request `ech=` / `ech_config_list=`, and `resp.ech_accepted: bool`. Queries DoH DNS Type 65 (`HTTPS` / SVCB) with per-domain TTL caching, injects the ECHConfigList directly into BoringSSL via `SSL_set1_ech_config_list`, handles server key rotation automatically via `SSL_get0_ech_retry_configs`, and verifies acceptance via `SSL_ech_accepted`. Verified live against `cloudflare-ech.com` (`HTTP/3`, `ech_accepted=True`, `sni=encrypted`, `kex=X25519MLKEM768`).
+- **Native HTTP/3 (UDP QUIC) over SOCKS5 UDP Associate (`src/socks5_udp.rs`):** Implemented `Socks5UdpSocket` for `quinn::AsyncUdpSocket` supporting RFC 1928 `CMD=0x03 (UDP ASSOCIATE)` and RFC 1929 Username/Password authentication (`socks5://` / `socks5h://`), real-world `0.0.0.0`/`::` `BND.ADDR` peer-IP substitution, TCP control channel lifetime management, and automatic fallback to TCP HTTP/2 when a proxy rejects `UDP ASSOCIATE` (`http3_only=False`). Works standalone or combined with `ech=True`.
+- **Zero New Crate Dependencies:** Built entirely on existing `btls-sys`, `quinn`, `h3`, and `tokio` primitives with 39/39 passing end-to-end tests and 0 `clippy` / `pyrefly` / `mypy` warnings.
+
+## [0.8.3] - 2026-11-23
+
+### Launch Packaging & Release Automation
+- Updated PyPI keywords and `README.md` with Pure BoringSSL HTTP/3 documentation and live Cloudflare verification examples.
+- Added automated GitHub Release creation with wheel + sdist assets in `.github/workflows/release.yml`.
+
 ## [0.8.2] - 2026-11-21
 
 ### 100% Pure BoringSSL QUIC TLS 1.3 & RFC 9001 Crypto Provider

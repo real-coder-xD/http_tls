@@ -278,6 +278,7 @@ class Response:
     peer_certificate: Optional[bytes]
     history: List["Response"]
     proxy: Optional[str]
+    ech_accepted: bool
 
     def __init__(
         self,
@@ -294,6 +295,7 @@ class Response:
         peer_certificate: Optional[bytes] = None,
         history: Optional[List["Response"]] = None,
         proxy: Optional[str] = None,
+        ech_accepted: bool = False,
         *,
         raw_chunks: Optional[Iterator[bytes]] = None,
         async_stream: Optional[Any] = None,
@@ -392,6 +394,8 @@ class Session:
     http3: bool
     http3_only: bool
     auto_upgrade_h3: bool
+    ech: bool
+    ech_doh_url: str
     alt_svc_cache: Dict[str, Dict[str, str]]
     har_entries: List[Dict[str, Any]]
     event_hooks: Dict[str, List[Callable[..., Any]]]
@@ -428,6 +432,8 @@ class Session:
         http3: bool = False,
         http3_only: bool = False,
         auto_upgrade_h3: bool = True,
+        ech: bool = False,
+        ech_doh_url: str = "https://cloudflare-dns.com/dns-query",
         resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
         local_address: Optional[str] = None,
         interface: Optional[str] = None,
@@ -485,6 +491,8 @@ class Session:
         local_address: Optional[str] = None,
         fetch_mode: Optional[str] = None,
         http3: Optional[bool] = None,
+        ech: Optional[bool] = None,
+        ech_config_list: Optional[bytes] = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> Response: ...
