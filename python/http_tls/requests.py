@@ -21,6 +21,7 @@ import json as _json
 import os
 import random as _random
 import re
+import threading as _threading
 import time as _time
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlencode, urljoin, urlparse
@@ -44,16 +45,32 @@ from http_tls.structures import CaseInsensitiveDict
 # Native Rust BoringSSL engine
 try:
     from http_tls._core import (
+        Element,
+        HtmlDocument,
         Session as _RustSession,
         WebSocket as _NativeWebSocket,
         __version__,
+        extract_between as _rust_extract_between,
+        extract_between_all as _rust_extract_between_all,
+        extract_json_path as _rust_extract_json_path,
+        extract_re as _rust_extract_re,
+        extract_re_first as _rust_extract_re_first,
         is_verified_preset as _rust_is_verified_preset,
+        parse_html as _rust_parse_html,
         supported_presets as _rust_presets,
     )
 except ImportError:
+    Element = Any  # type: ignore[misc, assignment]
+    HtmlDocument = Any  # type: ignore[misc, assignment]
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "1.0.1"
+    __version__ = "1.1.0"
+    _rust_parse_html = None
+    _rust_extract_re = None
+    _rust_extract_re_first = None
+    _rust_extract_between = None
+    _rust_extract_between_all = None
+    _rust_extract_json_path = None
 
     def _rust_presets() -> List[str]:
         return []
@@ -822,6 +839,7 @@ class Response:
         history: Optional[List["Response"]] = None,
         proxy: Optional[str] = None,
         ech_accepted: bool = False,
+        tls_resumed: bool = False,
         *,
         raw_chunks: Optional[Iterator[bytes]] = None,
         async_stream: Optional[Any] = None,
@@ -839,12 +857,14 @@ class Response:
         self.history: List["Response"] = history or []
         self.proxy: Optional[str] = proxy
         self.ech_accepted: bool = ech_accepted
+        self.tls_resumed: bool = tls_resumed
         self._raw_chunks = raw_chunks
         self._async_stream = async_stream
         self._closer = closer
         self._content: Optional[bytes] = None if (raw_chunks is not None or async_stream is not None) else (content or b"")
         self._text = text
         self._num_bytes_downloaded: int = len(self._content) if self._content is not None else 0
+        self._doc_cache: Optional[Any] = None
 
     @property
     def content(self) -> bytes:
@@ -1149,6 +1169,123 @@ class Response:
     def json(self, **kwargs: Any) -> Any:
         return _json.loads(self.text, **kwargs)
 
+    _XPATH_AXES: Tuple[str, ...] = (
+        "child::",
+        "descendant::",
+        "descendant-or-self::",
+        "parent::",
+        "ancestor::",
+        "ancestor-or-self::",
+        "following-sibling::",
+        "preceding-sibling::",
+        "following::",
+        "preceding::",
+        "self::",
+        "attribute::",
+    )
+
+    @classmethod
+    def _is_xpath_query(cls, q: str) -> bool:
+        return q.startswith(("/", "./", "../", "(", "@")) or any(axis in q for axis in cls._XPATH_AXES)
+
+    def _get_doc(self) -> Any:
+        if _rust_parse_html is None:
+            raise RuntimeError("Rust native HTML5 engine '_core' not compiled.")
+        if self._doc_cache is None:
+            self._doc_cache = _rust_parse_html(self.text)
+        return self._doc_cache
+
+    @property
+    def html_doc(self) -> Any:
+        """Lazily parsed Rust WHATWG HTML5 `HtmlDocument` cached on this response (thread-safe)."""
+        return self._get_doc()
+
+    def css(self, selector: str) -> List[Any]:
+        """Query HTML with Rust CSS3 selectors (`:has()`, `:contains()`, `:has-text()`, `::text`, `::attr(name)`)."""
+        return self._get_doc().css(selector)
+
+    def css_first(self, selector: str, default: Any = None) -> Optional[Any]:
+        """Return the first Rust CSS3 selector match (or `default`)."""
+        return self._get_doc().css_first(selector, default)
+
+    def select(self, selector: str) -> List[Any]:
+        """BeautifulSoup-compatible alias for `css(selector)`."""
+        return self._get_doc().css(selector)
+
+    def select_one(self, selector: str, default: Any = None) -> Optional[Any]:
+        """BeautifulSoup-compatible alias for `css_first(selector, default=default)`."""
+        return self._get_doc().css_first(selector, default)
+
+    def xpath(self, expr: str) -> List[Any]:
+        """Query HTML with the native Rust XPath 1.0 evaluator (axes, predicates, `text()`, `@attr`, `|`)."""
+        return self._get_doc().xpath(expr)
+
+    def xpath_first(self, expr: str, default: Any = None) -> Optional[Any]:
+        """Return the first native Rust XPath match (or `default`)."""
+        return self._get_doc().xpath_first(expr, default)
+
+    def find(self, query: str, default: Any = None) -> Optional[Any]:
+        """Auto-dispatch first match: JSON path (`$.`, `$..`, `$[`), XPath (`/...`, `.//...`, XPath axes), or CSS3 (incl. `::text`/`::attr(...)`)."""
+        q = query.strip()
+        if q.startswith(("$.", "$[")):
+            return self.json_path(q, default=default)
+        if self._is_xpath_query(q):
+            return self.xpath_first(q, default)
+        return self.css_first(q, default)
+
+    def find_all(self, query: str) -> List[Any]:
+        """Auto-dispatch all matches: JSON path (`$.`, `$..`, `$[`), XPath (`/...`, `.//...`, XPath axes), or CSS3 (incl. `::text`/`::attr(...)`)."""
+        q = query.strip()
+        if q.startswith(("$.", "$[")):
+            val = self.json_path(q, default=None)
+            if val is None:
+                return []
+            return val if isinstance(val, list) else [val]
+        if self._is_xpath_query(q):
+            return self.xpath(q)
+        return self.css(q)
+
+    def get_text(self, separator: str = " ", strip: bool = True) -> str:
+        """BeautifulSoup-compatible text extraction joining all HTML text nodes with `separator`."""
+        return self._get_doc().get_text(separator, strip)
+
+    def urljoin(self, url: str) -> str:
+        """Scrapy-compatible absolute URL resolver relative to `self.url`."""
+        return urljoin(self.url, url)
+
+    def re(self, pattern: str) -> List[str]:
+        """Extract all regex matches from `self.text` using Rust's linear-time DFA regex engine (ReDoS-safe)."""
+        if _rust_extract_re is None:
+            raise RuntimeError("Rust native regex engine '_core' not compiled.")
+        return _rust_extract_re(self.text, pattern)
+
+    def re_first(self, pattern: str, default: Optional[str] = None) -> Optional[str]:
+        """Return the first regex match from `self.text` (or `default`) using Rust's linear-time DFA regex engine."""
+        if _rust_extract_re_first is None:
+            raise RuntimeError("Rust native regex engine '_core' not compiled.")
+        res = _rust_extract_re_first(self.text, pattern)
+        return default if res is None else res
+
+    def between(self, left: str, right: str, default: Optional[str] = None) -> Optional[str]:
+        """Extract the first substring between `left` and `right` delimiters from `self.text` in Rust (or `default`)."""
+        if _rust_extract_between is None:
+            raise RuntimeError("Rust native extraction engine '_core' not compiled.")
+        res = _rust_extract_between(self.text, left, right)
+        return default if res is None else res
+
+    def between_all(self, left: str, right: str) -> List[str]:
+        """Extract all substrings between `left` and `right` delimiters from `self.text` in Rust."""
+        if _rust_extract_between_all is None:
+            raise RuntimeError("Rust native extraction engine '_core' not compiled.")
+        return _rust_extract_between_all(self.text, left, right)
+
+    def json_path(self, path: str, default: Any = None) -> Any:
+        """Extract a nested value from JSON in Rust (`a.b[0].c`, `items[-1].id`, `items[0:5]`, `items[*].name`, `$..price`)."""
+        if _rust_extract_json_path is None:
+            raise RuntimeError("Rust native JSON engine '_core' not compiled.")
+        found, val = _rust_extract_json_path(self.text, path)
+        return val if found else default
+
     def raise_for_status(self) -> None:
         if 400 <= self.status_code < 500:
             raise HTTPError(f"{self.status_code} Client Error: {self.reason} for url: {self.url}", response=self)
@@ -1334,6 +1471,8 @@ class Session:
         auto_upgrade_h3: bool = True,
         ech: bool = False,
         ech_doh_url: str = "https://cloudflare-dns.com/dns-query",
+        doh: bool = False,
+        doh_url: Optional[str] = None,
         resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
         local_address: Optional[str] = None,
         interface: Optional[str] = None,
@@ -1398,10 +1537,11 @@ class Session:
         self.fetch_mode = fetch_mode
         self.transport = transport
         self._last_url: Optional[str] = None
-        self.http3 = http3 or http3_only or ech
+        self.http3 = http3 or http3_only or (ech and not http1_only and not http2_only)
         self.http3_only = http3_only
         self.ech = ech
         self.ech_doh_url = ech_doh_url
+        self.doh_url: Optional[str] = doh_url or ("https://cloudflare-dns.com/dns-query" if doh else None)
         self.auto_upgrade_h3 = (
             auto_upgrade_h3
             and not http1_only
@@ -1483,6 +1623,7 @@ class Session:
                 http3_only=self.http3_only,
                 ech=self.ech,
                 ech_doh_url=self.ech_doh_url,
+                doh_url=self.doh_url,
                 resolve=dict(resolve) if resolve else None,
                 local_address=local_address,
                 interface=interface,
@@ -1962,6 +2103,7 @@ class Session:
             peer_certificate=bytes(peer_cert) if peer_cert is not None else None,
             history=hist,
             ech_accepted=bool(getattr(native, "ech_accepted", False)),
+            tls_resumed=bool(getattr(native, "tls_resumed", False)),
         )
         if stream:
             out_resp = Response(
@@ -2609,14 +2751,14 @@ _SESSION_KEYS = (
     "timeout", "connect_timeout", "read_timeout", "verify", "proxies", "proxy", "proxies_pool",
     "allow_redirects", "follow_redirects", "auth", "cert", "header_order", "tls_options", "ja3",
     "http2_options", "akamai_h2", "http1_only", "http2_only", "http3", "http3_only", "auto_upgrade_h3",
-    "ech", "ech_doh_url", "resolve", "local_address", "interface",
+    "ech", "ech_doh_url", "doh", "doh_url", "resolve", "local_address", "interface",
     "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay", "tcp_keepalive",
     "auto_referer", "fetch_mode", "transport", "retries", "retry_backoff", "retry_statuses",
     "retry_on_challenge", "rotate_impersonate", "event_hooks", "engine",
 )
 _REQ_SKIP_KEYS = {
     "engine", "cert", "tls_options", "ja3", "http2_options", "akamai_h2", "http1_only", "http2_only",
-    "http3_only", "auto_upgrade_h3", "ech_doh_url",
+    "http3_only", "auto_upgrade_h3", "ech_doh_url", "doh", "doh_url",
     "resolve", "interface", "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay",
     "tcp_keepalive", "auto_referer", "transport", "connect_timeout", "read_timeout", "proxies_pool",
     "retries", "retry_backoff", "retry_statuses", "retry_on_challenge", "rotate_impersonate",

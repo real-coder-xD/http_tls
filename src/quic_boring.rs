@@ -15,6 +15,7 @@ use quinn_proto::crypto::{
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
 use std::any::Any;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io::{Cursor, Read, Write};
@@ -43,6 +44,9 @@ const TLS13_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 const CERT_COMP_BROTLI: u16 = 2;
 const CERT_COMP_ZLIB: u16 = 1;
 const CERT_COMP_ZSTD: u16 = 3;
+const SSL_SESS_CACHE_CLIENT: c_int = 0x0001;
+
+pub type TicketCache = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
 static KEYLOG_LOCK: Mutex<()> = Mutex::new(());
 
@@ -53,7 +57,7 @@ fn ex_data_idx() -> c_int {
     })
 }
 
-fn keylog_ex_data_idx() -> c_int {
+pub(crate) fn keylog_ex_data_idx() -> c_int {
     static IDX: OnceLock<c_int> = OnceLock::new();
     *IDX.get_or_init(|| unsafe {
         ffi::SSL_CTX_get_ex_new_index(0, ptr::null_mut(), ptr::null_mut(), None, None)
@@ -144,7 +148,7 @@ fn last_boring_error() -> String {
 // ---------------------------------------------------------------------------
 // RFC 8879 Certificate Decompression Callbacks (Brotli, Zlib, Zstd)
 // ---------------------------------------------------------------------------
-unsafe extern "C" fn cert_decompress_brotli(
+pub(crate) unsafe extern "C" fn cert_decompress_brotli(
     _ssl: *mut ffi::SSL,
     out: *mut *mut ffi::CRYPTO_BUFFER,
     uncompressed_len: usize,
@@ -168,7 +172,7 @@ unsafe extern "C" fn cert_decompress_brotli(
     1
 }
 
-unsafe extern "C" fn cert_decompress_zlib(
+pub(crate) unsafe extern "C" fn cert_decompress_zlib(
     _ssl: *mut ffi::SSL,
     out: *mut *mut ffi::CRYPTO_BUFFER,
     uncompressed_len: usize,
@@ -192,7 +196,7 @@ unsafe extern "C" fn cert_decompress_zlib(
     1
 }
 
-unsafe extern "C" fn cert_decompress_zstd(
+pub(crate) unsafe extern "C" fn cert_decompress_zstd(
     _ssl: *mut ffi::SSL,
     out: *mut *mut ffi::CRYPTO_BUFFER,
     uncompressed_len: usize,
@@ -215,7 +219,7 @@ unsafe extern "C" fn cert_decompress_zstd(
     1
 }
 
-unsafe extern "C" fn keylog_cb(ssl: *const ffi::SSL, line: *const c_char) {
+pub(crate) unsafe extern "C" fn keylog_cb(ssl: *const ffi::SSL, line: *const c_char) {
     if ssl.is_null() || line.is_null() {
         return;
     }
@@ -574,17 +578,48 @@ struct BoringQuicState {
     read_secrets: [Option<(QuicCipher, Vec<u8>)>; 4],
     write_secrets: [Option<(QuicCipher, Vec<u8>)>; 4],
     alert: Option<u8>,
+    ticket_cache: TicketCache,
+    ticket_key: String,
 }
 
 impl BoringQuicState {
-    fn new() -> Self {
+    fn new(ticket_cache: TicketCache, ticket_key: String) -> Self {
         Self {
             write_bufs: Default::default(),
             read_secrets: Default::default(),
             write_secrets: Default::default(),
             alert: None,
+            ticket_cache,
+            ticket_key,
         }
     }
+}
+
+unsafe extern "C" fn quic_new_session_cb(
+    ssl: *mut ffi::SSL,
+    session: *mut ffi::SSL_SESSION,
+) -> c_int {
+    if ssl.is_null() || session.is_null() {
+        return 0;
+    }
+    if let Some(st) = state_from_ssl(ssl) {
+        let mut out_ptr: *mut u8 = ptr::null_mut();
+        let mut out_len: usize = 0;
+        if ffi::SSL_SESSION_to_bytes(session, &mut out_ptr, &mut out_len) == 1
+            && !out_ptr.is_null()
+            && out_len > 0
+        {
+            let bytes = std::slice::from_raw_parts(out_ptr, out_len).to_vec();
+            ffi::OPENSSL_free(out_ptr as *mut c_void);
+            let mut guard = st.ticket_cache.lock().unwrap_or_else(|p| p.into_inner());
+            if guard.len() >= 128 {
+                guard.clear();
+            }
+            guard.insert(st.ticket_key.clone(), bytes);
+        }
+    }
+    // Return 0 so BoringSSL retains ownership and frees `session` cleanly.
+    0
 }
 
 unsafe fn state_from_ssl<'a>(ssl: *mut ffi::SSL) -> Option<&'a mut BoringQuicState> {
@@ -675,6 +710,7 @@ pub struct BoringHandshakeData {
     #[allow(dead_code)]
     pub protocol: Option<Vec<u8>>,
     pub ech_accepted: bool,
+    pub tls_resumed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +724,8 @@ pub struct BoringQuicClientConfig {
     ech_grease: bool,
     ech_config_list: Option<Vec<u8>>,
     ech_retry_out: Arc<Mutex<Option<Vec<u8>>>>,
+    ticket_cache: TicketCache,
+    ticket_key: String,
 }
 
 // SAFETY: `SSL_CTX` is read-only after construction and safe for concurrent `SSL_new(ctx)`.
@@ -704,7 +742,7 @@ impl Drop for BoringQuicClientConfig {
     }
 }
 
-fn load_ca_certs_into_store(store: *mut ffi::X509_STORE, ca_bundle: Option<&[u8]>) {
+pub(crate) fn load_ca_certs_into_store(store: *mut ffi::X509_STORE, ca_bundle: Option<&[u8]>) {
     unsafe {
         // 1. Load embedded Mozilla WebPKI root certificates (DER)
         for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
@@ -744,7 +782,7 @@ fn load_ca_certs_into_store(store: *mut ffi::X509_STORE, ca_bundle: Option<&[u8]
     }
 }
 
-fn load_client_identity(ctx: *mut ffi::SSL_CTX, cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
+pub(crate) fn load_client_identity(ctx: *mut ffi::SSL_CTX, cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
     unsafe {
         let cbio = ffi::BIO_new_mem_buf(cert_pem.as_ptr() as *const c_void, cert_pem.len() as isize);
         if cbio.is_null() {
@@ -791,6 +829,7 @@ fn load_client_identity(ctx: *mut ffi::SSL_CTX, cert_pem: &[u8], key_pem: &[u8])
 }
 
 impl BoringQuicClientConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         preset: &str,
         verify: bool,
@@ -799,6 +838,8 @@ impl BoringQuicClientConfig {
         keylog_file: Option<&str>,
         ech_config_list: Option<Vec<u8>>,
         ech_retry_out: Arc<Mutex<Option<Vec<u8>>>>,
+        ticket_cache: TicketCache,
+        ticket_key: String,
     ) -> Result<Self, String> {
         let lower = preset.trim().to_ascii_lowercase();
         let is_firefox = lower.starts_with("firefox") || lower.starts_with("tor");
@@ -813,6 +854,8 @@ impl BoringQuicClientConfig {
             ffi::SSL_CTX_set_min_proto_version(ctx, ffi::TLS1_3_VERSION as u16);
             ffi::SSL_CTX_set_max_proto_version(ctx, ffi::TLS1_3_VERSION as u16);
             ffi::SSL_CTX_set_quic_method(ctx, &BORING_QUIC_METHOD);
+            ffi::SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
+            ffi::SSL_CTX_sess_set_new_cb(ctx, Some(quic_new_session_cb));
 
             // Authentic browser BoringSSL TLS 1.3 fingerprint settings
             ffi::SSL_CTX_set_grease_enabled(ctx, if is_firefox { 0 } else { 1 });
@@ -905,6 +948,8 @@ impl BoringQuicClientConfig {
                 ech_grease: !is_safari,
                 ech_config_list,
                 ech_retry_out,
+                ticket_cache,
+                ticket_key,
             })
         }
     }
@@ -932,12 +977,34 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
                 return Err(ConnectError::InvalidServerName(server_name.to_string()));
             };
 
-            let state = Box::new(BoringQuicState::new());
+            let state = Box::new(BoringQuicState::new(
+                Arc::clone(&self.ticket_cache),
+                self.ticket_key.clone(),
+            ));
             let state_ptr = &*state as *const BoringQuicState as *mut c_void;
             ffi::SSL_set_ex_data(ssl, ex_data_idx(), state_ptr);
 
             ffi::SSL_set_connect_state(ssl);
             ffi::SSL_set_tlsext_host_name(ssl, c_sni.as_ptr());
+
+            // Attach cached TLS 1.3 session ticket for QUIC session resumption when available
+            let cached_ticket = self
+                .ticket_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&self.ticket_key)
+                .cloned();
+            if let Some(ref ticket) = cached_ticket {
+                let sess = ffi::SSL_SESSION_from_bytes(
+                    ticket.as_ptr(),
+                    ticket.len(),
+                    self.ctx.as_ptr(),
+                );
+                if !sess.is_null() {
+                    ffi::SSL_set_session(ssl, sess);
+                    ffi::SSL_SESSION_free(sess);
+                }
+            }
 
             let mut real_ech_set = false;
             if let Some(ref ech_list) = self.ech_config_list {
@@ -1086,10 +1153,16 @@ impl crypto::Session for BoringQuicSession {
         if !self.got_handshake_data {
             return None;
         }
-        let ech_accepted = unsafe { ffi::SSL_ech_accepted(self.ssl.as_ptr()) == 1 };
+        let (ech_accepted, tls_resumed) = unsafe {
+            (
+                ffi::SSL_ech_accepted(self.ssl.as_ptr()) == 1,
+                ffi::SSL_session_reused(self.ssl.as_ptr()) == 1,
+            )
+        };
         Some(Box::new(BoringHandshakeData {
             protocol: self.alpn_protocol(),
             ech_accepted,
+            tls_resumed,
         }))
     }
 

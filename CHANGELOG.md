@@ -2,6 +2,15 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [1.1.0] - 2026-11-24
+
+### 100% Pure Rust Extraction Engine, TCP HTTP/2 Real ECH, Session-Wide DoH & QUIC TLS 1.3 Resumption
+- **Built-in Pure Rust Extraction Engine (`src/extract.rs`):** Added zero-Python-dependency HTML5 CSS3 (`dom_query` / `html5ever` with `:has()`, `:contains()`, `:has-text()`, `::text`, `::attr(name)`), native Rust XPath 1.0 (all core axes incl. `following::`/`preceding::`, predicates, `contains`, `starts-with`, `ends-with`, `normalize-space`, `string-length`, `count`, `substring-before`, `substring-after`, `and`/`or`/`not`, parenthesized groups `(//div[...])[1]`, unions `|`, `/text()`, `/@attr`), structured `serde_json` `json_path()` (dot paths, quoted keys, negative indices, slices `[0:5]`, wildcards `[*]`, recursive descent `$..key`), linear-time DFA `regex` (`re`, `re_first`), and delimiter slicing (`between`, `between_all`). Exposed thread-safe `Element` (with `own_text`, `get_text`, `attrib`, `parent`, `children`, `next_sibling`, `prev_sibling`, `ancestors`, `select`, `select_one`) and `HtmlDocument` PyO3 classes plus `Response.css()`, `css_first()`, `select()`, `select_one()`, `xpath()`, `xpath_first()`, `find()`, `find_all()`, `get_text()`, `urljoin()`, `re()`, `re_first()`, `between()`, `between_all()`, `json_path()`, and `html_doc`.
+- **Real ECH (`sni=encrypted`) over TCP HTTP/2 (`src/tcp_ech.rs`):** Extended `ech=True` to pure BoringSSL TCP HTTP/2 (`btls` + `tokio-btls` + `http2`) with Chrome GREASE, `X25519MLKEM768`, ALPS `h2`, Brotli/Zlib/Zstd cert decompression, automatic `SSL_get0_ech_retry_configs` retry, TLS 1.3 ticket capture, `keylog_file` / `SSLKEYLOGFILE`, SOCKS5 TCP CONNECT, and true incremental H2 chunk streaming. Verified live against `crypto.cloudflare.com` (`HTTP/2`, `ech_accepted=True`, `sni=encrypted`).
+- **Session-Wide DNS-over-HTTPS (`src/doh.rs`):** Added `doh=True` and `doh_url=` implementing `wreq::dns::Resolve` with concurrent dual-stack `A`+`AAAA` lookups and bounded TTL caching shared across HTTP/1.1, HTTP/2, and HTTP/3.
+- **QUIC TLS 1.3 Session Ticket Resumption, Per-Browser QUIC Params & H3 Multipart Uploads:** Added `SSL_CTX_sess_set_new_cb` session ticket caching with `resp.tls_resumed: bool` (invalidated on `set_impersonate()`, `close()`, and ECH retry), per-browser QUIC transport parameters (`0x0039` for Chrome, Firefox, and Safari presets), and native RFC 7578 multipart `files=` uploads over UDP QUIC HTTP/3.
+- **Security & Protocol Hardening:** Added SOCKS5 UDP relay source IP/port verification in `Socks5UdpSocket::poll_recv` and stripped stale `Content-Length`/`Content-Type` headers on `POST` -> `301`/`302`/`303` redirect `GET` transitions.
+
 ## [1.0.1] - 2026-11-23
 
 ### True Incremental HTTP/3 Chunk Streaming & RFC 8297 `103 Early Hints` Handling

@@ -32,7 +32,7 @@ pub fn is_socks5_proxy(proxy_url: &str) -> bool {
     low.starts_with("socks5://") || low.starts_with("socks5h://")
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -474,7 +474,11 @@ impl AsyncUdpSocket for Socks5UdpSocket {
             match self.udp.poll_recv_from(cx, &mut read_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(_from)) => {
+                Poll::Ready(Ok(from)) => {
+                    if from != self.relay_addr {
+                        // Drop stray UDP datagrams not originating from the negotiated SOCKS5 relay
+                        continue;
+                    }
                     let filled = read_buf.filled();
                     let Some((src_addr, hdr_len)) = parse_socks5_udp_header(filled) else {
                         // Ignore stray/malformed datagrams and keep polling

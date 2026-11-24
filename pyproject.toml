@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "http-tls"
-version = "1.0.1"
-description = "Standalone Rust + Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 (Real ECH, X25519MLKEM768, SOCKS5 UDP Associate) Browser-Impersonating HTTP Client for Python"
+version = "1.1.0"
+description = "Standalone Rust + Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 (Real ECH, DoH, SOCKS5 UDP) HTTP Client & HTML5 CSS3/XPath/JSON Extraction Engine for Python"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -16,6 +16,8 @@ keywords = [
     "quic",
     "ech",
     "encrypted-client-hello",
+    "doh",
+    "dns-over-https",
     "socks5",
     "tls",
     "ja3",
@@ -33,7 +35,15 @@ keywords = [
     "httpx",
     "curl-cffi",
     "websocket",
+    "web-scraping",
     "scraping",
+    "html-parser",
+    "html5ever",
+    "css-selector",
+    "xpath",
+    "jsonpath",
+    "beautifulsoup-alternative",
+    "parsel-alternative",
     "async",
 ]
 classifiers = [

@@ -264,6 +264,98 @@ class Cookies(dict):
     def list_records(self) -> List[Dict[str, Any]]: ...
     def get_dict(self, domain: Optional[str] = None, path: Optional[str] = None) -> Dict[str, str]: ...
 
+class Element:
+    """Native Rust HTML5 DOM element supporting chained CSS3, XPath 1.0, regex, DOM navigation, and dict-like attribute access."""
+    tag: str
+    text: str
+    own_text: str
+    html: str
+    outer_html: str
+    attrs: Dict[str, str]
+    attrib: Dict[str, str]
+    parent: Optional["Element"]
+    children: List["Element"]
+    next_sibling: Optional["Element"]
+    prev_sibling: Optional["Element"]
+    ancestors: List["Element"]
+    def get_text(self, separator: str = " ", strip: bool = True) -> str:
+        """BeautifulSoup-compatible text join across descendant text nodes with `separator`."""
+        ...
+    def attr(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        """Return attribute `name` or `default` if absent."""
+        ...
+    def css(self, selector: str) -> List[Any]:
+        """Query descendants with Rust CSS3 (`:has()`, `:contains()`, `::text`, `::attr(name)`)."""
+        ...
+    def css_first(self, selector: str, default: Any = None) -> Optional[Any]:
+        """Return the first matching descendant via Rust CSS3 (or `default`)."""
+        ...
+    def select(self, selector: str) -> List[Any]:
+        """BeautifulSoup-compatible alias for `css(selector)`."""
+        ...
+    def select_one(self, selector: str, default: Any = None) -> Optional[Any]:
+        """BeautifulSoup-compatible alias for `css_first(selector, default=default)`."""
+        ...
+    def xpath(self, expr: str) -> List[Any]:
+        """Query relative to this element using the native Rust XPath 1.0 evaluator."""
+        ...
+    def xpath_first(self, expr: str, default: Any = None) -> Optional[Any]:
+        """Return the first XPath 1.0 match relative to this element (or `default`)."""
+        ...
+    def find(self, query: str, default: Any = None) -> Optional[Any]:
+        """Auto-dispatch first match: XPath (`/...`, `.//...`, XPath axes) or CSS3 (incl. `::text`/`::attr()`)."""
+        ...
+    def find_all(self, query: str) -> List[Any]:
+        """Auto-dispatch all matches: XPath (`/...`, `.//...`, XPath axes) or CSS3 (incl. `::text`/`::attr()`)."""
+        ...
+    def re(self, pattern: str) -> List[str]:
+        """Extract all Rust linear-time DFA regex matches from `self.text`."""
+        ...
+    def re_first(self, pattern: str, default: Optional[str] = None) -> Optional[str]:
+        """Extract the first Rust linear-time DFA regex match from `self.text` (or `default`)."""
+        ...
+    def between(self, left: str, right: str, default: Optional[str] = None) -> Optional[str]:
+        """Extract the first substring between `left` and `right` delimiters from `self.text` (or `default`)."""
+        ...
+    def between_all(self, left: str, right: str) -> List[str]:
+        """Extract all substrings between `left` and `right` delimiters from `self.text`."""
+        ...
+    def __getitem__(self, key: str) -> str: ...
+    def __contains__(self, key: str) -> bool: ...
+
+class HtmlDocument:
+    """Standalone thread-safe Rust WHATWG HTML5 DOM document."""
+    text: str
+    html: str
+    def __init__(self, html: str) -> None: ...
+    def get_text(self, separator: str = " ", strip: bool = True) -> str:
+        """BeautifulSoup-compatible text join across all HTML text nodes with `separator`."""
+        ...
+    def css(self, selector: str) -> List[Any]:
+        """Query document with Rust CSS3 (`:has()`, `:contains()`, `::text`, `::attr(name)`)."""
+        ...
+    def css_first(self, selector: str, default: Any = None) -> Optional[Any]:
+        """Return the first Rust CSS3 match (or `default`)."""
+        ...
+    def select(self, selector: str) -> List[Any]:
+        """BeautifulSoup-compatible alias for `css(selector)`."""
+        ...
+    def select_one(self, selector: str, default: Any = None) -> Optional[Any]:
+        """BeautifulSoup-compatible alias for `css_first(selector, default=default)`."""
+        ...
+    def xpath(self, expr: str) -> List[Any]:
+        """Query document with the native Rust XPath 1.0 evaluator."""
+        ...
+    def xpath_first(self, expr: str, default: Any = None) -> Optional[Any]:
+        """Return the first native Rust XPath 1.0 match (or `default`)."""
+        ...
+    def find(self, query: str, default: Any = None) -> Optional[Any]:
+        """Auto-dispatch first match: XPath (`/...`, `.//...`, XPath axes) or CSS3 (incl. `::text`/`::attr()`)."""
+        ...
+    def find_all(self, query: str) -> List[Any]:
+        """Auto-dispatch all matches: XPath (`/...`, `.//...`, XPath axes) or CSS3 (incl. `::text`/`::attr()`)."""
+        ...
+
 class Response:
     status_code: int
     headers: CaseInsensitiveDict
@@ -279,6 +371,7 @@ class Response:
     history: List["Response"]
     proxy: Optional[str]
     ech_accepted: bool
+    tls_resumed: bool
 
     def __init__(
         self,
@@ -296,6 +389,7 @@ class Response:
         history: Optional[List["Response"]] = None,
         proxy: Optional[str] = None,
         ech_accepted: bool = False,
+        tls_resumed: bool = False,
         *,
         raw_chunks: Optional[Iterator[bytes]] = None,
         async_stream: Optional[Any] = None,
@@ -338,6 +432,55 @@ class Response:
     async def acontent(self) -> bytes: ...
     async def atext(self) -> str: ...
     def json(self, **kwargs: Any) -> Any: ...
+    @property
+    def html_doc(self) -> HtmlDocument:
+        """Lazily parsed thread-safe Rust WHATWG HTML5 `HtmlDocument` cached on this response."""
+        ...
+    def css(self, selector: str) -> List[Any]:
+        """Query HTML with Rust CSS3 selectors (`:has()`, `:contains()`, `:has-text()`, `::text`, `::attr(name)`)."""
+        ...
+    def css_first(self, selector: str, default: Any = None) -> Optional[Any]:
+        """Return the first Rust CSS3 selector match (or `default`)."""
+        ...
+    def select(self, selector: str) -> List[Any]:
+        """BeautifulSoup-compatible alias for `css(selector)`."""
+        ...
+    def select_one(self, selector: str, default: Any = None) -> Optional[Any]:
+        """BeautifulSoup-compatible alias for `css_first(selector, default=default)`."""
+        ...
+    def xpath(self, expr: str) -> List[Any]:
+        """Query HTML with the native Rust XPath 1.0 evaluator (axes, predicates, `text()`, `@attr`, `|`)."""
+        ...
+    def xpath_first(self, expr: str, default: Any = None) -> Optional[Any]:
+        """Return the first native Rust XPath 1.0 match (or `default`)."""
+        ...
+    def find(self, query: str, default: Any = None) -> Optional[Any]:
+        """Auto-dispatch first match: JSON path (`$.`, `$..`, `$[`), XPath (`/...`, `.//...`, XPath axes), or CSS3 (incl. `::text`/`::attr()`)."""
+        ...
+    def find_all(self, query: str) -> List[Any]:
+        """Auto-dispatch all matches: JSON path (`$.`, `$..`, `$[`), XPath (`/...`, `.//...`, XPath axes), or CSS3 (incl. `::text`/`::attr()`)."""
+        ...
+    def get_text(self, separator: str = " ", strip: bool = True) -> str:
+        """BeautifulSoup-compatible text join across all HTML text nodes with `separator`."""
+        ...
+    def urljoin(self, url: str) -> str:
+        """Scrapy-compatible absolute URL resolver relative to `self.url`."""
+        ...
+    def re(self, pattern: str) -> List[str]:
+        """Extract all matches from `self.text` using Rust's linear-time DFA regex engine (ReDoS-safe)."""
+        ...
+    def re_first(self, pattern: str, default: Optional[str] = None) -> Optional[str]:
+        """Return the first match from `self.text` (or `default`) using Rust's linear-time DFA regex engine."""
+        ...
+    def between(self, left: str, right: str, default: Optional[str] = None) -> Optional[str]:
+        """Extract the first substring between `left` and `right` delimiters from `self.text` in Rust (or `default`)."""
+        ...
+    def between_all(self, left: str, right: str) -> List[str]:
+        """Extract all substrings between `left` and `right` delimiters from `self.text` in Rust."""
+        ...
+    def json_path(self, path: str, default: Any = None) -> Any:
+        """Extract a nested value from JSON in Rust (`a.b[0].c`, `items[-1].id`, `items[0:5]`, `items[*].name`, `$..price`)."""
+        ...
     def raise_for_status(self) -> None: ...
     def iter_content(self, chunk_size: Optional[int] = 1, decode_unicode: bool = False) -> Iterator[Any]: ...
     def iter_bytes(self, chunk_size: Optional[int] = None) -> Iterator[bytes]: ...
@@ -396,6 +539,7 @@ class Session:
     auto_upgrade_h3: bool
     ech: bool
     ech_doh_url: str
+    doh_url: Optional[str]
     alt_svc_cache: Dict[str, Dict[str, str]]
     har_entries: List[Dict[str, Any]]
     event_hooks: Dict[str, List[Callable[..., Any]]]
@@ -434,6 +578,8 @@ class Session:
         auto_upgrade_h3: bool = True,
         ech: bool = False,
         ech_doh_url: str = "https://cloudflare-dns.com/dns-query",
+        doh: bool = False,
+        doh_url: Optional[str] = None,
         resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
         local_address: Optional[str] = None,
         interface: Optional[str] = None,
@@ -526,7 +672,67 @@ class AsyncSession:
     mode: str
     _sync_session: Session
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+    def __init__(
+        self,
+        impersonate: str = "chrome_149",
+        timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig] = 30.0,
+        connect_timeout: Optional[float] = None,
+        read_timeout: Optional[float] = None,
+        verify: Union[bool, str] = True,
+        verify_ssl: bool = True,
+        proxies: Optional[Dict[str, str]] = None,
+        proxy: Optional[str] = None,
+        proxies_pool: Optional[Sequence[str]] = None,
+        allow_redirects: bool = True,
+        follow_redirects: bool = True,
+        max_redirects: int = 10,
+        headers: Optional[Dict[str, str]] = None,
+        header_order: Optional[Sequence[str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        cookies: Optional[Dict[str, str]] = None,
+        auth: Optional[Union[Tuple[str, str], AuthBase]] = None,
+        cert: Union[str, Tuple[str, str], None] = None,
+        base_url: str = "",
+        tls_options: Optional[Dict[str, Any]] = None,
+        ja3: Optional[str] = None,
+        http2_options: Optional[Dict[str, Any]] = None,
+        akamai_h2: Optional[str] = None,
+        http1_only: bool = False,
+        http2_only: bool = False,
+        http3: bool = False,
+        http3_only: bool = False,
+        auto_upgrade_h3: bool = True,
+        ech: bool = False,
+        ech_doh_url: str = "https://cloudflare-dns.com/dns-query",
+        doh: bool = False,
+        doh_url: Optional[str] = None,
+        resolve: Optional[Dict[str, Union[str, Sequence[str]]]] = None,
+        local_address: Optional[str] = None,
+        interface: Optional[str] = None,
+        tls_info: bool = False,
+        keylog_file: Optional[str] = None,
+        system_dns: bool = False,
+        record_har: bool = False,
+        flare_solverr_url: Optional[str] = None,
+        solver: Optional[Callable[[str, Response], Any]] = None,
+        storage_state: Optional[Union[str, Dict[str, Any]]] = None,
+        pool_max_idle_per_host: Optional[int] = None,
+        pool_idle_timeout: Optional[float] = None,
+        limits: Optional[Limits] = None,
+        tcp_nodelay: Optional[bool] = None,
+        tcp_keepalive: Optional[float] = None,
+        auto_referer: bool = False,
+        fetch_mode: Optional[str] = None,
+        transport: Optional[MockTransport] = None,
+        retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_statuses: Sequence[int] = (429, 500, 502, 503, 504),
+        retry_on_challenge: bool = False,
+        rotate_impersonate: bool = False,
+        event_hooks: Optional[Dict[str, List[Callable[..., Any]]]] = None,
+        engine: str = "auto",
+        **kwargs: Any,
+    ) -> None: ...
     @property
     def is_closed(self) -> bool: ...
     def clear_cookies(self) -> None: ...
@@ -536,7 +742,33 @@ class AsyncSession:
     def export_har(self, path: Optional[str] = None) -> Dict[str, Any]: ...
     def clear_har(self) -> None: ...
     async def solve_challenge(self, url_or_resp: Union[str, Response]) -> bool: ...
-    async def request(self, method: str, url: str, **kwargs: Any) -> Response: ...
+    async def request(
+        self,
+        method: str,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        cookies: Optional[Dict[str, str]] = None,
+        data: Optional[Union[bytes, str, Dict[str, Any]]] = None,
+        json: Optional[Any] = None,
+        files: Any = None,
+        timeout: Union[float, int, Tuple[Optional[float], Optional[float]], TimeoutConfig, None] = None,
+        verify: Optional[Union[bool, str]] = None,
+        proxies: Optional[Dict[str, str]] = None,
+        proxy: Optional[str] = None,
+        allow_redirects: Optional[bool] = None,
+        follow_redirects: Optional[bool] = None,
+        auth: Optional[Union[Tuple[str, str], AuthBase]] = None,
+        header_order: Optional[Sequence[str]] = None,
+        impersonate: Optional[str] = None,
+        local_address: Optional[str] = None,
+        fetch_mode: Optional[str] = None,
+        http3: Optional[bool] = None,
+        ech: Optional[bool] = None,
+        ech_config_list: Optional[bytes] = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> Response: ...
     def stream(self, method: str, url: str, **kwargs: Any) -> AsyncContextManager[Response]: ...
     async def ws_connect(
         self,

@@ -891,3 +891,284 @@ def test_http3_true_chunked_streaming_sync_and_async():
                 assert b"google" in abody.lower()
 
     asyncio.run(_run_async())
+
+
+def test_real_ech_over_tcp_http2_crypto_cloudflare():
+    """Live test: Real ECH on H2-only domain (crypto.cloudflare.com) via pure BoringSSL TCP HTTP/2 + auto H3->H2 ECH fallback."""
+    # 1. Explicit http2_only=True + ech=True -> TCP BoringSSL HTTP/2 Real ECH
+    with Session(impersonate="chrome_149", http2_only=True, ech=True, timeout=15) as s_h2:
+        r = s_h2.get("https://crypto.cloudflare.com/cdn-cgi/trace")
+        assert r.status_code == 200
+        assert r.http_version == "HTTP/2"
+        assert r.ech_accepted is True
+        assert "sni=encrypted" in r.text
+        assert "kex=X25519MLKEM768" in r.text
+
+    # 2. Default Session(ech=True) tries H3 first, sees crypto.cloudflare.com rejects H3, auto-falls back to TCP HTTP/2 Real ECH
+    with Session(impersonate="chrome_149", ech=True, timeout=15) as s_auto:
+        r2 = s_auto.get("https://crypto.cloudflare.com/cdn-cgi/trace")
+        assert r2.status_code == 200
+        assert r2.http_version == "HTTP/2"
+        assert r2.ech_accepted is True
+        assert "sni=encrypted" in r2.text
+
+        # 3. True streaming on TCP HTTP/2 Real ECH
+        with s_auto.stream("GET", "https://crypto.cloudflare.com/cdn-cgi/trace") as rs:
+            assert rs.status_code == 200
+            assert rs.http_version == "HTTP/2"
+            assert rs.ech_accepted is True
+            body = b"".join(rs.iter_bytes())
+            assert b"sni=encrypted" in body
+
+    # 4. Non-ECH domain with http2_only=True, ech=True falls back cleanly to full wreq H2 without hijacking
+    with Session(impersonate="chrome_149", http2_only=True, ech=True, timeout=15) as s_plain:
+        rp = s_plain.get("https://www.google.com/")
+        assert rp.status_code == 200
+        assert rp.http_version == "HTTP/2"
+        assert rp.ech_accepted is False
+
+
+def test_session_wide_doh_resolver_http2_and_http3():
+    """Live test: Session-wide DNS-over-HTTPS (doh=True / doh_url=...) across TCP HTTP/2, HTTP/3, and Real ECH."""
+    with Session(impersonate="chrome_149", doh=True, http2_only=True, timeout=15) as s_cf:
+        r1 = s_cf.get("https://www.cloudflare.com/cdn-cgi/trace")
+        assert r1.status_code == 200
+        assert r1.http_version == "HTTP/2"
+        assert "tls=TLSv1.3" in r1.text
+
+    with Session(
+        impersonate="chrome_149",
+        doh_url="https://dns.google/resolve",
+        http3=True,
+        http3_only=True,
+        ech=True,
+        timeout=15,
+    ) as s_goog:
+        r2 = s_goog.get("https://cloudflare-ech.com/cdn-cgi/trace")
+        assert r2.status_code == 200
+        assert r2.http_version == "HTTP/3"
+        assert r2.ech_accepted is True
+        assert "sni=encrypted" in r2.text
+
+
+def test_quic_tls13_session_ticket_resumption_and_per_browser_h3():
+    """Live test: QUIC TLS 1.3 NewSessionTicket capture & session resumption (tls_resumed=True) + Chrome/Firefox/Safari H3."""
+    import time
+
+    with Session(impersonate="chrome_149", http3=True, http3_only=True, timeout=15) as s:
+        r1 = s.get("https://www.cloudflare.com/cdn-cgi/trace")
+        assert r1.status_code == 200
+        assert r1.http_version == "HTTP/3"
+        assert r1.tls_resumed is False
+
+        # Allow post-handshake QUIC CRYPTO NewSessionTicket frame to arrive and populate ticket_cache
+        for _ in range(20):
+            if s._session.h3_ticket_cache_len() >= 1:
+                break
+            time.sleep(0.05)
+        assert s._session.h3_ticket_cache_len() >= 1, "Expected BoringSSL quic_new_session_cb to cache TLS 1.3 ticket"
+
+        # Close open QUIC socket while retaining cached ticket -> reconnect must resume TLS 1.3 session
+        s._session.clear_h3_pool()
+        assert s._session.h3_pool_len() == 0
+
+        r2 = s.get("https://www.cloudflare.com/cdn-cgi/trace")
+        assert r2.status_code == 200
+        assert r2.http_version == "HTTP/3"
+        assert r2.tls_resumed is True
+
+        # Hot-swapping impersonate must invalidate cached TLS tickets so profiles never mix
+        s.set_impersonate("firefox_151")
+        assert s._session.h3_ticket_cache_len() == 0
+
+    # Per-browser QUIC transport parameters (Firefox & Safari presets over Pure BoringSSL HTTP/3)
+    for preset in ("firefox_151", "safari_26_4"):
+        with Session(impersonate=preset, http3=True, http3_only=True, timeout=15) as sb:
+            rb = sb.get("https://www.cloudflare.com/cdn-cgi/trace")
+            assert rb.status_code == 200
+            assert rb.http_version == "HTTP/3"
+            assert "http=http/3" in rb.text
+
+
+def test_http3_multipart_file_upload():
+    """Live test: multipart files= upload stays natively on UDP QUIC HTTP/3 and echoes RFC 7578 body."""
+    with Session(impersonate="chrome_149", http3=True, http3_only=True, timeout=15) as s:
+        r = s.post(
+            "https://echo.zuplo.io/",
+            data={"meta": "v1.1"},
+            files={"sample": ("hello.txt", b"http3-multipart-body", "text/plain")},
+        )
+        assert r.status_code == 200
+        assert r.http_version == "HTTP/3"
+        payload = r.json()
+        assert payload["method"] == "POST"
+        assert "multipart/form-data; boundary=" in payload["headers"].get("content-type", "")
+        assert "http3-multipart-body" in payload["body"]
+        assert 'name="sample"; filename="hello.txt"' in payload["body"]
+        assert "v1.1" in payload["body"]
+
+
+def test_rust_extraction_css_xpath_json_regex_and_threads():
+    """Verify 100% pure Rust HTML5 CSS3, XPath 1.0, JSON Path, DFA Regex, between, and cross-thread safety."""
+    from concurrent.futures import ThreadPoolExecutor
+    from http_tls import Element, HtmlDocument, Response
+
+    sample_html = """<!doctype html>
+    <html>
+      <head><title>  Shop Catalog  </title></head>
+      <body>
+        <main id="app" data-env="prod">
+          <div class="card featured" data-id="101">
+            <h2 class="title">Alpha Widget</h2>
+            <span class="price">$19.99</span>
+            <a class="buy" href="/item/101">Buy Now</a>
+            <p class="note">Unclosed tag test
+          </div>
+          <div class="card" data-id="102">
+            <h2 class="title">Beta Gadget</h2>
+            <span class="price">$42.50</span>
+            <a class="buy" href="/item/102">Order</a>
+          </div>
+          <div class="card sold-out" data-id="103">
+            <h2 class="title">Gamma Tool</h2>
+            <span class="price">$99.00</span>
+            <a class="buy" href="/item/103">Notify</a>
+          </div>
+          <script>window.__TOKEN__ = "tok_9f8e7d6c"; window.__IDS__ = [101, 102, 103];</script>
+        </main>
+      </body>
+    </html>"""
+
+    r = Response(status_code=200, headers={"Content-Type": "text/html"}, url="https://shop.example/", text=sample_html)
+
+    # 1. CSS3 selectors + :has() + :contains() + Scrapy ::text / ::attr(...)
+    assert isinstance(r.html_doc, HtmlDocument)
+    assert r.css_first("title::text") == "  Shop Catalog  "
+    assert r.css("div.card a.buy::attr(href)") == ["/item/101", "/item/102", "/item/103"]
+    assert r.css("div.card:not(.sold-out) .title::text") == ["Alpha Widget", "Beta Gadget"]
+    assert r.css("div.card:has(span.price:contains('$42.50')) a::attr(href)") == ["/item/102"]
+
+    first_card = r.css_first("div.card.featured")
+    assert isinstance(first_card, Element)
+    assert first_card.tag == "div"
+    assert first_card["data-id"] == "101"
+    assert first_card.attrib["data-id"] == "101"
+    assert "data-id" in first_card
+    assert first_card.attr("missing", "fallback") == "fallback"
+    assert first_card.attrs["data-id"] == "101"
+    assert first_card.css_first(".price::text") == "$19.99"
+    assert first_card.select_one(".missing::text", default="N/A") == "N/A"
+    assert first_card.xpath_first(".//a/@href") == "/item/101"
+    assert first_card.xpath(".//div") == []  # XPath 1.0: .//div = descendant::div (never includes self)
+    assert first_card.find(".title::text") == "Alpha Widget"
+    assert first_card.find(".//span[@class='price']/text()") == "$19.99"
+
+    # 1b. Community-standard DOM navigation & text extraction (selectolax / BeautifulSoup / Scrapy idioms)
+    assert first_card.parent is not None and first_card.parent["id"] == "app"
+    assert [c.tag for c in first_card.children] == ["h2", "span", "a", "p"]
+    assert first_card.next_sibling is not None and first_card.next_sibling["data-id"] == "102"
+    assert first_card.next_sibling.prev_sibling is not None and first_card.next_sibling.prev_sibling["data-id"] == "101"
+    assert [a.tag for a in first_card.ancestors][:2] == ["main", "body"]
+    assert "Alpha Widget" in first_card.get_text(" | ")
+    assert r.select_one("title::text") == "  Shop Catalog  "
+    assert r.select("div.card a.buy::attr(href)") == ["/item/101", "/item/102", "/item/103"]
+    assert r.urljoin("/item/101") == "https://shop.example/item/101"
+    assert r.find(".does-not-exist", default="fallback") == "fallback"
+    own_doc = HtmlDocument('<div id="p">Giá gốc <span>500k</span> <b>300k</b></div>')
+    own_el = own_doc.select_one("#p")
+    assert isinstance(own_el, Element)
+    assert own_el.own_text.strip() == "Giá gốc"
+    assert own_el.get_text(" ", strip=True) == "Giá gốc 500k 300k"
+
+    # 2. Native Rust XPath 1.0: axes, predicates, contains, starts-with, normalize-space, and/or/not, [1]/[last()], |
+    title_txt = r.xpath_first("//title/text()")
+    assert isinstance(title_txt, str) and title_txt.strip() == "Shop Catalog"
+    assert r.xpath("//div[@class='card']//h2/text()") == ["Beta Gadget"]
+    assert r.xpath("//div[contains(@class, 'card') and not(contains(@class, 'sold-out'))]/@data-id") == ["101", "102"]
+    assert r.xpath("//a[starts-with(@href, '/item/10')]/@href") == ["/item/101", "/item/102", "/item/103"]
+    assert r.xpath("//h2[normalize-space(.)='Gamma Tool']/following-sibling::span[1]/text()") == ["$99.00"]
+    assert r.xpath("//a[@href='/item/102']/preceding-sibling::h2[1]/text()") == ["Beta Gadget"]
+    assert r.xpath("//a[@href='/item/101']/parent::div/@data-id") == ["101"]
+    assert r.xpath("//a[@href='/item/101']/ancestor::main/@data-env") == ["prod"]
+    assert r.xpath("(//div[contains(@class, 'card')])[1]/@data-id") == ["101"]
+    assert r.xpath("(//div[contains(@class, 'card')])[last()]/@data-id") == ["103"]
+    assert r.xpath("//title/text() | //main/@data-env") == ["  Shop Catalog  ", "prod"]
+    # XPath following:: / preceding:: axes & substring-before / substring-after
+    assert r.xpath_first("//h2[normalize-space(.)='Alpha Widget']/following::h2[1]/text()") == "Beta Gadget"
+    assert r.xpath_first("//h2[normalize-space(.)='Gamma Tool']/preceding::h2[1]/text()") == "Beta Gadget"
+    assert r.xpath("//a[substring-after(@href, '/item/')='102']/text()") == ["Order"]
+    assert r.xpath("//span[substring-before(., '.')='$42']/text()") == ["$42.50"]
+
+    # 3. Unified find() / find_all() routing (ensure CSS ::text / ::attr() do NOT misroute to XPath)
+    assert r.find("div.card.featured .price::text") == "$19.99"
+    assert r.find("a.buy::attr(href)") == "/item/101"
+    assert r.find_all("a.buy::attr(href)") == ["/item/101", "/item/102", "/item/103"]
+    assert r.find("//div[@data-id='102']/a/@href") == "/item/102"
+    assert r.find_all("//div[contains(@class, 'card')]/@data-id") == ["101", "102", "103"]
+    assert r.html_doc.find("div.card.featured .title::text") == "Alpha Widget"
+
+    # 4. Rust linear-time DFA regex & between / between_all
+    assert r.re_first(r'__TOKEN__\s*=\s*"([^"]+)"') == "tok_9f8e7d6c"
+    assert r.re_first(r"NO_MATCH", default="none") == "none"
+    assert r.re(r"\$(\d+\.\d{2})") == ["19.99", "42.50", "99.00"]
+    assert r.between('window.__TOKEN__ = "', '"') == "tok_9f8e7d6c"
+    assert r.between("NO_LEFT", "NO_RIGHT", default="def") == "def"
+    assert r.between_all('href="', '"') == ["/item/101", "/item/102", "/item/103"]
+    assert first_card.between("$", " ") is None or isinstance(first_card.between("$", "\n"), (str, type(None)))
+    assert first_card.re_first(r"\$(\d+\.\d{2})") == "19.99"
+
+    # 5. Rust serde_json json_path (dot, negative index, slice, wildcard, recursive $..key) + find("$. ...")
+    rj = Response(
+        status_code=200,
+        headers={"Content-Type": "application/json"},
+        url="https://api.example/v1/items",
+        text='{"meta":{"ok":true,"count":3,"nested":{"price":9}},"items":[{"id":1,"name":"a","price":10},{"id":2,"name":"b","price":20},{"id":3,"name":"c","price":30}]}',
+    )
+    assert rj.json_path("meta.ok") is True
+    assert rj.json_path("$.items[0].name") == "a"
+    assert rj.json_path("items[-1].id") == 3
+    assert rj.json_path("items[0:2].name") == ["a", "b"]
+    assert rj.json_path("items[-2:].id") == [2, 3]
+    assert rj.json_path("items[*].name") == ["a", "b", "c"]
+    assert sorted(rj.json_path("$..price")) == [9, 10, 20, 30]
+    assert sorted(rj.find_all("$..price")) == [9, 10, 20, 30]
+    assert rj.json_path("items[99].id", default="nope") == "nope"
+    assert rj.json_path('meta["ok"]') is True
+    assert rj.find("$.items[-1].name") == "c"
+    assert rj.find_all("$.items[*].id") == [1, 2, 3]
+
+    # 6. Invalid queries raise ValueError cleanly (never panic)
+    with pytest.raises(ValueError):
+        r.css("div>>>span")
+    with pytest.raises(ValueError):
+        r.xpath("//div[unclosed")
+    with pytest.raises(ValueError):
+        r.re("[invalid(regex")
+    with pytest.raises(ValueError):
+        rj.json_path("items[0")
+    with pytest.raises(ValueError):
+        r.json_path("meta.ok")
+
+    # 7. Cross-thread safety: parse on worker thread, read & drop on main + other worker threads
+    def worker_extract(resp_obj: Response) -> tuple[object, object]:
+        return (
+            resp_obj.css_first("div.card.featured .title::text"),
+            resp_obj.xpath_first("//div[@data-id='103']/span/text()"),
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(worker_extract, r) for _ in range(12)]
+        for fut in futs:
+            assert fut.result() == ("Alpha Widget", "$99.00")
+
+
+def test_live_html_extraction():
+    """Live test: fetch real HTML over BoringSSL and extract <title>, <p>, & attrs via pure Rust CSS3/XPath."""
+    with Session(impersonate="chrome_149", timeout=15) as s:
+        r = s.get("https://example.com/")
+        assert r.status_code == 200
+        assert r.css_first("title::text") == "Example Domain"
+        assert r.xpath_first("//title/text()") == "Example Domain"
+        p_txt = r.find("//p/text()")
+        assert isinstance(p_txt, str) and "documentation" in p_txt.lower()
+        assert r.find("html::attr(lang)") == "en"
