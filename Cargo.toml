@@ -1,16 +1,20 @@
 [package]
 name = "http_tls"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Rust native BoringSSL TLS & HTTP/2 browser-impersonating core for http_tls"
 license = "MIT"
 
 [lib]
 name = "_core"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+pyo3 = { version = "0.23", features = ["abi3-py38"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time", "net", "io-util"] }
 wreq = { version = "0.16.4", features = [

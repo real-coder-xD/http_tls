@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "http-tls"
-version = "1.1.0"
+version = "1.2.0"
 description = "Standalone Rust + Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 (Real ECH, DoH, SOCKS5 UDP) HTTP Client & HTML5 CSS3/XPath/JSON Extraction Engine for Python"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -69,10 +69,14 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+http-tls = "http_tls.cli:main"
+
 [project.optional-dependencies]
 curl_cffi = ["curl_cffi>=0.17"]
 impersonate = []
 test = ["pytest>=8.0", "cryptography>=42.0", "certifi"]
+docs = ["mkdocs-material>=9.5"]
 
 [project.urls]
 Homepage = "https://github.com/real-coder-xD/http_tls"

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import sys
-from http_tls import auth, challenge, exceptions, requests, solvers, status_codes, structures
+from http_tls import auth, challenge, exceptions, models, requests, solvers, status_codes, structures
 from http_tls.auth import AuthBase, BasicAuth, BearerAuth, DigestAuth
 from http_tls.solvers import (
     BestDriverSolver,
@@ -43,6 +43,7 @@ from http_tls.requests import (
     Cookies,
     Element,
     HtmlDocument,
+    JsonDocument,
     Limits,
     MockTransport,
     Response,
@@ -72,11 +73,12 @@ from http_tls.structures import CaseInsensitiveDict
 try:
     from http_tls._core import __version__
 except ImportError:
-    __version__ = "1.0.1"
+    __version__ = "1.2.0"
 
 sys.modules["http_tls.requests"] = requests
 
 __all__ = [
+    "models",
     "requests",
     "auth",
     "challenge",
@@ -112,6 +114,7 @@ __all__ = [
     "Cookies",
     "Element",
     "HtmlDocument",
+    "JsonDocument",
     "BrowserType",
     "STABLE_PRESETS",
     "TimeoutConfig",

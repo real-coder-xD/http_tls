@@ -186,11 +186,12 @@ Reproduce locally with `python benchmarks/bench_extraction.py` (105.7 KB HTML / 
 | Workload | `http_tls` (Pure Rust) | Baseline | Result |
 | :--- | ---: | ---: | :--- |
 | Full HTML5 parse + CSS3 (`500 hrefs`) | **2.87 ms** | `BeautifulSoup (html.parser)`: 60.23 ms | **21.0x faster** |
-| Cached DOM CSS3 (`:not(.sold-out) a::attr(href)`) | **0.094 ms** | `BeautifulSoup .select()`: 6.90 ms | **73.6x faster** |
-| Cached DOM XPath 1.0 (`contains` + `not` + `/@attr`) | **1.05 ms** | — | Zero `lxml` / C deps |
-| Delimiter slicing `between_all()` (`500 hrefs`) | **0.062 ms** | Python `re.compile().findall()`: 0.078 ms | **1.26x faster** |
-| Cached Rust DFA `re()` (`500 matches`, ReDoS-safe) | **0.108 ms** | Python `re.compile().findall()`: 0.078 ms | Linear-time DFA guarantee |
-| Recursive JSON Path `$..price` (`501 matches`) | **0.312 ms** | `json.loads()` + listcomp: 0.282 ms | Native `serde_json` speed |
+| Cached DOM CSS3 (`:not(.sold-out) a::attr(href)`) | **0.093 ms** | `BeautifulSoup .select()`: 7.05 ms | **75.6x faster** |
+| Cached DOM XPath 1.0 (`contains` + `not` + `/@attr`) | **1.08 ms** | — | Zero `lxml` / C deps |
+| Delimiter slicing `between_all()` (`500 hrefs`) | **0.064 ms** | Python `re.compile().findall()`: 0.079 ms | **1.23x faster** |
+| Cached Rust DFA `re()` (`500 matches`, ReDoS-safe) | **0.110 ms** | Python `re.compile().findall()`: 0.079 ms | Linear-time DFA guarantee |
+| Cached JSON Path `items[*].price` / `$..price` | **0.017 ms** / **0.028 ms** | `json.loads()` + listcomp: 0.283 ms | **10.1x–16.6x faster** |
+| JSON Path Filter `items[?(@.price>50)].id` | **0.248 ms** | — | Full filter predicates in Rust |
 
 ---
 
@@ -314,7 +315,7 @@ Every `Response` ships with a **100% Pure Rust** extraction engine compiled dire
 
 - `◈` **WHATWG HTML5 + CSS3 (`dom_query` / `html5ever`)**: Tolerates broken/unclosed real-world HTML just like Chrome/Firefox, supports `:has()`, `:not()`, `:contains()`, `:has-text()`, Scrapy-style `::text` & `::attr(name)`, BeautifulSoup aliases (`select()`, `select_one()`, `get_text()`), `selectolax`-style `own_text` & DOM navigation (`parent`, `children`, `next_sibling`, `prev_sibling`, `ancestors`), and Scrapy `urljoin()` + `attrib` + `default=` fallbacks.
 - `◈` **Native Rust XPath 1.0**: Walks the Rust HTML5 DOM tree directly without re-parsing — supports `//`, `/`, `.`, `..`, `*`, `|`, parenthesized groups `(//div[...])[1]/@attr`, all core axes (`child::`, `descendant::`, `parent::`, `ancestor::`, `following-sibling::`, `preceding-sibling::`, `following::`, `preceding::`, `self::`, `attribute::`), and predicates (`and`/`or`/`not`, `contains()`, `starts-with()`, `ends-with()`, `normalize-space()`, `string-length()`, `count()`, `substring-before()`, `substring-after()`, `[1]`, `[last()]`, `[position()=n]`, `/text()`, `/@attr`).
-- `◈` **Structured JSON Path (`serde_json`)**: Extract nested keys, quoted keys (`meta["content-type"]`), negative indices (`items[-1].id`), array slices (`items[0:5]`), wildcards (`items[*].name`), and **recursive descent (`$..price`)** across deeply nested SPA / GraphQL / `__NEXT_DATA__` payloads.
+- `◈` **Structured JSON Path (`serde_json` + cached `JsonDocument`)**: Extract nested keys, quoted keys (`meta["content-type"]`), negative indices (`items[-1].id`), array slices (`items[0:5]`), wildcards (`items[*].name`), **filter predicates (`items[?(@.price > 15 && @.in_stock == true)].name`)**, and **recursive descent (`$..price`)** across deeply nested SPA / GraphQL / `__NEXT_DATA__` payloads — lazily parsed once per `Response` (`0.017 ms` repeated query).
 - `◈` **ReDoS-Safe Linear-Time DFA Regex & Delimiter Slicing (`regex`)**: `resp.re()`, `resp.re_first()`, `resp.between()`, and `resp.between_all()` run inside Rust with guaranteed linear-time execution (immune to catastrophic backtracking).
 - `◈` **Lazy & Thread-Safe DOM Caching**: The HTML5 DOM is parsed only on the first `css`/`xpath`/`find` call and cached inside an `Arc<Mutex<...>>` so a `Response`, `HtmlDocument`, or `Element` can safely cross `ThreadPoolExecutor` or `asyncio.to_thread` boundaries.
 
@@ -670,9 +671,18 @@ with http_tls.Client(event_hooks={"request": [sign_request], "response": [log_re
 
 ---
 
-## Traffic Inspection: Wireshark KeyLog & HAR 1.2 Export
+## Traffic Inspection: Wireshark KeyLog, HAR 1.2 Export & Built-in CLI
 
-Inspect TLS-encrypted HTTP/2 frames in Wireshark or replay full request/response waterfalls in Chrome DevTools:
+Inspect TLS-encrypted HTTP/2 & HTTP/3 frames in Wireshark, replay waterfalls in Chrome DevTools, or test fingerprints/ECH/DoH/CSS/XPath/JSON directly from your terminal via the built-in CLI (`http-tls` / `python -m http_tls`):
+
+```bash
+# Test HTTP/3 + Real ECH + DoH from terminal
+http-tls https://cloudflare-ech.com/cdn-cgi/trace --http3 --ech --doh --info
+
+# Query JA4 or HTML selectors in one command
+http-tls https://tls.peet.ws/api/all -i safari_26_4 --find "$.tls.ja4"
+http-tls https://example.com --find "title::text"
+```
 
 ```python
 import http_tls
@@ -747,13 +757,19 @@ Every preset returned by `http_tls.supported_presets()` is a **verified native B
 
 | File | Responsibility |
 | :--- | :--- |
-| `src/lib.rs` | PyO3 module: `NativeSession`, sync/async request paths, incremental H2 + H3 streaming, `gather()` scheduler, `H3Pool`, WebSocket bridge, TLS/H2 option builders, DNS overrides, KeyLog wiring. |
+| `src/lib.rs` | PyO3 module: `NativeSession`, H1/H2 request paths, `gather()` scheduler, error normalization, KeyLog wiring, Rust unit tests. |
+| `src/h3_transport.rs` | Pure BoringSSL UDP QUIC HTTP/3 transport: `H3Pool`, `H3StreamDecoder`, `execute_h3_request`, `execute_h3_stream`, decompression, redirects. |
+| `src/presets.rs` | 100+ verified browser emulation presets, Chromium `GetUserAgentBrandList` GREASE permutation, H3 default headers, `supported_presets`, `is_verified_preset`. |
+| `src/options.rs` | Custom BoringSSL `tls_options`, `http2_options`, `OrigHeaderMap`, and DNS `resolve` parsers. |
+| `src/ws.rs` | TLS-impersonated sync & native Tokio async `NativeWebSocket` bridge. |
 | `src/quic_boring.rs` | Pure BoringSSL (`btls-sys`) `quinn_proto::crypto` provider: `SSL_CTX_set_quic_method`, Chromium/Firefox/Safari QUIC Initial `ClientHello` (`X25519MLKEM768`, GREASE, ALPS `h3`, Real ECH, Brotli/Zlib/Zstd cert compression), TLS 1.3 ticket resumption, RFC 9001 AEAD/HP. |
 | `src/tcp_ech.rs` | Pure BoringSSL TCP HTTP/2 Real ECH transport (`btls` + `tokio-btls` + `http2`) with `SSL_set1_ech_config_list`, auto retry-config handling, TLS 1.3 ticket capture, SOCKS5 TCP CONNECT, and incremental H2 streaming. |
 | `src/doh.rs` | Session-wide DNS-over-HTTPS (`wreq::dns::Resolve`) with concurrent dual-stack `A`+`AAAA` lookups and bounded TTL caching across H1, H2, and H3. |
 | `src/socks5_udp.rs` | RFC 1928 / RFC 1929 SOCKS5 `UDP ASSOCIATE` socket (`quinn::AsyncUdpSocket`) with source relay verification for tunneling HTTP/3 over SOCKS5 proxies. |
-| `src/extract.rs` | 100% Pure Rust extraction engine: `dom_query` (`html5ever`) CSS3 + `::text`/`::attr()`, native XPath 1.0 evaluator, `serde_json` JSON Path, linear-time DFA `regex`, and thread-safe `HtmlDocument` / `Element` PyO3 classes. |
-| `python/http_tls/requests.py` | Public API: `Session`, `AsyncSession`, `Client`, `AsyncClient`, `Response` (incl. `css`, `xpath`, `find`, `re`, `between`, `json_path`), `Cookies`, retries, proxy pool, HAR recorder, `storage_state`, solver bridge, `event_hooks`. |
+| `src/extract.rs` | 100% Pure Rust extraction engine: `dom_query` (`html5ever`) CSS3 + `::text`/`::attr()`, native XPath 1.0 evaluator, `serde_json` `JsonDocument` + filter predicates, cached linear-time DFA `regex`, and thread-safe `HtmlDocument` / `Element` PyO3 classes. |
+| `python/http_tls/models.py` | Core data models: `Response` (incl. `css`, `select`, `xpath`, `find`, `re`, `between_all`, `json_path`, `json_doc`), `Cookies`, `BrowserType`, `TimeoutConfig`, `Limits`, `MockTransport`, `WebSocket`, `AsyncWebSocket`. |
+| `python/http_tls/requests.py` | `Session`, `AsyncSession`, `Client`, `AsyncClient`, retries, proxy pool, HAR recorder, `storage_state`, solver bridge, `event_hooks`, and top-level helpers (`get`/`post`/`stream`/`gather`). |
+| `python/http_tls/cli.py` | Zero-dependency CLI debugger (`http-tls` / `python -m http_tls`) for testing fingerprints, HTTP/3, ECH, DoH, and CSS/XPath/JSON selectors directly from the terminal. |
 | `python/http_tls/auth.py` | `AuthBase`, `BasicAuth`, `BearerAuth`, RFC 7616 `DigestAuth` (sync & async). |
 | `python/http_tls/challenge.py` | Interstitial detector for Cloudflare, DDoS-Guard, DataDome, PerimeterX, Imperva, Sucuri, Vercel, Akamai. |
 | `python/http_tls/solvers.py` | Optional browser challenge solver bridges (`BestDriverSolver`, `PlaywrightSolver`, `FlareSolverrSolver`). |
@@ -839,7 +855,7 @@ Pass `keylog_file="sslkeys.log"` to `Session(...)` (or set the `SSLKEYLOGFILE` e
 
 ## Testing & Development
 
-Run the full pytest suite (46 integration, fingerprint, ECH H2/H3, DoH, SOCKS5 UDP, pure Rust extraction, solver-alignment, singleflight, RFC 6265 cookie-isolation, production-readiness, and soak tests):
+Run the full pytest suite (47 integration, fingerprint, ECH H2/H3, DoH, SOCKS5 UDP, pure Rust extraction, CLI, solver-alignment, singleflight, RFC 6265 cookie-isolation, production-readiness, and soak tests) and native Rust unit tests (`cargo test --no-default-features --lib`):
 
 ```bash
 pip install -e ".[test]"

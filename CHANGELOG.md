@@ -2,6 +2,15 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [1.2.0] - 2026-11-24
+
+### Modular Rust/Python Architecture, Cached `JsonDocument` + Filter Predicates, Native CLI & MkDocs Site
+- **Cached `JsonDocument` & JSON Path Filter Predicates (`src/extract.rs`):** Added lazy `Response.json_doc` caching (`serde_json::Value` inside `Arc<Value>`, speeding up repeated `json_path` queries 11x–18x down to `0.017 ms` for `items[*].price` and `0.028 ms` for `$..price`) plus full JSON Path filter predicates (`items[?(@.price > 15 && @.in_stock == true)].name`, `||`, `!@.flag`, `==`/`!=`/`<`/`<=`/`>`/`>=`).
+- **Modular Rust & Python Codebase:** Split `src/lib.rs` in half (`4,147 -> 2,088` lines) into focused modules (`src/h3_transport.rs`, `src/presets.rs`, `src/options.rs`, `src/ws.rs`) and split `python/http_tls/requests.py` into `python/http_tls/models.py` + `requests.py` with 100% backwards-compatible re-exports.
+- **Native Rust Unit Tests & Clean FFI Errors:** Added `#[cfg(test)]` Rust unit tests (`cargo test --no-default-features --lib` via optional `extension-module` feature) and deduplicated chained `hyper`/`wreq` error wrapper strings in `error_chain()`.
+- **Built-in CLI Debugger (`http-tls` / `python -m http_tls`):** Added zero-dependency terminal CLI (`python/http_tls/cli.py`) supporting `--impersonate`, `--http3`, `--ech`, `--doh`, `--proxy`, `--info`, `--presets`, `--find`, `--find-all`, `--css`, `--xpath`, `--json-path`, and `--re`.
+- **Multi-Page Documentation Site (`mkdocs.yml` + `docs/`):** Added MkDocs Material multi-page documentation ready for GitHub Pages.
+
 ## [1.1.0] - 2026-11-24
 
 ### 100% Pure Rust Extraction Engine, TCP HTTP/2 Real ECH, Session-Wide DoH & QUIC TLS 1.3 Resumption

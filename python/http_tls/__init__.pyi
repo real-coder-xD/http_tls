@@ -356,6 +356,16 @@ class HtmlDocument:
         """Auto-dispatch all matches: XPath (`/...`, `.//...`, XPath axes) or CSS3 (incl. `::text`/`::attr()`)."""
         ...
 
+class JsonDocument:
+    """Thread-safe Rust `serde_json::Value` document cached for repeated fast `json_path` queries."""
+    def __init__(self, text: str) -> None: ...
+    def query(self, path: str) -> Tuple[bool, Any]:
+        """Evaluate a JSON path expression and return `(found, value)`."""
+        ...
+    def get(self, path: str, default: Any = None) -> Any:
+        """Evaluate a JSON path expression and return the matched value or `default`."""
+        ...
+
 class Response:
     status_code: int
     headers: CaseInsensitiveDict
@@ -478,8 +488,12 @@ class Response:
     def between_all(self, left: str, right: str) -> List[str]:
         """Extract all substrings between `left` and `right` delimiters from `self.text` in Rust."""
         ...
+    @property
+    def json_doc(self) -> JsonDocument:
+        """Lazily parsed Rust `JsonDocument` (`serde_json::Value`) cached on this response."""
+        ...
     def json_path(self, path: str, default: Any = None) -> Any:
-        """Extract a nested value from JSON in Rust (`a.b[0].c`, `items[-1].id`, `items[0:5]`, `items[*].name`, `$..price`)."""
+        """Extract a nested value from JSON in Rust (`a.b[0].c`, `items[-1].id`, `items[0:5]`, `items[*].name`, `items[?(@.price>10)].name`, `$..price`)."""
         ...
     def raise_for_status(self) -> None: ...
     def iter_content(self, chunk_size: Optional[int] = 1, decode_unicode: bool = False) -> Iterator[Any]: ...

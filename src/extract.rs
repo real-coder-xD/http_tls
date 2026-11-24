@@ -1353,6 +1353,7 @@ enum JsonToken {
     RecursiveKey(String),
     Index(isize),
     Slice(Option<isize>, Option<isize>),
+    Filter(String),
     Wildcard,
 }
 
@@ -1372,6 +1373,7 @@ fn parse_json_path(path: &str) -> Result<Vec<JsonToken>, String> {
                     i += 1;
                     let start = i;
                     let mut quote: Option<u8> = None;
+                    let mut depth = 1i32;
                     while i < bytes.len() {
                         let b = bytes[i];
                         if let Some(q) = quote {
@@ -1380,8 +1382,13 @@ fn parse_json_path(path: &str) -> Result<Vec<JsonToken>, String> {
                             }
                         } else if b == b'\'' || b == b'"' {
                             quote = Some(b);
+                        } else if b == b'[' {
+                            depth += 1;
                         } else if b == b']' {
-                            break;
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
                         }
                         i += 1;
                     }
@@ -1411,6 +1418,7 @@ fn parse_json_path(path: &str) -> Result<Vec<JsonToken>, String> {
             i += 1;
             let start = i;
             let mut quote: Option<u8> = None;
+            let mut depth = 1i32;
             while i < bytes.len() {
                 let b = bytes[i];
                 if let Some(q) = quote {
@@ -1419,8 +1427,13 @@ fn parse_json_path(path: &str) -> Result<Vec<JsonToken>, String> {
                     }
                 } else if b == b'\'' || b == b'"' {
                     quote = Some(b);
+                } else if b == b'[' {
+                    depth += 1;
                 } else if b == b']' {
-                    break;
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
                 }
                 i += 1;
             }
@@ -1431,6 +1444,12 @@ fn parse_json_path(path: &str) -> Result<Vec<JsonToken>, String> {
             i += 1; // consume ']'
             if inner == "*" {
                 tokens.push(JsonToken::Wildcard);
+            } else if let Some(filter_body) = inner.strip_prefix('?') {
+                let trimmed_f = filter_body.trim();
+                if trimmed_f.is_empty() {
+                    return Err(format!("Empty filter expression in json_path '{path}'"));
+                }
+                tokens.push(JsonToken::Filter(trimmed_f.to_string()));
             } else if let Some(unq) = unquote_literal(inner) {
                 tokens.push(JsonToken::Key(unq));
             } else if let Some((a, b)) = inner.split_once(':') {
@@ -1472,6 +1491,163 @@ fn parse_json_path(path: &str) -> Result<Vec<JsonToken>, String> {
         }
     }
     Ok(tokens)
+}
+
+fn split_top_level_symbol(s: &str, sym: &str) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let sb = sym.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth_sq = 0i32;
+    let mut depth_pr = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'[' => depth_sq += 1,
+            b']' => depth_sq = (depth_sq - 1).max(0),
+            b'(' => depth_pr += 1,
+            b')' => depth_pr = (depth_pr - 1).max(0),
+            _ if depth_sq == 0
+                && depth_pr == 0
+                && i + sb.len() <= bytes.len()
+                && &bytes[i..i + sb.len()] == sb =>
+            {
+                parts.push(s[start..i].trim().to_string());
+                i += sb.len();
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !parts.is_empty() {
+        parts.push(s[start..].trim().to_string());
+    }
+    parts
+}
+
+fn eval_json_filter_operand(item: &Value, raw: &str) -> Option<Value> {
+    let t = raw.trim();
+    if t == "@" {
+        return Some(item.clone());
+    }
+    if let Some(sub) = t.strip_prefix('@') {
+        let toks = parse_json_path(sub).ok()?;
+        return eval_json_tokens(item, &toks);
+    }
+    if let Some(lit) = unquote_literal(t) {
+        return Some(Value::String(lit));
+    }
+    if t.eq_ignore_ascii_case("true") {
+        return Some(Value::Bool(true));
+    }
+    if t.eq_ignore_ascii_case("false") {
+        return Some(Value::Bool(false));
+    }
+    if t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("none") {
+        return Some(Value::Null);
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Some(Value::Number(i.into()));
+    }
+    if let Ok(f) = t.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return Some(Value::Number(n));
+        }
+    }
+    None
+}
+
+fn json_val_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(m) => !m.is_empty(),
+    }
+}
+
+fn eval_json_filter_expr(item: &Value, expr: &str) -> bool {
+    let e = unwrap_outer_parens(expr);
+    if e.is_empty() {
+        return true;
+    }
+    for sep in ["||", "or"] {
+        let parts = if sep == "||" {
+            split_top_level_symbol(e, sep)
+        } else {
+            split_top_level_keyword(e, sep)
+        };
+        if parts.len() > 1 {
+            return parts.iter().any(|p| eval_json_filter_expr(item, p));
+        }
+    }
+    for sep in ["&&", "and"] {
+        let parts = if sep == "&&" {
+            split_top_level_symbol(e, sep)
+        } else {
+            split_top_level_keyword(e, sep)
+        };
+        if parts.len() > 1 {
+            return parts.iter().all(|p| eval_json_filter_expr(item, p));
+        }
+    }
+    if let Some(rest) = e.strip_prefix('!') {
+        if !rest.starts_with('=') {
+            return !eval_json_filter_expr(item, rest);
+        }
+    }
+    if let Some(inner) = strip_func_call(e, "not") {
+        return !eval_json_filter_expr(item, inner);
+    }
+
+    for op in ["==", "!=", "<=", ">=", "=", "<", ">"] {
+        if let Some(idx) = find_top_level_op(e, op) {
+            let lhs = eval_json_filter_operand(item, &e[..idx]);
+            let rhs = eval_json_filter_operand(item, &e[idx + op.len()..]);
+            return match (lhs, rhs) {
+                (Some(a), Some(b)) => match op {
+                    "==" | "=" => {
+                        if let (Some(fa), Some(fb)) = (a.as_f64(), b.as_f64()) {
+                            (fa - fb).abs() < 1e-9
+                        } else {
+                            a == b
+                        }
+                    }
+                    "!=" => {
+                        if let (Some(fa), Some(fb)) = (a.as_f64(), b.as_f64()) {
+                            (fa - fb).abs() >= 1e-9
+                        } else {
+                            a != b
+                        }
+                    }
+                    "<" => a.as_f64().zip(b.as_f64()).map(|(x, y)| x < y).unwrap_or(false),
+                    "<=" => a.as_f64().zip(b.as_f64()).map(|(x, y)| x <= y).unwrap_or(false),
+                    ">" => a.as_f64().zip(b.as_f64()).map(|(x, y)| x > y).unwrap_or(false),
+                    ">=" => a.as_f64().zip(b.as_f64()).map(|(x, y)| x >= y).unwrap_or(false),
+                    _ => false,
+                },
+                _ => false,
+            };
+        }
+    }
+
+    eval_json_filter_operand(item, e)
+        .map(|v| json_val_truthy(&v))
+        .unwrap_or(false)
 }
 
 fn collect_recursive_key(val: &Value, key: &str, rest: &[JsonToken], out: &mut Vec<Value>) {
@@ -1559,6 +1735,20 @@ fn eval_json_tokens(val: &Value, tokens: &[JsonToken]) -> Option<Value> {
             }
             Some(Value::Array(collected))
         }
+        JsonToken::Filter(expr) => {
+            let Value::Array(arr) = val else {
+                return None;
+            };
+            let mut collected = Vec::new();
+            for item in arr {
+                if eval_json_filter_expr(item, expr) {
+                    if let Some(sub) = eval_json_tokens(item, rest) {
+                        collected.push(sub);
+                    }
+                }
+            }
+            Some(Value::Array(collected))
+        }
         JsonToken::Wildcard => match val {
             Value::Array(arr) => {
                 let mut collected = Vec::with_capacity(arr.len());
@@ -1613,6 +1803,55 @@ fn json_value_to_py(py: Python<'_>, val: &Value) -> PyResult<Py<PyAny>> {
             }
             Ok(dict.into_any().unbind())
         }
+    }
+}
+
+#[pyclass(name = "JsonDocument")]
+pub struct NativeJsonDoc {
+    root: Arc<Value>,
+}
+
+#[pyfunction]
+pub fn parse_json(text: &str) -> PyResult<NativeJsonDoc> {
+    let root: Value = serde_json::from_str(text)
+        .map_err(|e| PyValueError::new_err(format!("Invalid JSON payload: {e}")))?;
+    Ok(NativeJsonDoc {
+        root: Arc::new(root),
+    })
+}
+
+#[pymethods]
+impl NativeJsonDoc {
+    #[new]
+    pub fn new(text: &str) -> PyResult<Self> {
+        parse_json(text)
+    }
+
+    pub fn query(&self, py: Python<'_>, path: &str) -> PyResult<(bool, Py<PyAny>)> {
+        let tokens = parse_json_path(path).map_err(PyValueError::new_err)?;
+        match eval_json_tokens(&self.root, &tokens) {
+            Some(v) => Ok((true, json_value_to_py(py, &v)?)),
+            None => Ok((false, py.None())),
+        }
+    }
+
+    #[pyo3(signature = (path, default = None))]
+    pub fn get(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let (found, val) = self.query(py, path)?;
+        if found {
+            Ok(val)
+        } else {
+            Ok(default.unwrap_or_else(|| py.None()))
+        }
+    }
+
+    pub fn __repr__(&self) -> String {
+        "<JsonDocument>".to_string()
     }
 }
 
@@ -2110,4 +2349,61 @@ pub fn is_xpath_query(q: &str) -> bool {
         || q.starts_with('(')
         || q.starts_with('@')
         || XPATH_AXES.iter().any(|axis| q.contains(axis))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xpath_vs_css_pseudo_routing() {
+        assert!(!is_xpath_query("div.price::text"));
+        assert!(!is_xpath_query("a.buy::attr(href)"));
+        assert!(is_xpath_query("//div/a/@href"));
+        assert!(is_xpath_query(".//span/text()"));
+        assert!(is_xpath_query("(//div)[1]/@id"));
+        assert!(is_xpath_query("following-sibling::span[1]"));
+        assert!(is_xpath_query("following::h2[1]"));
+        assert!(is_xpath_query("preceding::h2[1]"));
+    }
+
+    #[test]
+    fn test_between_and_between_all_utf8() {
+        let s = "Giá: 100₫ | Giá: 250₫ | Giá: 999₫";
+        assert_eq!(extract_between(s, "Giá: ", "₫"), Some("100".to_string()));
+        assert_eq!(
+            extract_between_all(s, "Giá: ", "₫"),
+            vec!["100".to_string(), "250".to_string(), "999".to_string()]
+        );
+        assert_eq!(extract_between_all(s, "NONE", "₫"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_json_path_filters_slices_and_recursive() {
+        let raw = r#"{"meta":{"price":5},"items":[{"id":1,"name":"a","price":10,"ok":true},{"id":2,"name":"b","price":25,"ok":true},{"id":3,"name":"c","price":40,"ok":false}]}"#;
+        let root: Value = serde_json::from_str(raw).unwrap();
+
+        let toks = parse_json_path("items[?(@.price > 15 && @.ok == true)].name").unwrap();
+        assert_eq!(
+            eval_json_tokens(&root, &toks),
+            Some(serde_json::json!(["b"]))
+        );
+
+        let toks_slice = parse_json_path("items[0:2].id").unwrap();
+        assert_eq!(
+            eval_json_tokens(&root, &toks_slice),
+            Some(serde_json::json!([1, 2]))
+        );
+
+        let toks_rec = parse_json_path("$..price").unwrap();
+        let mut prices: Vec<i64> = eval_json_tokens(&root, &toks_rec)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        prices.sort();
+        assert_eq!(prices, vec![5, 10, 25, 40]);
+    }
 }

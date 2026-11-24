@@ -1,0 +1,45 @@
+site_name: http_tls
+site_description: Rust + Pure BoringSSL HTTP/1.1, HTTP/2 & UDP QUIC HTTP/3 Client & HTML5/XPath/JSON Extraction Engine for Python
+site_url: https://real-coder-xD.github.io/http_tls/
+repo_url: https://github.com/real-coder-xD/http_tls
+repo_name: real-coder-xD/http_tls
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: Switch to light mode
+    - scheme: default
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Switch to dark mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+
+nav:
+  - Home: index.md
+  - Quick Start & Migration: quickstart.md
+  - Rust Extraction (CSS / XPath / JSON): extraction.md
+  - HTTP/3, Real ECH & DoH: http3-ech-doh.md
+  - Fingerprinting & Proxies: fingerprinting.md
+  - Anti-Bot & Solvers: anti-bot.md
+  - CLI Debugger: cli.md
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - tables

@@ -143,10 +143,11 @@ def main() -> None:
     bench("http_tls.between_all('href=\"', '\"')", lambda: r_html.between_all('href="', '"'), args.runs)
     print(f"    -> http_tls.re() vs Python compiled re: {py_re / rust_re:.2f}x")
 
-    print("\n=== 4. JSON PATH (serde_json) ===")
+    print("\n=== 4. JSON PATH (serde_json cached JsonDocument) ===")
     r_json = http_tls.Response(200, {}, "https://bench.example/", text=json_str)
-    bench("http_tls.json_path('items[*].price')", lambda: r_json.json_path("items[*].price"), args.runs)
-    bench("http_tls.json_path('$..price')", lambda: r_json.json_path("$..price"), args.runs)
+    bench("http_tls.json_path('items[*].price') [cached]", lambda: r_json.json_path("items[*].price"), args.runs)
+    bench("http_tls.json_path('items[?(@.price>50)].id')", lambda: r_json.json_path("items[?(@.price > 50)].id"), args.runs)
+    bench("http_tls.json_path('$..price') [cached]", lambda: r_json.json_path("$..price"), args.runs)
     bench("Python json.loads + listcomp", lambda: [x["price"] for x in json.loads(json_str)["items"]], args.runs)
 
 

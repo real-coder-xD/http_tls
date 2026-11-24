@@ -1117,19 +1117,28 @@ def test_rust_extraction_css_xpath_json_regex_and_threads():
     assert first_card.between("$", " ") is None or isinstance(first_card.between("$", "\n"), (str, type(None)))
     assert first_card.re_first(r"\$(\d+\.\d{2})") == "19.99"
 
-    # 5. Rust serde_json json_path (dot, negative index, slice, wildcard, recursive $..key) + find("$. ...")
+    # 5. Rust serde_json json_path (dot, negative index, slice, wildcard, filter predicates, recursive $..key) + cached JsonDocument
+    from http_tls import JsonDocument
+    from http_tls.models import Response as ModelsResponse
+    assert ModelsResponse is Response
+
     rj = Response(
         status_code=200,
         headers={"Content-Type": "application/json"},
         url="https://api.example/v1/items",
-        text='{"meta":{"ok":true,"count":3,"nested":{"price":9}},"items":[{"id":1,"name":"a","price":10},{"id":2,"name":"b","price":20},{"id":3,"name":"c","price":30}]}',
+        text='{"meta":{"ok":true,"count":3,"nested":{"price":9}},"items":[{"id":1,"name":"a","price":10,"in_stock":true},{"id":2,"name":"b","price":20,"in_stock":true},{"id":3,"name":"c","price":30,"in_stock":false}]}',
     )
+    assert isinstance(rj.json_doc, JsonDocument)
     assert rj.json_path("meta.ok") is True
     assert rj.json_path("$.items[0].name") == "a"
     assert rj.json_path("items[-1].id") == 3
     assert rj.json_path("items[0:2].name") == ["a", "b"]
     assert rj.json_path("items[-2:].id") == [2, 3]
     assert rj.json_path("items[*].name") == ["a", "b", "c"]
+    assert rj.json_path("items[?(@.price > 15)].name") == ["b", "c"]
+    assert rj.json_path("items[?(@.price >= 15 && @.in_stock == true)].name") == ["b"]
+    assert rj.json_path("items[?(@.name == 'a' || @.id == 3)].id") == [1, 3]
+    assert rj.json_path("items[?(!@.in_stock)].name") == ["c"]
     assert sorted(rj.json_path("$..price")) == [9, 10, 20, 30]
     assert sorted(rj.find_all("$..price")) == [9, 10, 20, 30]
     assert rj.json_path("items[99].id", default="nope") == "nope"
@@ -1172,3 +1181,17 @@ def test_live_html_extraction():
         p_txt = r.find("//p/text()")
         assert isinstance(p_txt, str) and "documentation" in p_txt.lower()
         assert r.find("html::attr(lang)") == "en"
+
+
+def test_builtin_cli_presets_and_live_find(capsys):
+    """Verify built-in CLI (`http-tls` / `python -m http_tls`) preset listing and live CSS/XPath extraction."""
+    from http_tls.cli import main as cli_main
+
+    assert cli_main(["--presets"]) == 0
+    out_presets = capsys.readouterr().out
+    assert "chrome_149" in out_presets and "firefox_151" in out_presets
+
+    assert cli_main(["https://example.com/", "--find", "title::text", "--info"]) == 0
+    out_live = capsys.readouterr().out
+    assert "Example Domain" in out_live
+    assert "200" in out_live
