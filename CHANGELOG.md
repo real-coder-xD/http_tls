@@ -2,6 +2,11 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [1.2.1] - 2026-11-24
+
+### Fixed
+- **Comma-Separated CSS3 `::text` & `::attr(...)` Selector Lists (`src/extract.rs`):** Fixed `run_css_on_selection` raising `ValueError` on multi-branch Scrapy-style pseudo-element selectors such as `"h1::text, h2::text"` or `".alert::text, .error::text"`. Same-mode branches now combine into a single `dom_query::Matcher` preserving exact document order, and mixed-mode lists (`"h2::text, a::attr(href)"`) evaluate each branch in order.
+
 ## [1.2.0] - 2026-11-24
 
 ### Modular Rust/Python Architecture, Cached `JsonDocument` + Filter Predicates, Native CLI & MkDocs Site

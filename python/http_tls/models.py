@@ -67,7 +67,7 @@ except ImportError:
     JsonDocument = Any  # type: ignore[misc, assignment]
     _RustSession = None
     _NativeWebSocket = None
-    __version__ = "1.2.0"
+    __version__ = "1.2.1"
     _rust_parse_html = None
     _rust_parse_json = None
     _rust_extract_re = None

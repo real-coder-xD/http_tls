@@ -30,6 +30,7 @@ type SharedDoc = Arc<Mutex<SendDoc>>;
 // ---------------------------------------------------------------------------
 // CSS3 Pseudo-Element Parsing (::text, ::attr(name))
 // ---------------------------------------------------------------------------
+#[derive(PartialEq, Eq)]
 enum CssExtractMode {
     Elements,
     Text,
@@ -57,20 +58,20 @@ fn split_css_pseudo(raw: &str) -> (&str, CssExtractMode) {
     (trimmed, CssExtractMode::Elements)
 }
 
-fn run_css_on_selection<'py>(
+fn eval_css_single<'py>(
     py: Python<'py>,
     doc: &SharedDoc,
-    sel: Selection<'_>,
-    selector: &str,
+    sel: &Selection<'_>,
+    css_expr: &str,
+    mode: &CssExtractMode,
     first_only: bool,
-) -> PyResult<Vec<Py<PyAny>>> {
-    let (css_expr, mode) = split_css_pseudo(selector);
+    out: &mut Vec<Py<PyAny>>,
+) -> PyResult<()> {
     let matcher = Matcher::new(css_expr)
         .map_err(|_| PyValueError::new_err(format!("Invalid CSS selector: '{css_expr}'")))?;
     let matched = sel.select_matcher(&matcher);
-    let mut out = Vec::new();
     for node in matched.nodes() {
-        match &mode {
+        match mode {
             CssExtractMode::Elements => {
                 let elem = NativeElement {
                     doc: Arc::clone(doc),
@@ -90,6 +91,60 @@ fn run_css_on_selection<'py>(
             }
         }
         if first_only {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn run_css_on_selection<'py>(
+    py: Python<'py>,
+    doc: &SharedDoc,
+    sel: Selection<'_>,
+    selector: &str,
+    first_only: bool,
+) -> PyResult<Vec<Py<PyAny>>> {
+    let mut out = Vec::new();
+    let trimmed = selector.trim();
+    if trimmed.is_empty() {
+        return Err(PyValueError::new_err("Invalid CSS selector: ''"));
+    }
+
+    // Fast path when no Scrapy ::text / ::attr(...) pseudo-elements are present
+    if !trimmed.contains("::text") && !trimmed.contains("::attr(") {
+        eval_css_single(py, doc, &sel, trimmed, &CssExtractMode::Elements, first_only, &mut out)?;
+        return Ok(out);
+    }
+
+    let raw_branches = split_top_level(trimmed, ',');
+    let parsed: Vec<(String, CssExtractMode)> = raw_branches
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            let (base, mode) = split_css_pseudo(&b);
+            (base.to_string(), mode)
+        })
+        .collect();
+    if parsed.is_empty() {
+        return Err(PyValueError::new_err(format!("Invalid CSS selector: '{trimmed}'")));
+    }
+
+    // If every comma branch shares the same extraction mode (e.g. "h1::text, h2::text"),
+    // combine into a single Matcher so results preserve exact document order.
+    let first_mode = &parsed[0].1;
+    if parsed.iter().all(|(_, m)| m == first_mode) {
+        let combined = parsed
+            .iter()
+            .map(|(b, _)| b.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eval_css_single(py, doc, &sel, &combined, first_mode, first_only, &mut out)?;
+        return Ok(out);
+    }
+
+    for (base, mode) in &parsed {
+        eval_css_single(py, doc, &sel, base, mode, first_only, &mut out)?;
+        if first_only && !out.is_empty() {
             break;
         }
     }

@@ -1047,6 +1047,10 @@ def test_rust_extraction_css_xpath_json_regex_and_threads():
     assert r.css("div.card a.buy::attr(href)") == ["/item/101", "/item/102", "/item/103"]
     assert r.css("div.card:not(.sold-out) .title::text") == ["Alpha Widget", "Beta Gadget"]
     assert r.css("div.card:has(span.price:contains('$42.50')) a::attr(href)") == ["/item/102"]
+    # Comma-separated Scrapy ::text / ::attr() selector lists (same-mode & mixed-mode)
+    assert r.css("title::text, div.card.featured h2.title::text") == ["  Shop Catalog  ", "Alpha Widget"]
+    assert r.find(".nonexistent::text, div.card.featured .price::text") == "$19.99"
+    assert r.css("div.card.featured h2::text, div.card.featured a::attr(href)") == ["Alpha Widget", "/item/101"]
 
     first_card = r.css_first("div.card.featured")
     assert isinstance(first_card, Element)
