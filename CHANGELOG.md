@@ -2,6 +2,12 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [1.0.1] - 2026-11-23
+
+### True Incremental HTTP/3 Chunk Streaming & RFC 8297 `103 Early Hints` Handling
+- **Zero-Buffering Incremental HTTP/3 Streaming (`execute_h3_stream`):** `start_dual_stream` now streams QUIC `DATA` frames on demand via `futures_util::stream::unfold` over `h3::client::RequestStream` instead of buffering the entire HTTP/3 response body upfront, paired with incremental frame-by-frame streaming decompression (`H3StreamDecoder` for `gzip`, `deflate`, `br`, `zstd`, and zero-copy `copy_to_bytes` for identity streams).
+- **RFC 8297 / RFC 9110 `103 Early Hints` on HTTP/3:** `open_h3_single_hop` now skips interim `1xx` informational frames (such as Cloudflare `103 Early Hints`) until the final response headers arrive.
+
 ## [1.0.0] - 2026-11-23
 
 ### Real ECH (`sni=encrypted`) & HTTP/3 over SOCKS5 UDP Associate

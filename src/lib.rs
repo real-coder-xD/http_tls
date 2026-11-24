@@ -9,7 +9,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -33,7 +33,7 @@ use wreq::{Client, Method, Proxy, RequestBuilder, Version};
 use wreq_util::emulate::compress::{BrotliCompressor, ZlibCompressor, ZstdCompressor};
 use wreq_util::{Emulation, Platform, Profile};
 
-type BodyStream = Pin<Box<dyn Stream<Item = wreq::Result<Bytes>> + Send + 'static>>;
+type BodyStream = Pin<Box<dyn Stream<Item = PyResult<Bytes>> + Send + 'static>>;
 type MultipartItem = (String, Option<String>, Vec<u8>, Option<String>);
 type HistoryTuple = (u16, String, String, HashMap<String, String>);
 
@@ -1495,8 +1495,139 @@ async fn acquire_h3_conn(
     Ok((key, pooled_sr, remote_addr_str, peer_cert_der, ech_accepted, false))
 }
 
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-async fn execute_h3_single_hop(
+#[derive(Clone, Default)]
+struct SharedVec(Arc<Mutex<Vec<u8>>>);
+
+impl SharedVec {
+    fn drain_bytes(&self) -> Vec<u8> {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *guard)
+    }
+}
+
+impl Write for SharedVec {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        guard.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+enum H3StreamDecoder {
+    Identity,
+    Gzip(flate2::write::GzDecoder<SharedVec>, SharedVec),
+    Zlib(flate2::write::ZlibDecoder<SharedVec>, SharedVec),
+    Brotli(Box<brotli::DecompressorWriter<SharedVec>>, SharedVec),
+    Zstd(zstd::stream::write::Decoder<'static, SharedVec>, SharedVec),
+}
+
+impl H3StreamDecoder {
+    fn from_encoding(content_encoding: Option<&str>) -> Self {
+        let enc = match content_encoding {
+            Some(s) => s.trim().to_ascii_lowercase(),
+            None => return Self::Identity,
+        };
+        if enc == "gzip" || enc == "x-gzip" {
+            let sink = SharedVec::default();
+            Self::Gzip(flate2::write::GzDecoder::new(sink.clone()), sink)
+        } else if enc == "deflate" {
+            let sink = SharedVec::default();
+            Self::Zlib(flate2::write::ZlibDecoder::new(sink.clone()), sink)
+        } else if enc == "br" {
+            let sink = SharedVec::default();
+            Self::Brotli(Box::new(brotli::DecompressorWriter::new(sink.clone(), 4096)), sink)
+        } else if enc == "zstd" {
+            let sink = SharedVec::default();
+            match zstd::stream::write::Decoder::new(sink.clone()) {
+                Ok(dec) => Self::Zstd(dec, sink),
+                Err(_) => Self::Identity,
+            }
+        } else {
+            Self::Identity
+        }
+    }
+
+    fn push(&mut self, input: &[u8]) -> Bytes {
+        if input.is_empty() {
+            return Bytes::new();
+        }
+        match self {
+            Self::Identity => Bytes::copy_from_slice(input),
+            Self::Gzip(dec, sink) => {
+                if dec.write_all(input).is_err() {
+                    return Bytes::copy_from_slice(input);
+                }
+                let _ = dec.flush();
+                Bytes::from(sink.drain_bytes())
+            }
+            Self::Zlib(dec, sink) => {
+                if dec.write_all(input).is_err() {
+                    return Bytes::copy_from_slice(input);
+                }
+                let _ = dec.flush();
+                Bytes::from(sink.drain_bytes())
+            }
+            Self::Brotli(dec, sink) => {
+                if dec.write_all(input).is_err() {
+                    return Bytes::copy_from_slice(input);
+                }
+                let _ = dec.flush();
+                Bytes::from(sink.drain_bytes())
+            }
+            Self::Zstd(dec, sink) => {
+                if dec.write_all(input).is_err() {
+                    return Bytes::copy_from_slice(input);
+                }
+                let _ = dec.flush();
+                Bytes::from(sink.drain_bytes())
+            }
+        }
+    }
+
+    fn finish(self) -> Bytes {
+        match self {
+            Self::Identity => Bytes::new(),
+            Self::Gzip(mut dec, sink) => {
+                let _ = dec.try_finish();
+                drop(dec);
+                Bytes::from(sink.drain_bytes())
+            }
+            Self::Zlib(mut dec, sink) => {
+                let _ = dec.try_finish();
+                drop(dec);
+                Bytes::from(sink.drain_bytes())
+            }
+            Self::Brotli(mut dec, sink) => {
+                let _ = dec.flush();
+                drop(dec);
+                Bytes::from(sink.drain_bytes())
+            }
+            Self::Zstd(mut dec, sink) => {
+                let _ = dec.flush();
+                drop(dec);
+                Bytes::from(sink.drain_bytes())
+            }
+        }
+    }
+}
+
+type H3OpenHop = (
+    u16,
+    HeaderMap,
+    HashMap<String, String>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<u8>>,
+    bool,
+    h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+);
+
+#[allow(clippy::too_many_arguments)]
+async fn open_h3_single_hop(
     spec: &H3RequestSpec,
     current_url: &url::Url,
     method_str: &str,
@@ -1506,15 +1637,7 @@ async fn execute_h3_single_hop(
     ech_cache: &EchCache,
     doh_client: Option<&Client>,
     port_override: Option<u16>,
-) -> PyResult<(
-    u16,
-    HeaderMap,
-    HashMap<String, String>,
-    Vec<u8>,
-    Option<String>,
-    Option<Vec<u8>>,
-    bool,
-)> {
+) -> PyResult<H3OpenHop> {
     if current_url.scheme() != "https" {
         return Err(PyRuntimeError::new_err(
             "[connect] HTTP/3 (QUIC) requires an https:// URL",
@@ -1661,7 +1784,7 @@ async fn execute_h3_single_hop(
             )));
         }
 
-        let resp = match stream.recv_response().await {
+        let mut resp = match stream.recv_response().await {
             Ok(r) => r,
             Err(e) => {
                 if reused && attempt == 0 {
@@ -1676,6 +1799,14 @@ async fn execute_h3_single_hop(
                 )));
             }
         };
+
+        // RFC 9110 / RFC 8297: skip interim 1xx frames (e.g. Cloudflare 103 Early Hints) until final headers.
+        while resp.status().is_informational() && resp.status().as_u16() != 101 {
+            resp = stream
+                .recv_response()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_response failed: {e}")))?;
+        }
 
         let status_code = resp.status().as_u16();
         let mut wreq_headers = HeaderMap::new();
@@ -1708,29 +1839,15 @@ async fn execute_h3_single_hop(
             }
         }
 
-        let mut raw_body = Vec::new();
-        while let Some(mut chunk) = stream
-            .recv_data()
-            .await
-            .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_data failed: {e}")))?
-        {
-            while chunk.has_remaining() {
-                let slice = chunk.chunk();
-                raw_body.extend_from_slice(slice);
-                let len = slice.len();
-                chunk.advance(len);
-            }
-        }
-
-        let decoded_bytes = decompress_h3_body(raw_body, content_encoding.as_deref());
         return Ok((
             status_code,
             wreq_headers,
             headers_map,
-            decoded_bytes,
+            content_encoding,
             remote_addr_str,
             peer_cert_der,
             ech_accepted,
+            stream,
         ));
     }
 
@@ -1757,11 +1874,12 @@ async fn execute_h3_request(
                 status_code,
                 wreq_hdrs,
                 headers_map,
-                body_bytes,
+                content_encoding,
                 remote_addr,
                 peer_certificate,
                 ech_accepted,
-            ) = execute_h3_single_hop(
+                mut stream,
+            ) = open_h3_single_hop(
                 &spec,
                 &current_url,
                 &current_method,
@@ -1804,10 +1922,26 @@ async fn execute_h3_request(
                         current_method = "GET".to_string();
                         current_body = None;
                     }
+                    drop(stream);
                     current_url = next_url;
                     continue;
                 }
             }
+
+            let mut raw_body = Vec::new();
+            while let Some(mut chunk) = stream
+                .recv_data()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_data failed: {e}")))?
+            {
+                while chunk.has_remaining() {
+                    let slice = chunk.chunk();
+                    raw_body.extend_from_slice(slice);
+                    let len = slice.len();
+                    chunk.advance(len);
+                }
+            }
+            let body_bytes = decompress_h3_body(raw_body, content_encoding.as_deref());
 
             let elapsed = start.elapsed().as_secs_f64();
             let final_url_str = current_url.to_string();
@@ -1835,6 +1969,153 @@ async fn execute_h3_request(
     match tokio::time::timeout(spec.timeout, fut).await {
         Ok(res) => res,
         Err(_) => Err(PyRuntimeError::new_err("[timeout] HTTP/3 request timed out")),
+    }
+}
+
+async fn execute_h3_stream(
+    spec: H3RequestSpec,
+    jar: Arc<Jar>,
+    h3_pool: H3Pool,
+    ech_cache: EchCache,
+    doh_client: Option<Client>,
+) -> PyResult<NativeStream> {
+    let start = Instant::now();
+    let open_fut = async {
+        let mut current_url = spec.url.clone();
+        let mut current_method = spec.method.to_uppercase();
+        let mut current_body = spec.body.clone();
+        let mut history: Vec<HistoryTuple> = Vec::new();
+        let mut hop_port = spec.alt_svc_port;
+
+        for hop in 0..=spec.max_redirects {
+            let (
+                status_code,
+                wreq_hdrs,
+                headers_map,
+                content_encoding,
+                remote_addr,
+                peer_certificate,
+                ech_accepted,
+                stream,
+            ) = open_h3_single_hop(
+                &spec,
+                &current_url,
+                &current_method,
+                current_body.as_deref(),
+                &jar,
+                &h3_pool,
+                &ech_cache,
+                doh_client.as_ref(),
+                hop_port,
+            )
+            .await?;
+            hop_port = None;
+
+            let is_redir = matches!(status_code, 301 | 302 | 303 | 307 | 308);
+            if spec.allow_redirects && is_redir {
+                if let Some(loc) = wreq_hdrs
+                    .get(wreq::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    if hop >= spec.max_redirects {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "[redirect] Too many redirects (max {})",
+                            spec.max_redirects
+                        )));
+                    }
+                    let next_url = current_url.join(loc).map_err(|e| {
+                        PyValueError::new_err(format!("Invalid redirect URL '{loc}': {e}"))
+                    })?;
+                    history.push((
+                        status_code,
+                        current_url.to_string(),
+                        next_url.to_string(),
+                        headers_map,
+                    ));
+                    if status_code == 303
+                        || ((status_code == 301 || status_code == 302)
+                            && current_method != "GET"
+                            && current_method != "HEAD")
+                    {
+                        current_method = "GET".to_string();
+                        current_body = None;
+                    }
+                    drop(stream);
+                    current_url = next_url;
+                    continue;
+                }
+            }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let final_url_str = current_url.to_string();
+            let encoding = charset_of(&wreq_hdrs)
+                .map(|e| e.name().to_ascii_lowercase())
+                .unwrap_or_default();
+            let cookies = collect_cookies(&jar, &final_url_str, &wreq_hdrs);
+            let decoder = H3StreamDecoder::from_encoding(content_encoding.as_deref());
+
+            // Incremental QUIC DATA frame stream: zero whole-body buffering in RAM.
+            let body_stream: BodyStream = Box::pin(futures_util::stream::unfold(
+                (stream, Some(decoder)),
+                |(mut req_stream, mut dec_opt)| async move {
+                    let dec = dec_opt.as_mut()?;
+                    loop {
+                        match req_stream.recv_data().await {
+                            Ok(Some(mut buf)) => {
+                                let raw = buf.copy_to_bytes(buf.remaining());
+                                if raw.is_empty() {
+                                    continue;
+                                }
+                                let out = match dec {
+                                    H3StreamDecoder::Identity => raw,
+                                    _ => dec.push(&raw),
+                                };
+                                if !out.is_empty() {
+                                    return Some((Ok(out), (req_stream, dec_opt)));
+                                }
+                            }
+                            Ok(None) => {
+                                let finished = dec_opt.take().map(|d| d.finish()).unwrap_or_default();
+                                if !finished.is_empty() {
+                                    return Some((Ok(finished), (req_stream, None)));
+                                }
+                                return None;
+                            }
+                            Err(e) => {
+                                dec_opt.take();
+                                return Some((
+                                    Err(PyRuntimeError::new_err(format!(
+                                        "[request] HTTP/3 recv_data failed: {e}"
+                                    ))),
+                                    (req_stream, None),
+                                ));
+                            }
+                        }
+                    }
+                },
+            ));
+
+            return Ok(NativeStream {
+                status_code,
+                headers: headers_map,
+                cookies,
+                encoding,
+                url: final_url_str,
+                elapsed,
+                http_version: "HTTP/3".to_string(),
+                remote_addr,
+                peer_certificate,
+                history,
+                ech_accepted,
+                inner: Arc::new(tokio::sync::Mutex::new(Some(body_stream))),
+            });
+        }
+        Err(PyRuntimeError::new_err("[redirect] Too many redirects"))
+    };
+
+    match tokio::time::timeout(spec.timeout, open_fut).await {
+        Ok(res) => res,
+        Err(_) => Err(PyRuntimeError::new_err("[timeout] HTTP/3 stream timed out")),
     }
 }
 
@@ -1943,7 +2224,7 @@ impl NativeStream {
                     Some(stream) => match stream.next().await {
                         None => None,
                         Some(Ok(b)) => Some(b),
-                        Some(Err(e)) => return Err(net_err(e)),
+                        Some(Err(e)) => return Err(e),
                     },
                 };
                 if next.is_none() {
@@ -1964,7 +2245,7 @@ impl NativeStream {
                 Some(stream) => match stream.next().await {
                     None => None,
                     Some(Ok(b)) => Some(b.to_vec()),
-                    Some(Err(e)) => return Err(net_err(e)),
+                    Some(Err(e)) => return Err(e),
                 },
             };
             if next.is_none() {
@@ -2628,26 +2909,8 @@ async fn start_dual_stream(
 ) -> PyResult<NativeStream> {
     if let Some(spec) = h3_spec {
         let strict = spec.strict_h3;
-        match execute_h3_request(spec, Arc::clone(&jar), h3_pool, ech_cache, doh_client).await {
-            Ok(resp) => {
-                let body_bytes = Bytes::from(resp.content);
-                let stream: BodyStream =
-                    Box::pin(futures_util::stream::once(async move { Ok(body_bytes) }));
-                return Ok(NativeStream {
-                    status_code: resp.status_code,
-                    headers: resp.headers,
-                    cookies: resp.cookies,
-                    encoding: resp.encoding,
-                    url: resp.url,
-                    elapsed: resp.elapsed,
-                    http_version: resp.http_version,
-                    remote_addr: resp.remote_addr,
-                    peer_certificate: resp.peer_certificate,
-                    history: resp.history,
-                    ech_accepted: resp.ech_accepted,
-                    inner: Arc::new(tokio::sync::Mutex::new(Some(stream))),
-                });
-            }
+        match execute_h3_stream(spec, Arc::clone(&jar), h3_pool, ech_cache, doh_client).await {
+            Ok(stream) => return Ok(stream),
             Err(e) if strict => return Err(e),
             Err(_) => {}
         }
@@ -2702,7 +2965,7 @@ async fn start_stream(rb: RequestBuilder, jar: Arc<Jar>) -> PyResult<NativeStrea
         .unwrap_or_default();
     let cookies = collect_cookies(&jar, &final_url, &hdrs);
     let headers = collect_headers(&hdrs);
-    let stream: BodyStream = Box::pin(resp.bytes_stream());
+    let stream: BodyStream = Box::pin(resp.bytes_stream().map(|res| res.map_err(net_err)));
     Ok(NativeStream {
         status_code,
         headers,

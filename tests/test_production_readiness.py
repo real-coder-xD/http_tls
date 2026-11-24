@@ -863,3 +863,31 @@ def test_socks5_udp_associate_rejected_fallback_and_strict():
             assert stats["tcp_connect"] >= 1
     finally:
         shutdown()
+
+
+def test_http3_true_chunked_streaming_sync_and_async():
+    """Live test: true incremental QUIC DATA frame streaming + 103 Early Hints handling (sync & async)."""
+    # 1. Sync streaming over HTTP/3 on Cloudflare (skips 103 Early Hints -> 200 OK, streams multiple chunks)
+    with Session(impersonate="chrome_149", http3=True, http3_only=True, timeout=20) as s:
+        with s.stream("GET", "https://www.cloudflare.com/") as resp:
+            assert resp.status_code == 200
+            assert resp.http_version == "HTTP/3"
+            chunks = [c for c in resp.iter_bytes(chunk_size=None) if c]
+            assert len(chunks) > 1, f"Expected true multi-chunk QUIC stream, got {len(chunks)} chunk(s)"
+            body = b"".join(chunks)
+            assert len(body) > 10_000
+            assert b"cloudflare" in body.lower()
+
+    # 2. Native async streaming over HTTP/3 on Google (incremental Brotli decompression across many QUIC frames)
+    async def _run_async():
+        async with AsyncClient(impersonate="chrome_149", http3=True, http3_only=True, timeout=20) as ac:
+            async with ac.stream("GET", "https://www.google.com/") as resp:
+                assert resp.status_code == 200
+                assert resp.http_version == "HTTP/3"
+                achunks = [c async for c in resp.aiter_bytes(chunk_size=None) if c]
+                assert len(achunks) > 1, f"Expected true async multi-chunk QUIC stream, got {len(achunks)} chunk(s)"
+                abody = b"".join(achunks)
+                assert len(abody) > 10_000
+                assert b"google" in abody.lower()
+
+    asyncio.run(_run_async())

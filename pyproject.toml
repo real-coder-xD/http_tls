@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "http-tls"
-version = "1.0.0"
+version = "1.0.1"
 description = "Standalone Rust + Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 (Real ECH, X25519MLKEM768, SOCKS5 UDP Associate) Browser-Impersonating HTTP Client for Python"
 readme = "README.md"
 requires-python = ">=3.8"
