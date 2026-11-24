@@ -1,0 +1,9 @@
+{
+  "name": "http-tls-ffi-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "koffi": "^2.9.0"
+  }
+}

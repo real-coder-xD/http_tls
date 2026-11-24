@@ -1,7 +1,14 @@
 # Rust
 target/
+ffi/target/
 **/*.rs.bk
 Cargo.lock
+ffi/Cargo.lock
+
+# FFI Examples build outputs
+ffi/examples/**/bin/
+ffi/examples/**/obj/
+ffi/examples/**/node_modules/
 
 # Python
 __pycache__/

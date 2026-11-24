@@ -6,13 +6,18 @@
 //! - Structured JSON path extraction (`json_path`) supporting dot paths, negative indices, and `[*]` wildcards via `serde_json`
 
 use dom_query::{Document, Matcher, NodeId, NodeRef, Selection};
+#[cfg(feature = "python")]
 use pyo3::exceptions::PyValueError;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::{PyDict, PyList};
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(feature = "python")]
+use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 
 /// Thread-safe confinement wrapper around `dom_query::Document`.
 ///
@@ -22,9 +27,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// zero `NodeRef`/`Tendril` references ever escape the lock guard (PyO3 methods return
 /// only owned `String`s, `HashMap<String, String>`, and `NodeId` values). `Arc`
 /// guarantees exclusive drop on whichever thread releases the final reference.
+#[cfg(feature = "python")]
 struct SendDoc(Document);
+#[cfg(feature = "python")]
 unsafe impl Send for SendDoc {}
 
+#[cfg(feature = "python")]
 type SharedDoc = Arc<Mutex<SendDoc>>;
 
 // ---------------------------------------------------------------------------
@@ -58,6 +66,7 @@ fn split_css_pseudo(raw: &str) -> (&str, CssExtractMode) {
     (trimmed, CssExtractMode::Elements)
 }
 
+#[cfg(feature = "python")]
 fn eval_css_single<'py>(
     py: Python<'py>,
     doc: &SharedDoc,
@@ -97,6 +106,7 @@ fn eval_css_single<'py>(
     Ok(())
 }
 
+#[cfg(feature = "python")]
 fn run_css_on_selection<'py>(
     py: Python<'py>,
     doc: &SharedDoc,
@@ -1256,6 +1266,7 @@ fn eval_xpath_branch(
     eval_steps_from_nodes(tree, vec![start_id], &steps)
 }
 
+#[cfg(feature = "python")]
 fn eval_xpath<'py>(
     py: Python<'py>,
     doc_arc: &SharedDoc,
@@ -1307,7 +1318,7 @@ fn eval_xpath<'py>(
 // ---------------------------------------------------------------------------
 const REGEX_CACHE_LIMIT: usize = 128;
 
-fn get_cached_regex(pattern: &str) -> PyResult<Regex> {
+fn get_cached_regex(pattern: &str) -> Result<Regex, String> {
     static CACHE: OnceLock<Mutex<HashMap<String, Regex>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -1317,7 +1328,7 @@ fn get_cached_regex(pattern: &str) -> PyResult<Regex> {
         }
     }
     let compiled = Regex::new(pattern)
-        .map_err(|e| PyValueError::new_err(format!("Invalid regex pattern '{pattern}': {e}")))?;
+        .map_err(|e| format!("Invalid regex pattern '{pattern}': {e}"))?;
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= REGEX_CACHE_LIMIT {
         guard.clear();
@@ -1326,8 +1337,7 @@ fn get_cached_regex(pattern: &str) -> PyResult<Regex> {
     Ok(compiled)
 }
 
-#[pyfunction]
-pub fn extract_re(text: &str, pattern: &str) -> PyResult<Vec<String>> {
+pub(crate) fn extract_re_pure(text: &str, pattern: &str) -> Result<Vec<String>, String> {
     let re = get_cached_regex(pattern)?;
     let has_groups = re.captures_len() > 1;
     let mut out = Vec::new();
@@ -1351,8 +1361,7 @@ pub fn extract_re(text: &str, pattern: &str) -> PyResult<Vec<String>> {
     Ok(out)
 }
 
-#[pyfunction]
-pub fn extract_re_first(text: &str, pattern: &str) -> PyResult<Option<String>> {
+pub(crate) fn extract_re_first_pure(text: &str, pattern: &str) -> Result<Option<String>, String> {
     let re = get_cached_regex(pattern)?;
     if re.captures_len() > 1 {
         if let Some(caps) = re.captures(text) {
@@ -1368,7 +1377,19 @@ pub fn extract_re_first(text: &str, pattern: &str) -> PyResult<Option<String>> {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
+pub fn extract_re(text: &str, pattern: &str) -> PyResult<Vec<String>> {
+    extract_re_pure(text, pattern).map_err(PyValueError::new_err)
+}
+
+#[cfg(feature = "python")]
+#[pyfunction]
+pub fn extract_re_first(text: &str, pattern: &str) -> PyResult<Option<String>> {
+    extract_re_first_pure(text, pattern).map_err(PyValueError::new_err)
+}
+
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn extract_between(text: &str, left: &str, right: &str) -> Option<String> {
     let start = if left.is_empty() {
         0
@@ -1384,7 +1405,7 @@ pub fn extract_between(text: &str, left: &str, right: &str) -> Option<String> {
     }
 }
 
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn extract_between_all(text: &str, left: &str, right: &str) -> Vec<String> {
     if left.is_empty() || right.is_empty() {
         return extract_between(text, left, right).into_iter().collect();
@@ -1828,6 +1849,159 @@ fn eval_json_tokens(val: &Value, tokens: &[JsonToken]) -> Option<Value> {
     }
 }
 
+#[allow(dead_code)]
+fn node_to_json(node: &NodeRef<'_>) -> Value {
+    let tag = node
+        .node_name()
+        .map(|s| s.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut attrs = serde_json::Map::new();
+    for a in node.attrs() {
+        attrs.insert(a.name.local.to_string(), Value::String(a.value.to_string()));
+    }
+    json!({
+        "tag": tag,
+        "text": node.text().to_string(),
+        "own_text": node.immediate_text().to_string(),
+        "html": node.inner_html().to_string(),
+        "outer_html": node.html().to_string(),
+        "attrs": Value::Object(attrs),
+    })
+}
+
+#[allow(dead_code)]
+fn eval_css_single_json(
+    sel: &Selection<'_>,
+    css_expr: &str,
+    mode: &CssExtractMode,
+    first_only: bool,
+    out: &mut Vec<Value>,
+) -> Result<(), String> {
+    let matcher =
+        Matcher::new(css_expr).map_err(|_| format!("Invalid CSS selector: '{css_expr}'"))?;
+    let matched = sel.select_matcher(&matcher);
+    for node in matched.nodes() {
+        match mode {
+            CssExtractMode::Elements => out.push(node_to_json(node)),
+            CssExtractMode::Text => out.push(Value::String(node.text().to_string())),
+            CssExtractMode::Attr(name) => {
+                if let Some(val) = node.attr(name) {
+                    out.push(Value::String(val.to_string()));
+                } else {
+                    continue;
+                }
+            }
+        }
+        if first_only {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn extract_css_json(
+    html: &str,
+    selector: &str,
+    first_only: bool,
+) -> Result<Vec<Value>, String> {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() {
+        return Err("Invalid CSS selector: ''".to_string());
+    }
+    let doc = Document::from(html);
+    let root_sel = Selection::from(doc.root());
+    let mut out = Vec::new();
+
+    if !trimmed.contains("::text") && !trimmed.contains("::attr(") {
+        eval_css_single_json(&root_sel, trimmed, &CssExtractMode::Elements, first_only, &mut out)?;
+        return Ok(out);
+    }
+
+    let raw_branches = split_top_level(trimmed, ',');
+    let parsed: Vec<(String, CssExtractMode)> = raw_branches
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            let (base, mode) = split_css_pseudo(&b);
+            (base.to_string(), mode)
+        })
+        .collect();
+    if parsed.is_empty() {
+        return Err(format!("Invalid CSS selector: '{trimmed}'"));
+    }
+
+    let first_mode = &parsed[0].1;
+    if parsed.iter().all(|(_, m)| m == first_mode) {
+        let combined = parsed
+            .iter()
+            .map(|(b, _)| b.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eval_css_single_json(&root_sel, &combined, first_mode, first_only, &mut out)?;
+        return Ok(out);
+    }
+
+    for (base, mode) in &parsed {
+        eval_css_single_json(&root_sel, base, mode, first_only, &mut out)?;
+        if first_only && !out.is_empty() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+pub(crate) fn extract_xpath_json(
+    html: &str,
+    expr: &str,
+    first_only: bool,
+) -> Result<Vec<Value>, String> {
+    let doc = Document::from(html);
+    let branches = split_top_level(expr.trim(), '|');
+    let mut out = Vec::new();
+    let mut seen_nodes = HashSet::new();
+    let ctx_id = doc.tree.root().id;
+
+    for branch in branches {
+        if branch.is_empty() {
+            continue;
+        }
+        let vals = eval_xpath_branch(&doc.tree, ctx_id, &branch)
+            .map_err(|e| format!("XPath evaluation failed '{expr}': {e}"))?;
+
+        for val in vals {
+            match val {
+                XPathValue::Str(s) => out.push(Value::String(s)),
+                XPathValue::Node(id) => {
+                    if seen_nodes.insert(id) {
+                        if let Some(node) = doc.tree.get(&id) {
+                            out.push(node_to_json(&node));
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+            }
+            if first_only {
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+pub(crate) fn extract_json_path_val(text: &str, path: &str) -> Result<Option<Value>, String> {
+    let tokens = parse_json_path(path)?;
+    let root: Value =
+        serde_json::from_str(text).map_err(|e| format!("Invalid JSON payload: {e}"))?;
+    Ok(eval_json_tokens(&root, &tokens))
+}
+
+#[cfg(feature = "python")]
 fn json_value_to_py(py: Python<'_>, val: &Value) -> PyResult<Py<PyAny>> {
     match val {
         Value::Null => Ok(py.None()),
@@ -1861,11 +2035,13 @@ fn json_value_to_py(py: Python<'_>, val: &Value) -> PyResult<Py<PyAny>> {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "JsonDocument")]
 pub struct NativeJsonDoc {
     root: Arc<Value>,
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 pub fn parse_json(text: &str) -> PyResult<NativeJsonDoc> {
     let root: Value = serde_json::from_str(text)
@@ -1875,6 +2051,7 @@ pub fn parse_json(text: &str) -> PyResult<NativeJsonDoc> {
     })
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl NativeJsonDoc {
     #[new]
@@ -1910,6 +2087,7 @@ impl NativeJsonDoc {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 pub fn extract_json_path(py: Python<'_>, text: &str, path: &str) -> PyResult<(bool, Py<PyAny>)> {
     let tokens = parse_json_path(path).map_err(PyValueError::new_err)?;
@@ -1924,11 +2102,13 @@ pub fn extract_json_path(py: Python<'_>, text: &str, path: &str) -> PyResult<(bo
 // ---------------------------------------------------------------------------
 // PyO3 Classes: HtmlDocument & Element (Send + Sync via Mutex confinement)
 // ---------------------------------------------------------------------------
+#[cfg(feature = "python")]
 #[pyclass(name = "HtmlDocument")]
 pub struct NativeDocument {
     doc: SharedDoc,
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 pub fn parse_html(html: &str) -> NativeDocument {
     NativeDocument {
@@ -1936,6 +2116,7 @@ pub fn parse_html(html: &str) -> NativeDocument {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl NativeDocument {
     #[new]
@@ -2058,12 +2239,14 @@ impl NativeDocument {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyclass(name = "Element")]
 pub struct NativeElement {
     doc: SharedDoc,
     id: NodeId,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl NativeElement {
     #[getter]
@@ -2382,6 +2565,7 @@ impl NativeElement {
     }
 }
 
+#[allow(dead_code)]
 const XPATH_AXES: &[&str] = &[
     "child::",
     "descendant::",
@@ -2397,6 +2581,7 @@ const XPATH_AXES: &[&str] = &[
     "attribute::",
 ];
 
+#[allow(dead_code)]
 pub fn is_xpath_query(q: &str) -> bool {
     q.starts_with('/')
         || q.starts_with("./")

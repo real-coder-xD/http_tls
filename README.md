@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/real-coder-xD/http_tls/main/docs/assets/banner.jpg" alt="http_tls — Rust + Pure BoringSSL HTTP/3 & HTML5/XPath/JSON Engine for Python" width="100%" />
+
 # `http_tls`
 
 **Rust & Pure BoringSSL TLS (JA3/JA4), HTTP/2 & UDP QUIC HTTP/3 Impersonating HTTP Client for Python**
@@ -18,17 +20,13 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](https://github.com/real-coder-xD/http_tls/blob/main/LICENSE)
 
 [Why](#why-http_tls) · [Comparison](#comparison-http_tls-vs-curl_cffi-primp-rnet-and-tls-client) · [Benchmarks](#verified-benchmarks--live-ja4--http2-fingerprint-audit) · [Installation](#installation) · [Quick Start](#migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client) · [Rust Extraction (CSS/XPath/JSON)](#built-in-pure-rust-extraction-html5-css3-xpath-10-json-path--dfa-regex) · [Concurrency](#high-concurrency-execution-native-tokio-async--sync-gather) · [Streaming](#streaming-responses--multipart-file-uploads)<br>
-[WebSockets](#tls-impersonated-websockets-sync--async) · [Fingerprint Tuning](#custom-ja3-boringssl-tls_options-http2-settings--wire-header-order) · [Proxies & DoH DNS](#proxies-dns-over-https-doh-custom-resolve--ipv6-64-binding) · [Auth & mTLS](#authentication-basic-bearer-digest-custom-ca-bundles--mutual-tls-mtls) · [Anti-Bot](#waf-challenge-detection-retries-playwright-storage_statejson--solver-bridge) · [Traffic Inspection](#traffic-inspection-wireshark-keylog--har-12-export) · [Presets](#supported-browser-impersonation-presets-100-profiles) · [API Reference](#api-reference-summary) · [Architecture](#architecture-under-the-hood) · [FAQ](#frequently-asked-questions-faq) · [Changelog](CHANGELOG.md)
+[WebSockets](#tls-impersonated-websockets-sync--async) · [Fingerprint Tuning](#custom-ja3-boringssl-tls_options-http2-settings--wire-header-order) · [Proxies & DoH DNS](#proxies-dns-over-https-doh-custom-resolve--ipv6-64-binding) · [Auth & mTLS](#authentication-basic-bearer-digest-custom-ca-bundles--mutual-tls-mtls) · [Anti-Bot](#waf-challenge-detection-retries-playwright-storage_statejson--solver-bridge) · [Traffic Inspection](#traffic-inspection-wireshark-keylog--har-12-export) · [Presets](#supported-browser-impersonation-presets-100-profiles) · [C-ABI DLL/.so/.dylib](#c-abi-shared-library-c-go-nodejs-cc-php) · [API Reference](#api-reference-summary) · [Architecture](#architecture-under-the-hood) · [FAQ](#frequently-asked-questions-faq) · [Changelog](CHANGELOG.md)
 
 </div>
 
-`http_tls` (`pip install http-tls`) is a high-performance, standalone **Rust + BoringSSL (`btls`) HTTP client & extraction toolkit for Python** that reproduces byte-exact **TLS (JA3, JA4, GREASE, ALPS, Real ECH, Post-Quantum `X25519MLKEM768`)**, **HTTP/2 (Akamai)**, and **UDP QUIC HTTP/3** browser fingerprints for over 100 Chrome, Safari, Firefox, Edge, Opera, OkHttp, and Tor profiles — and parses HTML/JSON/text responses directly inside Rust (`html5ever` CSS3, native XPath 1.0, `serde_json` JSON Path, linear-time DFA `regex`).
+`http_tls` is a standalone **Rust + BoringSSL (`btls`) HTTP/1.1, HTTP/2 & UDP QUIC HTTP/3 client and HTML5/XPath/JSON extraction toolkit** that reproduces byte-exact **TLS (JA3, JA4, GREASE, ALPS, Real ECH, Post-Quantum `X25519MLKEM768`)**, **HTTP/2 (Akamai)**, and **UDP QUIC HTTP/3** browser fingerprints across 131+ Chrome, Safari, Firefox, Edge, Opera, OkHttp, and Tor profiles — and parses HTML/JSON/text directly inside Rust (`html5ever` CSS3, native XPath 1.0, `serde_json` JSON Path, linear-time DFA `regex`).
 
-Built on Rust PyO3 (`abi3-py38`), Tokio, `wreq`, `quinn`/`h3`, `dom_query`, and Hickory async DNS, `http_tls` ships as a single self-contained ABI3 wheel with **zero Python runtime dependencies** and works as a drop-in replacement for **`requests`**, **`httpx`**, and **`curl_cffi`**.
-
-```bash
-pip install http-tls
-```
+Shipped as **one self-contained Python ABI3 wheel** (zero Python dependencies, drop-in for `requests`, `httpx`, and `curl_cffi`) and as a **standalone C-ABI shared library** (`http_tls.dll` / `libhttp_tls.so` / `libhttp_tls.dylib`, zero Python runtime) for **C#, Go, Node.js, C/C++, and PHP**.
 
 ---
 
@@ -36,7 +34,7 @@ pip install http-tls
 
 | Property | Value |
 | :--- | :--- |
-| **PyPI Package** | `http-tls` (`pip install http-tls`) |
+| **Distribution** | Python PyPI (`http-tls`, ABI3 wheels 3.8–3.14+) · Native C-ABI (`http_tls.dll` / `.so` / `.dylib` + `http_tls.h`, zero Python) |
 | **Python Import** | `import http_tls` |
 | **TLS / HTTP Engine** | Embedded Rust `wreq` + BoringSSL (`btls`) + `quinn`/`h3` UDP QUIC (HTTP/1.1, HTTP/2 & HTTP/3), zero `libcurl` or Go CGo dependency |
 | **Async & DNS Stack** | Native Rust Tokio runtime (`pyo3-async-runtimes`) + Hickory async DNS + **Session-wide DNS-over-HTTPS (`doh=True`)** |
@@ -197,29 +195,36 @@ Reproduce locally with `python benchmarks/bench_extraction.py` (105.7 KB HTML / 
 
 ## Installation
 
-Prebuilt ABI3 wheels are published on PyPI for Windows (`x86_64`), Linux (`manylinux_2_28` `x86_64` and `aarch64`), and macOS (`x86_64` and `arm64`), supporting Python 3.8 through 3.14+ with zero Python runtime dependencies:
+### Python (ABI3 Wheels — Python 3.8 to 3.14+)
+
+Prebuilt wheels with **zero Python runtime dependencies** are published on PyPI for Windows (`x86_64`), Linux (`manylinux_2_28` `x86_64` / `aarch64`), and macOS (`x86_64` / `arm64`):
 
 ```bash
-pip install http-tls
+pip install http-tls      # Install
+pip install -U http-tls   # Upgrade to latest
 ```
 
-Upgrade to the latest version:
+### C#, Go, Node.js, C/C++, PHP (Standalone C-ABI Shared Library)
 
-```bash
-pip install -U http-tls
-```
+Download the prebuilt binary for your OS (`http_tls-windows-x86_64.dll`, `libhttp_tls-linux-x86_64.so`, `libhttp_tls-linux-aarch64.so`, `libhttp_tls-macos-aarch64.dylib`, `libhttp_tls-macos-x86_64.dylib`) and [`http_tls.h`](include/http_tls.h) from [GitHub Releases](https://github.com/real-coder-xD/http_tls/releases) — **zero Python runtime required**. See the [C-ABI Handbook](docs/c-abi.md) for drop-in snippets.
 
-### Building from Source
+<details>
+<summary><strong>Building from source</strong> (Python wheel or C-ABI shared library)</summary>
 
-Building from source requires Rust (`>= 1.98`), `cmake`, `perl`, `clang`/`libclang` (plus `nasm` on Windows):
+Requires Rust (`>= 1.98`), `cmake`, `perl`, `clang`/`libclang` (plus `nasm` on Windows):
 
 ```bash
 git clone https://github.com/real-coder-xD/http_tls.git
 cd http_tls
-pip install maturin
-maturin build --release --out dist
-pip install dist/*.whl
+
+# Option A: Build & install Python ABI3 wheel
+pip install maturin && maturin build --release --out dist && pip install dist/*.whl
+
+# Option B: Build standalone C-ABI shared library (http_tls.dll / .so / .dylib)
+cargo build --release --manifest-path ffi/Cargo.toml --target-dir target
 ```
+
+</details>
 
 ---
 
@@ -710,6 +715,30 @@ Every preset returned by `http_tls.supported_presets()` is a **verified native B
 - `▸` **Opera (`opera_116` – `opera_131`)**: `opera_131`, `opera_130`, `opera_128`, `opera_124`, `opera_120`, `opera_116`.
 - `▸` **OkHttp (Android)**: `okhttp_5`, `okhttp_4_12`, `okhttp_4_10`, `okhttp_4_9`, `okhttp_3_14`, `okhttp_3_11`, `okhttp_3_9`.
 - `▸` **Tor & Automatic Rotation**: `tor_14_5`, `random`, and `weighted_random` (market-share weighted browser + OS selection).
+
+---
+
+## C-ABI Shared Library (C#, Go, Node.js, C/C++, PHP)
+
+Need `http_tls` outside Python? Download pre-built binaries from [GitHub Releases](https://github.com/real-coder-xD/http_tls/releases) or build the standalone C-ABI shared library (**`http_tls.dll`** / **`libhttp_tls.so`** / **`libhttp_tls.dylib`**) with **zero Python dependency** (`python3.dll` is never linked) and C header [`include/http_tls.h`](include/http_tls.h).
+
+- **Full BoringSSL core included:** 131+ presets, HTTP/1.1, HTTP/2, UDP QUIC HTTP/3, Real ECH (`sni=encrypted`) on both TCP H2 & UDP H3, DoH, SOCKS5 UDP, JA3 / Akamai H2, Cookie Jar, incremental H1/H2/H3 streaming, full-duplex TLS-impersonated WebSockets, concurrent Rust Tokio `http_tls_gather`, WAF `challenge` classifier, and Pure Rust `http_tls_extract` (CSS3, XPath 1.0, JSONPath, Regex, `between`).
+- **Simple UTF-8 JSON C-ABI (19 thread-safe functions):** `http_tls_create_session`, `http_tls_request`, `http_tls_gather`, `http_tls_stream_open`/`read`/`close`, `http_tls_ws_connect`/`send`/`recv`/`close`, `http_tls_get_cookies`, `http_tls_set_cookies`, `http_tls_set_impersonate`, `http_tls_destroy_session`, `http_tls_destroy_all_sessions`, `http_tls_extract`, `http_tls_presets`, `http_tls_version`, `http_tls_free_string`.
+
+```csharp
+// C# (.NET 8+) — drop http_tls.dll next to your .exe, zero Python needed
+using var client = new HttpTlsNative(new { impersonate = "chrome_149", http3 = true, ech = true, doh = true });
+var resp = client.Request(new() { ["url"] = "https://cloudflare-ech.com/cdn-cgi/trace" });
+Console.WriteLine($"{resp["http_version"]} {resp["status_code"]} | ech_accepted={resp["ech_accepted"]}");
+```
+
+```bash
+# Build standalone shared library from source (zero Python runtime required)
+cargo build --release --manifest-path ffi/Cargo.toml --target-dir target
+```
+
+Full C-ABI Handbook (all 19 functions, JSON schemas, Streaming, WebSockets, PHP/C/C++ recipes) & runnable examples:
+[`docs/c-abi.md`](docs/c-abi.md) · [`ffi/README.md`](ffi/README.md) · [`ffi/examples/csharp`](ffi/examples/csharp) · [`ffi/examples/go`](ffi/examples/go) · [`ffi/examples/nodejs`](ffi/examples/nodejs).
 
 ---
 

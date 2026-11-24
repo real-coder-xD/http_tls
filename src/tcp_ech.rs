@@ -150,8 +150,10 @@ pub struct TcpEchOutcome {
     pub elapsed: f64,
 }
 
+#[allow(dead_code)]
 pub type TcpEchBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send + 'static>>;
 
+#[allow(dead_code)]
 pub struct TcpEchStreamOutcome {
     pub status_code: u16,
     pub wreq_headers: HeaderMap,
@@ -776,7 +778,7 @@ async fn open_tcp_ech_single_hop(
 }
 
 pub async fn execute_tcp_ech_request(
-    spec: TcpEchSpec,
+    mut spec: TcpEchSpec,
     jar: Arc<Jar>,
     ech_cache: EchCache,
     ticket_cache: TicketCache,
@@ -784,6 +786,7 @@ pub async fn execute_tcp_ech_request(
     doh_client: Option<Client>,
 ) -> Result<TcpEchOutcome, String> {
     let start = Instant::now();
+    let total_timeout = spec.timeout;
     let fut = async {
         let mut current_url = spec.url.clone();
         let mut current_method = spec.method.to_uppercase();
@@ -826,14 +829,20 @@ pub async fn execute_tcp_ech_request(
                         next_url.to_string(),
                         open.headers_map,
                     ));
-                    if open.status_code == 303
+                    let stripped_body = open.status_code == 303
                         || ((open.status_code == 301 || open.status_code == 302)
                             && current_method != "GET"
-                            && current_method != "HEAD")
-                    {
+                            && current_method != "HEAD");
+                    if stripped_body {
                         current_method = "GET".to_string();
                         current_body = None;
                     }
+                    crate::sanitize_redirect_headers(
+                        &mut spec.headers,
+                        &current_url,
+                        &next_url,
+                        stripped_body,
+                    );
                     drop(open.conn_guard);
                     current_url = next_url;
                     continue;
@@ -865,13 +874,14 @@ pub async fn execute_tcp_ech_request(
         Err("[redirect] Too many redirects".to_string())
     };
 
-    tokio::time::timeout(spec.timeout, fut)
+    tokio::time::timeout(total_timeout, fut)
         .await
         .map_err(|_| "[timeout] TCP ECH request timed out".to_string())?
 }
 
+#[allow(dead_code)]
 pub async fn execute_tcp_ech_stream(
-    spec: TcpEchSpec,
+    mut spec: TcpEchSpec,
     jar: Arc<Jar>,
     ech_cache: EchCache,
     ticket_cache: TicketCache,
@@ -879,6 +889,7 @@ pub async fn execute_tcp_ech_stream(
     doh_client: Option<Client>,
 ) -> Result<TcpEchStreamOutcome, String> {
     let start = Instant::now();
+    let total_timeout = spec.timeout;
     let open_fut = async {
         let mut current_url = spec.url.clone();
         let mut current_method = spec.method.to_uppercase();
@@ -921,14 +932,20 @@ pub async fn execute_tcp_ech_stream(
                         next_url.to_string(),
                         open.headers_map,
                     ));
-                    if open.status_code == 303
+                    let stripped_body = open.status_code == 303
                         || ((open.status_code == 301 || open.status_code == 302)
                             && current_method != "GET"
-                            && current_method != "HEAD")
-                    {
+                            && current_method != "HEAD");
+                    if stripped_body {
                         current_method = "GET".to_string();
                         current_body = None;
                     }
+                    crate::sanitize_redirect_headers(
+                        &mut spec.headers,
+                        &current_url,
+                        &next_url,
+                        stripped_body,
+                    );
                     drop(open.conn_guard);
                     current_url = next_url;
                     continue;
@@ -991,7 +1008,7 @@ pub async fn execute_tcp_ech_stream(
         Err("[redirect] Too many redirects".to_string())
     };
 
-    tokio::time::timeout(spec.timeout, open_fut)
+    tokio::time::timeout(total_timeout, open_fut)
         .await
         .map_err(|_| "[timeout] TCP ECH stream timed out".to_string())?
 }

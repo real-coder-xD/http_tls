@@ -2,6 +2,20 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [1.3.0] - 2026-11-24
+
+### Standalone C-ABI Shared Library (`http_tls.dll` / `libhttp_tls.so` / `libhttp_tls.dylib`), Full-Duplex WebSocket & Hardening
+- **Zero-Python Standalone C-ABI Shared Library (`src/ffi.rs`, `ffi/`, `include/http_tls.h`):** Decoupled PyO3 behind an optional `python` Cargo feature and added a dedicated `cdylib` target exporting 19 thread-safe UTF-8 JSON C functions (`http_tls_version`, `http_tls_presets`, `http_tls_create_session`, `http_tls_request`, `http_tls_gather`, `http_tls_get_cookies`, `http_tls_set_cookies`, `http_tls_set_impersonate`, `http_tls_destroy_session`, `http_tls_destroy_all_sessions`, `http_tls_stream_open`/`read`/`close`, `http_tls_ws_connect`/`send`/`recv`/`close`, `http_tls_extract`, `http_tls_free_string`) with zero `python3.dll` / `libpython` linkage.
+- **Full-Stack Feature Coverage in C-ABI:** Includes all 131+ BoringSSL presets, HTTP/1.1, HTTP/2, UDP QUIC HTTP/3, Real ECH (`sni=encrypted`) on TCP H2 & UDP H3, DoH, SOCKS5 UDP, native Rust `ja3` & `akamai_h2` parsers, RFC 6265 Cookie Jar, `form`/`json`/`body_base64`/multipart `files`, Tokio `gather()`, incremental H1/H2/H3 streaming with cross-thread cancellation, full-duplex TLS WebSockets, WAF `challenge` classification, and Pure Rust HTML5 CSS3/XPath/JSONPath/Regex/`between` extraction.
+- **Multi-Language Examples, Handbook & CI Artifacts:** Added runnable examples for C# (.NET 8+ P/Invoke), Go (zero-CGO Windows DLL), and Node.js (`koffi`), full C-ABI developer handbook (`docs/c-abi.md`, `ffi/README.md`, PHP FFI & C/C++ recipes, 5-step binding blueprint), and automated GitHub Release builds (`manylinux_2_28` `glibc 2.28` Linux x64/ARM64, Windows x64, macOS ARM64/Intel + `http_tls.h`).
+- **Full-Duplex WebSockets Across Both Python & C-ABI (`src/ws.rs`, `src/ffi.rs`):** Split `wreq::ws::WebSocket` into independent `SplitSink` + `SplitStream` locks with `tokio::sync::Notify` cancellation so concurrent `send`/`recv`/`close` calls never block each other.
+- **Core Protocol, Cookie & Security Fixes (`src/lib.rs`, `src/h3_transport.rs`, `src/tcp_ech.rs`, `src/options.rs`):**
+  - Replaced `RequestBuilder::header()` (append) with `RequestBuilder::headers()` (replace) so caller `User-Agent` and `Content-Type` overrides never emit duplicate headers on the wire.
+  - Upgraded `delete_cookie_core()` to use `wreq::cookie::Jar::remove()` directly and `c.host()` fallback, preserving host-only and IP-literal (`127.0.0.1`) cookies.
+  - Added `sanitize_redirect_headers()` to HTTP/3 and TCP ECH redirect loops to strip `Authorization`, `Proxy-Authorization`, and manual `Cookie` headers on cross-origin redirects and strip stale `Content-Length`/`Content-Type` headers on `301`/`302`/`303` POST->GET downgrades.
+  - Added `safe_duration()` clamping (`0.05s..=86400s`), checked `TryFrom` integer parsing in TLS/HTTP2 options, and bounded `gather()` concurrency to eliminate overflow panics and OOM risks on untrusted inputs.
+- **Documentation & Release Banner:** Added dark-mode release banner (`docs/assets/banner.jpg`) and deduplicated `README.md` installation sections for Python wheels and C-ABI shared libraries.
+
 ## [1.2.1] - 2026-11-24
 
 ### Fixed

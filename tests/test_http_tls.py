@@ -251,9 +251,13 @@ def _start_ws_echo_server():
     return port, stop, sock
 
 
+class _LargeBacklogHTTPServer(ThreadingHTTPServer):
+    request_queue_size = 128
+
+
 @pytest.fixture(scope="module")
 def http_server():
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    srv = _LargeBacklogHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_port}", srv.server_port
     srv.shutdown()

@@ -1,5 +1,6 @@
 // Language: Rust 2021 | File: src/h3_transport.rs | Target: Pure BoringSSL UDP QUIC HTTP/3 Transport, Multiplexed Pool & Incremental Streaming
 use crate::doh::{fetch_ech_config_list, DohResolver, EchCache};
+use crate::error::{CoreError, CoreResult};
 use crate::presets::default_h3_browser_headers;
 use crate::quic_boring::{self, TicketCache};
 use crate::socks5_udp;
@@ -9,8 +10,6 @@ use crate::{
 };
 
 use bytes::{Buf, Bytes};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
-use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -98,7 +97,7 @@ fn build_h3_client_config(
     ech_retry_out: Arc<Mutex<Option<Vec<u8>>>>,
     ticket_cache: TicketCache,
     ticket_key: String,
-) -> PyResult<quinn::ClientConfig> {
+) -> CoreResult<quinn::ClientConfig> {
     let boring_cfg = quic_boring::BoringQuicClientConfig::new(
         preset,
         verify,
@@ -110,7 +109,7 @@ fn build_h3_client_config(
         ticket_cache,
         ticket_key,
     )
-    .map_err(|e| PyRuntimeError::new_err(format!("[builder] BoringSSL QUIC init failed: {e}")))?;
+    .map_err(|e| CoreError::runtime(format!("[builder] BoringSSL QUIC init failed: {e}")))?;
     let mut client_cfg = quinn::ClientConfig::new(Arc::new(boring_cfg));
 
     // Per-browser QUIC transport parameters (0x0039): Chrome/Edge/Opera vs Firefox vs Safari
@@ -154,7 +153,7 @@ async fn resolve_h3_target(
     resolve_entries: &[(String, Vec<SocketAddr>)],
     doh_resolver: Option<&DohResolver>,
     prefer_ipv6: Option<bool>,
-) -> PyResult<SocketAddr> {
+) -> CoreResult<SocketAddr> {
     for (dom, addrs) in resolve_entries {
         if dom.eq_ignore_ascii_case(host) {
             if let Some(&first) = addrs.first() {
@@ -170,12 +169,12 @@ async fn resolve_h3_target(
         return doh
             .resolve_socket_addr(host, port, prefer_ipv6)
             .await
-            .map_err(|e| PyRuntimeError::new_err(format!("[connect] DoH DNS lookup failed: {e}")));
+            .map_err(|e| CoreError::runtime(format!("[connect] DoH DNS lookup failed: {e}")));
     }
     let lookup_target = format!("{host}:{port}");
     let addrs: Vec<SocketAddr> = lookup_host(&lookup_target)
         .await
-        .map_err(|e| PyRuntimeError::new_err(format!("[connect] DNS lookup failed for '{lookup_target}': {e}")))?
+        .map_err(|e| CoreError::runtime(format!("[connect] DNS lookup failed for '{lookup_target}': {e}")))?
         .collect();
     if let Some(want_v6) = prefer_ipv6 {
         if let Some(&matched) = addrs.iter().find(|a| a.is_ipv6() == want_v6) {
@@ -189,7 +188,7 @@ async fn resolve_h3_target(
     addrs
         .into_iter()
         .next()
-        .ok_or_else(|| PyRuntimeError::new_err(format!("[connect] No addresses resolved for '{lookup_target}'")))
+        .ok_or_else(|| CoreError::runtime(format!("[connect] No addresses resolved for '{lookup_target}'")))
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -253,7 +252,7 @@ async fn acquire_h3_conn(
     ticket_cache: &TicketCache,
     doh_resolver: Option<&DohResolver>,
     doh_client: Option<&Client>,
-) -> PyResult<(
+) -> CoreResult<(
     H3PoolKey,
     h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     Option<String>,
@@ -316,7 +315,7 @@ async fn acquire_h3_conn(
         active_ech.is_some()
     );
     let mut final_pair: Option<(quinn::Endpoint, quinn::Connection)> = None;
-    let mut last_err: Option<PyErr> = None;
+    let mut last_err: Option<CoreError> = None;
 
     // Up to 2 attempts: second attempt runs only if BoringSSL returns ECH retry configs.
     for ech_attempt in 0..2 {
@@ -342,7 +341,7 @@ async fn acquire_h3_conn(
             )
             .await
             .map_err(|e| {
-                PyRuntimeError::new_err(format!(
+                CoreError::runtime(format!(
                     "[connect] SOCKS5 UDP ASSOCIATE failed via '{proxy_url}': {e}"
                 ))
             })?;
@@ -353,7 +352,7 @@ async fn acquire_h3_conn(
                 Arc::new(quinn::TokioRuntime),
             )
             .map_err(|e| {
-                PyRuntimeError::new_err(format!(
+                CoreError::runtime(format!(
                     "[connect] QUIC SOCKS5 endpoint init failed: {e}"
                 ))
             })?
@@ -369,17 +368,17 @@ async fn acquire_h3_conn(
                 }
             };
             let udp_sock = std::net::UdpSocket::bind(bind_addr).map_err(|e| {
-                PyRuntimeError::new_err(format!("[connect] UDP socket bind failed on {bind_addr}: {e}"))
+                CoreError::runtime(format!("[connect] UDP socket bind failed on {bind_addr}: {e}"))
             })?;
             quinn::Endpoint::new(ep_cfg, None, udp_sock, Arc::new(quinn::TokioRuntime)).map_err(|e| {
-                PyRuntimeError::new_err(format!("[connect] QUIC endpoint init failed on {bind_addr}: {e}"))
+                CoreError::runtime(format!("[connect] QUIC endpoint init failed on {bind_addr}: {e}"))
             })?
         };
         endpoint.set_default_client_config(client_cfg);
 
         let connecting = endpoint
             .connect(remote_sa, clean_sni)
-            .map_err(|e| PyRuntimeError::new_err(format!("[connect] QUIC connect init failed: {e}")))?;
+            .map_err(|e| CoreError::runtime(format!("[connect] QUIC connect init failed: {e}")))?;
 
         match tokio::time::timeout(spec.connect_timeout, connecting).await {
             Ok(Ok(c)) => {
@@ -413,12 +412,12 @@ async fn acquire_h3_conn(
                 } else {
                     "connect"
                 };
-                last_err = Some(PyRuntimeError::new_err(format!("[{tag}] QUIC handshake failed: {e}")));
+                last_err = Some(CoreError::runtime(format!("[{tag}] QUIC handshake failed: {e}")));
                 break;
             }
             Err(_) => {
                 endpoint.close(0u32.into(), b"timeout");
-                last_err = Some(PyRuntimeError::new_err(
+                last_err = Some(CoreError::runtime(
                     "[connect_timeout] QUIC UDP handshake timed out",
                 ));
                 break;
@@ -430,7 +429,7 @@ async fn acquire_h3_conn(
         Some(pair) => pair,
         None => {
             return Err(last_err.unwrap_or_else(|| {
-                PyRuntimeError::new_err("[connect] QUIC handshake failed")
+                CoreError::runtime("[connect] QUIC handshake failed")
             }));
         }
     };
@@ -452,7 +451,7 @@ async fn acquire_h3_conn(
     let quinn_conn = h3_quinn::Connection::new(conn.clone());
     let (mut driver, send_request) = h3::client::new(quinn_conn).await.map_err(|e| {
         endpoint.close(0u32.into(), b"h3_init_err");
-        PyRuntimeError::new_err(format!("[connect] HTTP/3 session init failed: {e}"))
+        CoreError::runtime(format!("[connect] HTTP/3 session init failed: {e}"))
     })?;
 
     let driver_handle = tokio::spawn(async move {
@@ -495,9 +494,11 @@ async fn acquire_h3_conn(
     ))
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub(crate) struct SharedVec(Arc<Mutex<Vec<u8>>>);
 
+#[allow(dead_code)]
 impl SharedVec {
     fn drain_bytes(&self) -> Vec<u8> {
         let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -517,6 +518,7 @@ impl Write for SharedVec {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) enum H3StreamDecoder {
     Identity,
     Gzip(flate2::write::GzDecoder<SharedVec>, SharedVec),
@@ -525,6 +527,7 @@ pub(crate) enum H3StreamDecoder {
     Zstd(zstd::stream::write::Decoder<'static, SharedVec>, SharedVec),
 }
 
+#[allow(dead_code)]
 impl H3StreamDecoder {
     pub(crate) fn from_encoding(content_encoding: Option<&str>) -> Self {
         let enc = match content_encoding {
@@ -640,15 +643,15 @@ async fn open_h3_single_hop(
     doh_resolver: Option<&DohResolver>,
     doh_client: Option<&Client>,
     port_override: Option<u16>,
-) -> PyResult<H3OpenHop> {
+) -> CoreResult<H3OpenHop> {
     if current_url.scheme() != "https" {
-        return Err(PyRuntimeError::new_err(
+        return Err(CoreError::runtime(
             "[connect] HTTP/3 (QUIC) requires an https:// URL",
         ));
     }
     let host = current_url
         .host_str()
-        .ok_or_else(|| PyValueError::new_err("HTTP/3 URL missing host"))?
+        .ok_or_else(|| CoreError::value("HTTP/3 URL missing host"))?
         .to_string();
     let port = port_override.or_else(|| current_url.port()).unwrap_or(443);
 
@@ -666,10 +669,10 @@ async fn open_h3_single_hop(
         .authority(authority.as_str())
         .path_and_query(if path_and_query.is_empty() { "/" } else { &path_and_query })
         .build()
-        .map_err(|e| PyValueError::new_err(format!("Invalid HTTP/3 URI: {e}")))?;
+        .map_err(|e| CoreError::value(format!("Invalid HTTP/3 URI: {e}")))?;
 
     let method = http::Method::from_bytes(method_str.as_bytes())
-        .map_err(|e| PyValueError::new_err(format!("Invalid HTTP method '{method_str}': {e}")))?;
+        .map_err(|e| CoreError::value(format!("Invalid HTTP method '{method_str}': {e}")))?;
 
     // Merge browser defaults + session/caller headers + cookie jar
     let defaults = default_h3_browser_headers(
@@ -754,7 +757,7 @@ async fn open_h3_single_hop(
         }
         let req = req_builder
             .body(())
-            .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 request build error: {e}")))?;
+            .map_err(|e| CoreError::runtime(format!("[request] HTTP/3 request build error: {e}")))?;
 
         let mut stream = match send_request.send_request(req).await {
             Ok(s) => s,
@@ -766,7 +769,7 @@ async fn open_h3_single_hop(
                     }
                     continue;
                 }
-                return Err(PyRuntimeError::new_err(format!(
+                return Err(CoreError::runtime(format!(
                     "[request] HTTP/3 send_request failed: {e}"
                 )));
             }
@@ -782,7 +785,7 @@ async fn open_h3_single_hop(
                         }
                         continue;
                     }
-                    return Err(PyRuntimeError::new_err(format!(
+                    return Err(CoreError::runtime(format!(
                         "[request] HTTP/3 send_data failed: {e}"
                     )));
                 }
@@ -796,7 +799,7 @@ async fn open_h3_single_hop(
                 }
                 continue;
             }
-            return Err(PyRuntimeError::new_err(format!(
+            return Err(CoreError::runtime(format!(
                 "[request] HTTP/3 stream finish failed: {e}"
             )));
         }
@@ -811,7 +814,7 @@ async fn open_h3_single_hop(
                     }
                     continue;
                 }
-                return Err(PyRuntimeError::new_err(format!(
+                return Err(CoreError::runtime(format!(
                     "[request] HTTP/3 recv_response failed: {e}"
                 )));
             }
@@ -822,7 +825,7 @@ async fn open_h3_single_hop(
             resp = stream
                 .recv_response()
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_response failed: {e}")))?;
+                .map_err(|e| CoreError::runtime(format!("[request] HTTP/3 recv_response failed: {e}")))?;
         }
 
         let status_code = resp.status().as_u16();
@@ -869,20 +872,21 @@ async fn open_h3_single_hop(
         ));
     }
 
-    Err(PyRuntimeError::new_err("[connect] HTTP/3 connection retry exhausted"))
+    Err(CoreError::runtime("[connect] HTTP/3 connection retry exhausted"))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_h3_request(
-    spec: H3RequestSpec,
+    mut spec: H3RequestSpec,
     jar: Arc<Jar>,
     h3_pool: H3Pool,
     ech_cache: EchCache,
     ticket_cache: TicketCache,
     doh_resolver: Option<DohResolver>,
     doh_client: Option<Client>,
-) -> PyResult<NativeResponse> {
+) -> CoreResult<NativeResponse> {
     let start = Instant::now();
+    let total_timeout = spec.timeout;
     let fut = async {
         let mut current_url = spec.url.clone();
         let mut current_method = spec.method.to_uppercase();
@@ -924,13 +928,13 @@ pub(crate) async fn execute_h3_request(
                     .and_then(|v| v.to_str().ok())
                 {
                     if hop >= spec.max_redirects {
-                        return Err(PyRuntimeError::new_err(format!(
+                        return Err(CoreError::runtime(format!(
                             "[redirect] Too many redirects (max {})",
                             spec.max_redirects
                         )));
                     }
                     let next_url = current_url.join(loc).map_err(|e| {
-                        PyValueError::new_err(format!("Invalid redirect URL '{loc}': {e}"))
+                        CoreError::value(format!("Invalid redirect URL '{loc}': {e}"))
                     })?;
                     history.push((
                         status_code,
@@ -938,14 +942,20 @@ pub(crate) async fn execute_h3_request(
                         next_url.to_string(),
                         headers_map,
                     ));
-                    if status_code == 303
+                    let stripped_body = status_code == 303
                         || ((status_code == 301 || status_code == 302)
                             && current_method != "GET"
-                            && current_method != "HEAD")
-                    {
+                            && current_method != "HEAD");
+                    if stripped_body {
                         current_method = "GET".to_string();
                         current_body = None;
                     }
+                    crate::sanitize_redirect_headers(
+                        &mut spec.headers,
+                        &current_url,
+                        &next_url,
+                        stripped_body,
+                    );
                     drop(stream);
                     current_url = next_url;
                     continue;
@@ -956,7 +966,7 @@ pub(crate) async fn execute_h3_request(
             while let Some(mut chunk) = stream
                 .recv_data()
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("[request] HTTP/3 recv_data failed: {e}")))?
+                .map_err(|e| CoreError::runtime(format!("[request] HTTP/3 recv_data failed: {e}")))?
             {
                 while chunk.has_remaining() {
                     let slice = chunk.chunk();
@@ -988,26 +998,27 @@ pub(crate) async fn execute_h3_request(
                 tls_resumed,
             });
         }
-        Err(PyRuntimeError::new_err("[redirect] Too many redirects"))
+        Err(CoreError::runtime("[redirect] Too many redirects"))
     };
 
-    match tokio::time::timeout(spec.timeout, fut).await {
+    match tokio::time::timeout(total_timeout, fut).await {
         Ok(res) => res,
-        Err(_) => Err(PyRuntimeError::new_err("[timeout] HTTP/3 request timed out")),
+        Err(_) => Err(CoreError::runtime("[timeout] HTTP/3 request timed out")),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) async fn execute_h3_stream(
-    spec: H3RequestSpec,
+    mut spec: H3RequestSpec,
     jar: Arc<Jar>,
     h3_pool: H3Pool,
     ech_cache: EchCache,
     ticket_cache: TicketCache,
     doh_resolver: Option<DohResolver>,
     doh_client: Option<Client>,
-) -> PyResult<NativeStream> {
+) -> CoreResult<NativeStream> {
     let start = Instant::now();
+    let total_timeout = spec.timeout;
     let open_fut = async {
         let mut current_url = spec.url.clone();
         let mut current_method = spec.method.to_uppercase();
@@ -1049,13 +1060,13 @@ pub(crate) async fn execute_h3_stream(
                     .and_then(|v| v.to_str().ok())
                 {
                     if hop >= spec.max_redirects {
-                        return Err(PyRuntimeError::new_err(format!(
+                        return Err(CoreError::runtime(format!(
                             "[redirect] Too many redirects (max {})",
                             spec.max_redirects
                         )));
                     }
                     let next_url = current_url.join(loc).map_err(|e| {
-                        PyValueError::new_err(format!("Invalid redirect URL '{loc}': {e}"))
+                        CoreError::value(format!("Invalid redirect URL '{loc}': {e}"))
                     })?;
                     history.push((
                         status_code,
@@ -1063,14 +1074,20 @@ pub(crate) async fn execute_h3_stream(
                         next_url.to_string(),
                         headers_map,
                     ));
-                    if status_code == 303
+                    let stripped_body = status_code == 303
                         || ((status_code == 301 || status_code == 302)
                             && current_method != "GET"
-                            && current_method != "HEAD")
-                    {
+                            && current_method != "HEAD");
+                    if stripped_body {
                         current_method = "GET".to_string();
                         current_body = None;
                     }
+                    crate::sanitize_redirect_headers(
+                        &mut spec.headers,
+                        &current_url,
+                        &next_url,
+                        stripped_body,
+                    );
                     drop(stream);
                     current_url = next_url;
                     continue;
@@ -1115,7 +1132,7 @@ pub(crate) async fn execute_h3_stream(
                             Err(e) => {
                                 dec_opt.take();
                                 return Some((
-                                    Err(PyRuntimeError::new_err(format!(
+                                    Err(CoreError::runtime(format!(
                                         "[request] HTTP/3 recv_data failed: {e}"
                                     ))),
                                     (req_stream, None),
@@ -1142,11 +1159,11 @@ pub(crate) async fn execute_h3_stream(
                 inner: Arc::new(tokio::sync::Mutex::new(Some(body_stream))),
             });
         }
-        Err(PyRuntimeError::new_err("[redirect] Too many redirects"))
+        Err(CoreError::runtime("[redirect] Too many redirects"))
     };
 
-    match tokio::time::timeout(spec.timeout, open_fut).await {
+    match tokio::time::timeout(total_timeout, open_fut).await {
         Ok(res) => res,
-        Err(_) => Err(PyRuntimeError::new_err("[timeout] HTTP/3 stream timed out")),
+        Err(_) => Err(CoreError::runtime("[timeout] HTTP/3 stream timed out")),
     }
 }

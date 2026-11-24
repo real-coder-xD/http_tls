@@ -1,4 +1,5 @@
 // Language: Rust 2021 | File: src/presets.rs | Target: Browser Emulation Presets, Chromium GREASE Brand Lists & H3 Default Headers
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use wreq_util::{Emulation, Platform, Profile};
 
@@ -437,7 +438,7 @@ pub(crate) fn default_h3_browser_headers(
     ]
 }
 
-#[pyfunction]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn supported_presets() -> Vec<&'static str> {
     vec![
         // Verified native BoringSSL + HTTP/2 profiles from wreq-util (zero header extrapolation)
@@ -470,7 +471,8 @@ pub fn supported_presets() -> Vec<&'static str> {
     ]
 }
 
-#[pyfunction]
+#[allow(dead_code)]
+#[cfg_attr(feature = "python", pyfunction)]
 pub fn is_verified_preset(preset: &str) -> bool {
     let lower = preset.trim().to_lowercase().replace('-', "_");
     if matches!(lower.as_str(), "random" | "weighted_random" | "auto" | "chrome" | "default") {
