@@ -46,7 +46,7 @@ jobs:
           mypy --ignore-missing-imports python/http_tls/__init__.pyi
 
   build-wheels:
-    name: Build & Test Wheels on ${{ matrix.os }} (${{ matrix.target }})
+    name: Build & Test Wheels on ${{ matrix.os }} (${{ matrix.label || matrix.target }})
     runs-on: ${{ matrix.os }}
     needs: [lint]
     strategy:
@@ -70,14 +70,12 @@ jobs:
             manylinux: 2_28
             run_tests: true
             test_pythons: '3.12'
-          # macOS Intel (cross-compiled from Apple Silicon)
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            run_tests: false
-            test_pythons: ''
-          # macOS Apple Silicon
+          # macOS Apple Silicon + Intel (single runner: avoids 4-way macOS runner contention)
           - os: macos-latest
             target: aarch64-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            extra_target: x86_64-apple-darwin
+            label: aarch64 + x86_64
             run_tests: true
             test_pythons: '3.12'
 
@@ -92,7 +90,7 @@ jobs:
       - name: Set up latest stable Rust (MSRV >= 1.98 for wreq)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_targets || matrix.target }}
 
       - name: Install Windows BoringSSL build deps (NASM + LLVM)
         if: runner.os == 'Windows'
@@ -111,7 +109,13 @@ jobs:
           before-script-linux: |
             set -e
             if command -v dnf >/dev/null 2>&1; then
-              dnf install -y cmake perl-core clang clang-devel clang-libs llvm-devel git ninja-build
+              dnf install -y \
+                --setopt=fastestmirror=True \
+                --setopt=max_parallel_downloads=10 \
+                --setopt=minrate=500000 \
+                --setopt=timeout=15 \
+                --setopt=install_weak_deps=False \
+                cmake perl-core clang clang-devel clang-libs llvm-devel git ninja-build
             elif command -v yum >/dev/null 2>&1; then
               yum install -y cmake perl-core clang clang-devel clang-libs llvm-devel git
             elif command -v apt-get >/dev/null 2>&1; then
@@ -129,6 +133,13 @@ jobs:
           python -m pip install pytest cryptography certifi
           python -m pip install dist/*.whl
           python -m pytest -v tests/
+
+      - name: Build extra cross-compiled wheel (${{ matrix.extra_target }})
+        if: ${{ matrix.extra_target != '' }}
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.extra_target }}
+          args: --release --out dist
 
       - name: Verify ABI3 wheel compatibility on Python 3.13
         if: ${{ matrix.os == 'ubuntu-latest' }}
@@ -151,7 +162,7 @@ jobs:
           path: dist
 
   build-capi:
-    name: Build & Test C-ABI Shared Library (${{ matrix.artifact_name }})
+    name: Build & Test C-ABI Shared Library (${{ matrix.label || matrix.artifact_name }})
     runs-on: ${{ matrix.os }}
     needs: [lint]
     strategy:
@@ -178,16 +189,14 @@ jobs:
             run_tests: true
           - os: macos-latest
             target: aarch64-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            extra_target: x86_64-apple-darwin
+            extra_artifact_name: libhttp_tls-macos-x86_64.dylib
             src_lib: libhttp_tls.dylib
             artifact_name: libhttp_tls-macos-aarch64.dylib
+            label: libhttp_tls-macos-aarch64 + x86_64
             manylinux_image: ''
             run_tests: true
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            src_lib: libhttp_tls.dylib
-            artifact_name: libhttp_tls-macos-x86_64.dylib
-            manylinux_image: ''
-            run_tests: false
 
     steps:
       - uses: actions/checkout@v4
@@ -202,7 +211,7 @@ jobs:
         if: ${{ matrix.manylinux_image == '' }}
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_targets || matrix.target }}
 
       - name: Install Windows BoringSSL build deps (NASM + LLVM)
         if: runner.os == 'Windows'
@@ -222,7 +231,13 @@ jobs:
             -w /io \
             "${{ matrix.manylinux_image }}" \
             bash -euo pipefail -c '
-              dnf install -y cmake perl-core clang clang-devel clang-libs llvm-devel git ninja-build
+              dnf install -y \
+                --setopt=fastestmirror=True \
+                --setopt=max_parallel_downloads=10 \
+                --setopt=minrate=500000 \
+                --setopt=timeout=15 \
+                --setopt=install_weak_deps=False \
+                cmake perl-core clang clang-devel clang-libs llvm-devel git ninja-build
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
               export PATH="$HOME/.cargo/bin:$PATH"
               cargo build --release --manifest-path ffi/Cargo.toml --target ${{ matrix.target }} --target-dir target
@@ -238,14 +253,21 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: |
-          cargo build --release --manifest-path ffi/Cargo.toml --target ${{ matrix.target }} --target-dir target
           mkdir -p capi-dist
+          cargo build --release --manifest-path ffi/Cargo.toml --target ${{ matrix.target }} --target-dir target
           cp "target/${{ matrix.target }}/release/${{ matrix.src_lib }}" "capi-dist/${{ matrix.artifact_name }}"
           if [ -f "target/${{ matrix.target }}/release/http_tls.dll.lib" ]; then
             cp "target/${{ matrix.target }}/release/http_tls.dll.lib" "capi-dist/http_tls-windows-x86_64.dll.lib"
           fi
           if [ "$(uname -s)" = "Darwin" ]; then
             ! otool -L "capi-dist/${{ matrix.artifact_name }}" | grep -i python
+          fi
+          if [ -n "${{ matrix.extra_target }}" ]; then
+            cargo build --release --manifest-path ffi/Cargo.toml --target "${{ matrix.extra_target }}" --target-dir target
+            cp "target/${{ matrix.extra_target }}/release/${{ matrix.src_lib }}" "capi-dist/${{ matrix.extra_artifact_name }}"
+            if [ "$(uname -s)" = "Darwin" ]; then
+              ! otool -L "capi-dist/${{ matrix.extra_artifact_name }}" | grep -i python
+            fi
           fi
 
       - name: Run C-ABI FFI test suite (Windows / macOS)
