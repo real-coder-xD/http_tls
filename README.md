@@ -19,7 +19,7 @@
 [![Downloads](https://img.shields.io/pypi/dm/http-tls?style=flat-square&color=blue)](https://pypi.org/project/http-tls/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](https://github.com/real-coder-xD/http_tls/blob/main/LICENSE)
 
-[Why](#why-http_tls) · [Comparison](#comparison-http_tls-vs-curl_cffi-primp-rnet-and-tls-client) · [Benchmarks](#verified-benchmarks--live-ja4--http2-fingerprint-audit) · [Installation](#installation) · [Quick Start](#migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client) · [Rust Extraction (CSS/XPath/JSON)](#built-in-pure-rust-extraction-html5-css3-xpath-10-json-path--dfa-regex) · [Concurrency](#high-concurrency-execution-native-tokio-async--sync-gather) · [Streaming](#streaming-responses--multipart-file-uploads)<br>
+[Installation](#installation) · [Quick Start](#migration--drop-in-quick-start-requests-httpx-curl_cffi-tls-client) · [Why](#why-http_tls) · [Comparison](#comparison-http_tls-vs-curl_cffi-primp-rnet-and-tls-client) · [Benchmarks](#verified-benchmarks--live-ja4--http2-fingerprint-audit) · [Rust Extraction (CSS/XPath/JSON)](#built-in-pure-rust-extraction-html5-css3-xpath-10-json-path--dfa-regex) · [Concurrency](#high-concurrency-execution-native-tokio-async--sync-gather) · [Streaming](#streaming-responses--multipart-file-uploads)<br>
 [WebSockets](#tls-impersonated-websockets-sync--async) · [Fingerprint Tuning](#custom-ja3-boringssl-tls_options-http2-settings--wire-header-order) · [Proxies & DoH DNS](#proxies-dns-over-https-doh-custom-resolve--ipv6-64-binding) · [Auth & mTLS](#authentication-basic-bearer-digest-custom-ca-bundles--mutual-tls-mtls) · [Anti-Bot](#waf-challenge-detection-retries-playwright-storage_statejson--solver-bridge) · [Traffic Inspection](#traffic-inspection-wireshark-keylog--har-12-export) · [Presets](#supported-browser-impersonation-presets-100-profiles) · [C-ABI DLL/.so/.dylib](#c-abi-shared-library-c-go-nodejs-cc-php) · [API Reference](#api-reference-summary) · [Architecture](#architecture-under-the-hood) · [FAQ](#frequently-asked-questions-faq) · [Changelog](CHANGELOG.md)
 
 </div>
@@ -27,6 +27,41 @@
 `http_tls` is a standalone **Rust + BoringSSL (`btls`) HTTP/1.1, HTTP/2 & UDP QUIC HTTP/3 client and HTML5/XPath/JSON extraction toolkit** that reproduces byte-exact **TLS (JA3, JA4, GREASE, ALPS, Real ECH, Post-Quantum `X25519MLKEM768`)**, **HTTP/2 (Akamai)**, and **UDP QUIC HTTP/3** browser fingerprints across 131+ Chrome, Safari, Firefox, Edge, Opera, OkHttp, and Tor profiles — and parses HTML/JSON/text directly inside Rust (`html5ever` CSS3, native XPath 1.0, `serde_json` JSON Path, linear-time DFA `regex`).
 
 Shipped as **one self-contained Python ABI3 wheel** (zero Python dependencies, drop-in for `requests`, `httpx`, and `curl_cffi`) and as a **standalone C-ABI shared library** (`http_tls.dll` / `libhttp_tls.so` / `libhttp_tls.dylib`, zero Python runtime) for **C#, Go, Node.js, C/C++, and PHP**.
+
+---
+
+## Installation
+
+### Python (ABI3 Wheels — Python 3.8 to 3.14+)
+
+Prebuilt wheels with **zero Python runtime dependencies** are published on PyPI for Windows (`x86_64`), Linux (`manylinux_2_28` `x86_64` / `aarch64`), and macOS (`x86_64` / `arm64`):
+
+```bash
+pip install http-tls      # Install
+pip install -U http-tls   # Upgrade to latest
+```
+
+### C#, Go, Node.js, C/C++, PHP (Standalone C-ABI Shared Library)
+
+Download the prebuilt binary for your OS (`http_tls-windows-x86_64.dll`, `libhttp_tls-linux-x86_64.so`, `libhttp_tls-linux-aarch64.so`, `libhttp_tls-macos-aarch64.dylib`, `libhttp_tls-macos-x86_64.dylib`) and [`http_tls.h`](include/http_tls.h) from [GitHub Releases](https://github.com/real-coder-xD/http_tls/releases) — **zero Python runtime required**. See the [C-ABI Handbook](docs/c-abi.md) for drop-in snippets.
+
+<details>
+<summary><strong>Building from source</strong> (Python wheel or C-ABI shared library)</summary>
+
+Requires Rust (`>= 1.98`), `cmake`, `perl`, `clang`/`libclang` (plus `nasm` on Windows):
+
+```bash
+git clone https://github.com/real-coder-xD/http_tls.git
+cd http_tls
+
+# Option A: Build & install Python ABI3 wheel
+pip install maturin && maturin build --release --out dist && pip install dist/*.whl
+
+# Option B: Build standalone C-ABI shared library (http_tls.dll / .so / .dylib)
+cargo build --release --manifest-path ffi/Cargo.toml --target-dir target
+```
+
+</details>
 
 ---
 
@@ -190,41 +225,6 @@ Reproduce locally with `python benchmarks/bench_extraction.py` (105.7 KB HTML / 
 | Cached Rust DFA `re()` (`500 matches`, ReDoS-safe) | **0.110 ms** | Python `re.compile().findall()`: 0.079 ms | Linear-time DFA guarantee |
 | Cached JSON Path `items[*].price` / `$..price` | **0.017 ms** / **0.028 ms** | `json.loads()` + listcomp: 0.283 ms | **10.1x–16.6x faster** |
 | JSON Path Filter `items[?(@.price>50)].id` | **0.248 ms** | — | Full filter predicates in Rust |
-
----
-
-## Installation
-
-### Python (ABI3 Wheels — Python 3.8 to 3.14+)
-
-Prebuilt wheels with **zero Python runtime dependencies** are published on PyPI for Windows (`x86_64`), Linux (`manylinux_2_28` `x86_64` / `aarch64`), and macOS (`x86_64` / `arm64`):
-
-```bash
-pip install http-tls      # Install
-pip install -U http-tls   # Upgrade to latest
-```
-
-### C#, Go, Node.js, C/C++, PHP (Standalone C-ABI Shared Library)
-
-Download the prebuilt binary for your OS (`http_tls-windows-x86_64.dll`, `libhttp_tls-linux-x86_64.so`, `libhttp_tls-linux-aarch64.so`, `libhttp_tls-macos-aarch64.dylib`, `libhttp_tls-macos-x86_64.dylib`) and [`http_tls.h`](include/http_tls.h) from [GitHub Releases](https://github.com/real-coder-xD/http_tls/releases) — **zero Python runtime required**. See the [C-ABI Handbook](docs/c-abi.md) for drop-in snippets.
-
-<details>
-<summary><strong>Building from source</strong> (Python wheel or C-ABI shared library)</summary>
-
-Requires Rust (`>= 1.98`), `cmake`, `perl`, `clang`/`libclang` (plus `nasm` on Windows):
-
-```bash
-git clone https://github.com/real-coder-xD/http_tls.git
-cd http_tls
-
-# Option A: Build & install Python ABI3 wheel
-pip install maturin && maturin build --release --out dist && pip install dist/*.whl
-
-# Option B: Build standalone C-ABI shared library (http_tls.dll / .so / .dylib)
-cargo build --release --manifest-path ffi/Cargo.toml --target-dir target
-```
-
-</details>
 
 ---
 
