@@ -2,6 +2,13 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [1.3.1] - 2026-11-26
+
+### Documentation, Visuals & Release Pipeline
+- **README & PyPI Layout (`README.md`):** Moved the **Installation** section (Python ABI3 wheels + standalone C-ABI `.dll`/`.so`/`.dylib` downloads + build-from-source) directly to the top of `README.md` and PyPI package description for immediate visibility.
+- **2:1 Release Banner (`docs/assets/banner.jpg`):** Re-rendered the release & social preview banner at exact `1280x640` (`2:1`) highlighting `v1.3.1` and standalone zero-Python C-ABI support.
+- **Faster Release CI (`.github/workflows/release.yml`):** Added AlmaLinux 8 `dnf` mirror-failover / parallel-download flags (`fastestmirror`, `max_parallel_downloads=10`, `minrate=500000`, `install_weak_deps=False`) and consolidated macOS ARM64 + Intel builds onto 2 runners instead of 4 to avoid hosted macOS queue contention.
+
 ## [1.3.0] - 2026-11-24
 
 ### Standalone C-ABI Shared Library (`http_tls.dll` / `libhttp_tls.so` / `libhttp_tls.dylib`), Full-Duplex WebSocket & Hardening
