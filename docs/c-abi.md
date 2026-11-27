@@ -92,6 +92,16 @@ All fields are optional; defaults use `impersonate: "chrome_149"` and `timeout: 
   "doh_url": "https://cloudflare-dns.com/dns-query",
   "ja3": "771,4865-4866-4867-49195-49199,0-23-65281,4588-29-23-24,0",
   "akamai_h2": "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p",
+  "quic_options": {
+    "receive_window": 15728640,
+    "stream_receive_window": 6291456,
+    "max_concurrent_bidi_streams": 100,
+    "max_concurrent_uni_streams": 103,
+    "send_grease": true,
+    "max_field_section_size": 262144,
+    "enable_datagram": true,
+    "enable_extended_connect": true
+  },
   "resolve": { "api.example.com": "127.0.0.1" },
   "local_address": "192.168.1.50",
   "ca_bundle_path": "/path/to/ca.pem",

@@ -877,3 +877,42 @@ def test_ffi_stream_cross_thread_cancel(ffi_lib: _FFILib, local_url: str) -> Non
     assert dt < 1.5, f"stream_close did not cancel blocked stream_read ({dt:.2f}s)!"
 
 
+def test_ffi_quic_options_and_akamai_h2_session_config(ffi_lib: _FFILib, local_url: str) -> None:
+    v = ffi_lib.version()
+    assert "quic_options" in v["features"]
+    assert "h3_grease" in v["features"]
+
+    # Valid quic_options + akamai_h2 session creation and request
+    created = ffi_lib.create_session(
+        {
+            "session_id": "test-quic-h2-1",
+            "impersonate": "chrome_149",
+            "akamai_h2": "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p",
+            "quic_options": {
+                "receive_window": 16_777_216,
+                "stream_receive_window": 6_291_456,
+                "send_window": 16_777_216,
+                "max_concurrent_bidi_streams": 100,
+                "max_concurrent_uni_streams": 103,
+                "max_idle_timeout": 30.0,
+                "keep_alive_interval": 15.0,
+                "send_grease": True,
+                "max_field_section_size": 262_144,
+                "enable_datagram": True,
+                "enable_extended_connect": True,
+            },
+        }
+    )
+    assert created["ok"] is True
+    r = ffi_lib.request({"session_id": "test-quic-h2-1", "url": f"{local_url}/echo"})
+    assert r["ok"] is True and r["status_code"] == 200
+    assert ffi_lib.destroy_session("test-quic-h2-1")["ok"] is True
+
+    # Invalid quic_options bounds must fail cleanly
+    bad_win = ffi_lib.create_session({"quic_options": {"receive_window": 128}})
+    assert bad_win["ok"] is False
+    bad_grease = ffi_lib.create_session({"quic_options": {"send_grease": "not-a-bool"}})
+    assert bad_grease["ok"] is False
+
+
+

@@ -5,6 +5,7 @@
 //! `SSLKEYLOGFILE` / `keylog_file`, and incremental chunk-by-chunk HTTP/2 streaming.
 
 use crate::doh::{fetch_ech_config_list, DohResolver, EchCache};
+use crate::options::RawHttp2Config;
 use crate::quic_boring::{
     cert_decompress_brotli, cert_decompress_zlib, cert_decompress_zstd, keylog_cb,
     keylog_ex_data_idx, load_ca_certs_into_store, load_client_identity, TicketCache,
@@ -133,6 +134,208 @@ pub struct TcpEchSpec {
     pub preset: String,
     pub ech_doh_url: String,
     pub ech_config_list: Option<Vec<u8>>,
+    pub http2_config: Option<RawHttp2Config>,
+}
+
+/// Apply per-browser Akamai HTTP/2 fingerprint defaults (`SETTINGS`, exact setting order,
+/// connection `WINDOW_UPDATE`, pseudo-header order, priorities) and overlay any custom
+/// `http2_options` / `akamai_h2` overrides onto `http2::client::Builder`.
+pub(crate) fn apply_h2_fingerprint(
+    b: &mut http2::client::Builder,
+    preset: &str,
+    custom: Option<&RawHttp2Config>,
+) {
+    use http2::frame::{
+        Priorities, Priority, PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency,
+        StreamId,
+    };
+
+    let lower = preset.trim().to_ascii_lowercase();
+    if lower.starts_with("firefox") || lower.starts_with("tor") {
+        // Firefox: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s
+        b.header_table_size(65_536)
+            .enable_push(false)
+            .initial_window_size(131_072)
+            .max_frame_size(16_384)
+            .initial_connection_window_size(12_582_912)
+            .settings_order(
+                SettingsOrder::builder()
+                    .extend([
+                        SettingId::HeaderTableSize,
+                        SettingId::EnablePush,
+                        SettingId::InitialWindowSize,
+                        SettingId::MaxFrameSize,
+                    ])
+                    .build(),
+            )
+            .headers_pseudo_order(
+                PseudoOrder::builder()
+                    .extend([
+                        PseudoId::Method,
+                        PseudoId::Path,
+                        PseudoId::Authority,
+                        PseudoId::Scheme,
+                    ])
+                    .build(),
+            );
+    } else if lower.starts_with("safari") {
+        // Safari: 2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p
+        b.enable_push(false)
+            .max_concurrent_streams(100)
+            .initial_window_size(2_097_152)
+            .no_rfc7540_priorities(true)
+            .initial_connection_window_size(10_485_760)
+            .settings_order(
+                SettingsOrder::builder()
+                    .extend([
+                        SettingId::EnablePush,
+                        SettingId::MaxConcurrentStreams,
+                        SettingId::InitialWindowSize,
+                        SettingId::NoRfc7540Priorities,
+                    ])
+                    .build(),
+            )
+            .headers_pseudo_order(
+                PseudoOrder::builder()
+                    .extend([
+                        PseudoId::Method,
+                        PseudoId::Scheme,
+                        PseudoId::Authority,
+                        PseudoId::Path,
+                    ])
+                    .build(),
+            );
+    } else if lower.starts_with("okhttp") {
+        // OkHttp: 4:16777216|16711681|0|m,p,a,s
+        b.initial_window_size(16_777_216)
+            .initial_connection_window_size(16_777_216)
+            .settings_order(
+                SettingsOrder::builder()
+                    .extend([SettingId::InitialWindowSize])
+                    .build(),
+            )
+            .headers_pseudo_order(
+                PseudoOrder::builder()
+                    .extend([
+                        PseudoId::Method,
+                        PseudoId::Path,
+                        PseudoId::Authority,
+                        PseudoId::Scheme,
+                    ])
+                    .build(),
+            );
+    } else {
+        // Chrome / Edge / Opera: 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
+        b.header_table_size(65_536)
+            .enable_push(false)
+            .initial_window_size(6_291_456)
+            .max_header_list_size(262_144)
+            .initial_connection_window_size(15_728_640)
+            .settings_order(
+                SettingsOrder::builder()
+                    .extend([
+                        SettingId::HeaderTableSize,
+                        SettingId::EnablePush,
+                        SettingId::InitialWindowSize,
+                        SettingId::MaxHeaderListSize,
+                    ])
+                    .build(),
+            )
+            .headers_pseudo_order(
+                PseudoOrder::builder()
+                    .extend([
+                        PseudoId::Method,
+                        PseudoId::Authority,
+                        PseudoId::Scheme,
+                        PseudoId::Path,
+                    ])
+                    .build(),
+            );
+    }
+
+    if let Some(cfg) = custom {
+        if let Some(v) = cfg.header_table_size {
+            b.header_table_size(v);
+        }
+        if let Some(v) = cfg.enable_push {
+            b.enable_push(v);
+        }
+        if let Some(v) = cfg.max_concurrent_streams {
+            b.max_concurrent_streams(v);
+        }
+        if let Some(v) = cfg.initial_window_size {
+            b.initial_window_size(v);
+        }
+        if let Some(v) = cfg.initial_connection_window_size {
+            b.initial_connection_window_size(v);
+        }
+        if let Some(v) = cfg.max_frame_size {
+            b.max_frame_size(v);
+        }
+        if let Some(v) = cfg.max_header_list_size {
+            b.max_header_list_size(v);
+        }
+        if let Some(v) = cfg.enable_connect_protocol {
+            b.enable_connect_protocol(v);
+        }
+        if let Some(v) = cfg.no_rfc7540_priorities {
+            b.no_rfc7540_priorities(v);
+        }
+        if let Some(v) = cfg.initial_stream_id {
+            b.initial_stream_id(v);
+        }
+        if let Some(ref order) = cfg.settings_order {
+            let mapped: Vec<SettingId> = order
+                .iter()
+                .filter_map(|&n| match n {
+                    1 => Some(SettingId::HeaderTableSize),
+                    2 => Some(SettingId::EnablePush),
+                    3 => Some(SettingId::MaxConcurrentStreams),
+                    4 => Some(SettingId::InitialWindowSize),
+                    5 => Some(SettingId::MaxFrameSize),
+                    6 => Some(SettingId::MaxHeaderListSize),
+                    8 => Some(SettingId::EnableConnectProtocol),
+                    9 => Some(SettingId::NoRfc7540Priorities),
+                    _ => None,
+                })
+                .collect();
+            if !mapped.is_empty() {
+                b.settings_order(SettingsOrder::builder().extend(mapped).build());
+            }
+        }
+        if let Some(ref pseudo) = cfg.headers_pseudo_order {
+            let mapped: Vec<PseudoId> = pseudo
+                .iter()
+                .filter_map(|&p| match p {
+                    0 => Some(PseudoId::Method),
+                    1 => Some(PseudoId::Authority),
+                    2 => Some(PseudoId::Scheme),
+                    3 => Some(PseudoId::Path),
+                    _ => None,
+                })
+                .collect();
+            if !mapped.is_empty() {
+                b.headers_pseudo_order(PseudoOrder::builder().extend(mapped).build());
+            }
+        }
+        if let Some((dep_id, weight, exclusive)) = cfg.headers_stream_dependency {
+            b.headers_stream_dependency(StreamDependency::new(
+                StreamId::from(dep_id),
+                weight,
+                exclusive,
+            ));
+        }
+        if let Some(ref prios) = cfg.priorities {
+            let mut pb = Priorities::builder();
+            for &(sid, dep_id, weight, exclusive) in prios {
+                pb = pb.push(Priority::new(
+                    StreamId::from(sid),
+                    StreamDependency::new(StreamId::from(dep_id), weight, exclusive),
+                ));
+            }
+            b.priorities(pb.build());
+        }
+    }
 }
 
 pub struct TcpEchOutcome {
@@ -632,14 +835,9 @@ async fn open_tcp_ech_single_hop(
         None
     };
 
-    // HTTP/2 handshake with Chrome-accurate SETTINGS
+    // HTTP/2 handshake with per-browser Akamai H2 settings + custom `http2_options` parity
     let mut h2_builder = http2::client::Builder::new();
-    h2_builder
-        .header_table_size(65_536)
-        .enable_push(false)
-        .initial_window_size(6_291_456)
-        .initial_connection_window_size(15_728_640)
-        .max_header_list_size(262_144);
+    apply_h2_fingerprint(&mut h2_builder, &spec.preset, spec.http2_config.as_ref());
 
     let (mut send_req, conn) = h2_builder
         .handshake::<_, Bytes>(tls_stream)

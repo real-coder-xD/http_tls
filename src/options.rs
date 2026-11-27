@@ -10,6 +10,7 @@ use pyo3::types::{PyDict, PyList};
 use serde_json::{Map, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::time::Duration;
 use wreq::header::OrigHeaderMap;
 use wreq::http2::{
     Http2Options, Priorities, Priority, PseudoId, PseudoOrder, SettingId, SettingsOrder,
@@ -18,6 +19,70 @@ use wreq::http2::{
 use wreq::tls::compress::CertificateCompressor;
 use wreq::tls::{AlpnProtocol, AlpsProtocol, ExtensionType, TlsOptions, TlsVersion};
 use wreq_util::emulate::compress::{BrotliCompressor, ZlibCompressor, ZstdCompressor};
+
+/// Pure-Rust mirror of custom HTTP/2 fingerprint settings so both `wreq` and the
+/// direct BoringSSL TCP ECH HTTP/2 transport (`src/tcp_ech.rs`) enforce identical
+/// Akamai HTTP/2 frames (`SETTINGS` order, `WINDOW_UPDATE`, pseudo-header order, priorities).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RawHttp2Config {
+    pub header_table_size: Option<u32>,
+    pub enable_push: Option<bool>,
+    pub max_concurrent_streams: Option<u32>,
+    pub initial_window_size: Option<u32>,
+    pub initial_connection_window_size: Option<u32>,
+    pub max_frame_size: Option<u32>,
+    pub max_header_list_size: Option<u32>,
+    pub enable_connect_protocol: Option<bool>,
+    pub no_rfc7540_priorities: Option<bool>,
+    pub initial_stream_id: Option<u32>,
+    pub settings_order: Option<Vec<u16>>,
+    /// Encoded pseudo-header order: 0=Method, 1=Authority, 2=Scheme, 3=Path.
+    pub headers_pseudo_order: Option<Vec<u8>>,
+    /// `(stream_id, weight, exclusive)`
+    pub headers_stream_dependency: Option<(u32, u8, bool)>,
+    /// `[(stream_id, dependency_id, weight, exclusive)]`
+    pub priorities: Option<Vec<(u32, u32, u8, bool)>>,
+}
+
+/// Optional QUIC transport & HTTP/3 framing overrides (`quic_options`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QuicOptions {
+    pub receive_window: Option<u32>,
+    pub stream_receive_window: Option<u32>,
+    pub send_window: Option<u64>,
+    pub max_concurrent_bidi_streams: Option<u32>,
+    pub max_concurrent_uni_streams: Option<u32>,
+    pub max_idle_timeout: Option<Duration>,
+    pub keep_alive_interval: Option<Duration>,
+    pub send_grease: Option<bool>,
+    pub max_field_section_size: Option<u64>,
+    pub enable_datagram: Option<bool>,
+    pub enable_extended_connect: Option<bool>,
+}
+
+fn setting_id_to_u16(id: SettingId) -> u16 {
+    match id {
+        SettingId::HeaderTableSize => 1,
+        SettingId::EnablePush => 2,
+        SettingId::MaxConcurrentStreams => 3,
+        SettingId::InitialWindowSize => 4,
+        SettingId::MaxFrameSize => 5,
+        SettingId::MaxHeaderListSize => 6,
+        SettingId::EnableConnectProtocol => 8,
+        SettingId::NoRfc7540Priorities => 9,
+        _ => 0,
+    }
+}
+
+fn pseudo_id_to_u8(id: PseudoId) -> u8 {
+    match id {
+        PseudoId::Method => 0,
+        PseudoId::Authority => 1,
+        PseudoId::Scheme => 2,
+        PseudoId::Path => 3,
+        _ => 0,
+    }
+}
 
 fn parse_tls_version_core(s: &str) -> CoreResult<TlsVersion> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -216,40 +281,58 @@ pub(crate) fn parse_tls_options_json(v: &Value) -> CoreResult<TlsOptions> {
 }
 
 #[allow(dead_code)]
-pub(crate) fn parse_http2_options_json(v: &Value) -> CoreResult<Http2Options> {
+pub(crate) fn parse_http2_options_json(v: &Value) -> CoreResult<(Http2Options, RawHttp2Config)> {
     let obj = v
         .as_object()
         .ok_or_else(|| CoreError::value("http2_options must be a JSON object"))?;
     let mut b = Http2Options::builder();
+    let mut raw = RawHttp2Config::default();
     if let Some(n) = obj.get("header_table_size").and_then(Value::as_u64) {
-        b = b.header_table_size(n as u32);
+        let v32 = u32::try_from(n).map_err(|_| CoreError::value("header_table_size out of u32 range"))?;
+        b = b.header_table_size(v32);
+        raw.header_table_size = Some(v32);
     }
     if let Some(x) = obj.get("enable_push").and_then(Value::as_bool) {
         b = b.enable_push(x);
+        raw.enable_push = Some(x);
     }
     if let Some(n) = obj.get("max_concurrent_streams").and_then(Value::as_u64) {
-        b = b.max_concurrent_streams(n as u32);
+        let v32 = u32::try_from(n).map_err(|_| CoreError::value("max_concurrent_streams out of u32 range"))?;
+        b = b.max_concurrent_streams(v32);
+        raw.max_concurrent_streams = Some(v32);
     }
     if let Some(n) = obj.get("initial_window_size").and_then(Value::as_u64) {
-        b = b.initial_window_size(n as u32);
+        let v32 = u32::try_from(n).map_err(|_| CoreError::value("initial_window_size out of u32 range"))?;
+        b = b.initial_window_size(v32);
+        raw.initial_window_size = Some(v32);
     }
     if let Some(n) = obj.get("initial_connection_window_size").and_then(Value::as_u64) {
-        b = b.initial_connection_window_size(n as u32);
+        let v32 = u32::try_from(n).map_err(|_| CoreError::value("initial_connection_window_size out of u32 range"))?;
+        b = b.initial_connection_window_size(v32);
+        raw.initial_connection_window_size = Some(v32);
     }
     if let Some(n) = obj.get("max_frame_size").and_then(Value::as_u64) {
-        b = b.max_frame_size(n as u32);
+        let v32 = u32::try_from(n).map_err(|_| CoreError::value("max_frame_size out of u32 range"))?;
+        b = b.max_frame_size(v32);
+        raw.max_frame_size = Some(v32);
     }
     if let Some(n) = obj.get("max_header_list_size").and_then(Value::as_u64) {
-        b = b.max_header_list_size(n as u32);
+        let v32 = u32::try_from(n).map_err(|_| CoreError::value("max_header_list_size out of u32 range"))?;
+        b = b.max_header_list_size(v32);
+        raw.max_header_list_size = Some(v32);
     }
     if let Some(x) = obj.get("enable_connect_protocol").and_then(Value::as_bool) {
         b = b.enable_connect_protocol(x);
+        raw.enable_connect_protocol = Some(x);
     }
     if let Some(x) = obj.get("no_rfc7540_priorities").and_then(Value::as_bool) {
         b = b.no_rfc7540_priorities(x);
+        raw.no_rfc7540_priorities = Some(x);
     }
     if let Some(n) = obj.get("initial_stream_id").and_then(Value::as_u64) {
-        b = b.initial_stream_id(n as u32);
+        let v32 = u32::try_from(n).map_err(|_| CoreError::value("initial_stream_id out of u32 range"))?;
+        b = b.initial_stream_id(v32);
+        raw.initial_stream_id = Some(v32);
     }
     if let Some(x) = obj.get("adaptive_window").and_then(Value::as_bool) {
         b = b.adaptive_window(x);
@@ -268,26 +351,34 @@ pub(crate) fn parse_http2_options_json(v: &Value) -> CoreResult<Http2Options> {
     }
     if let Some(arr) = obj.get("settings_order").and_then(Value::as_array) {
         let mut ids = Vec::with_capacity(arr.len());
+        let mut raw_ids = Vec::with_capacity(arr.len());
         for item in arr {
-            if let Some(num) = item.as_u64() {
+            let sid = if let Some(num) = item.as_u64() {
                 let n16 = u16::try_from(num).map_err(|_| {
                     CoreError::value(format!("Unsupported HTTP/2 setting id {num}"))
                 })?;
-                ids.push(parse_setting_id_num(n16)?);
+                parse_setting_id_num(n16)?
             } else if let Some(s) = item.as_str() {
-                ids.push(parse_setting_id_str(s)?);
+                parse_setting_id_str(s)?
             } else {
                 return Err(CoreError::value("settings_order elements must be integers or strings"));
-            }
+            };
+            raw_ids.push(setting_id_to_u16(sid));
+            ids.push(sid);
         }
         b = b.settings_order(SettingsOrder::builder().extend(ids).build());
+        raw.settings_order = Some(raw_ids);
     }
     if let Some(pseudo) = obj.get("headers_pseudo_order") {
         let mut ids = Vec::new();
+        let mut raw_ids = Vec::new();
         for name in json_str_list(pseudo, "headers_pseudo_order")? {
-            ids.push(parse_pseudo_id_core(&name)?);
+            let pid = parse_pseudo_id_core(&name)?;
+            raw_ids.push(pseudo_id_to_u8(pid));
+            ids.push(pid);
         }
         b = b.headers_pseudo_order(PseudoOrder::builder().extend(ids).build());
+        raw.headers_pseudo_order = Some(raw_ids);
     }
     if let Some(dep) = obj.get("headers_stream_dependency").and_then(Value::as_object) {
         let dep_id = dep
@@ -298,9 +389,11 @@ pub(crate) fn parse_http2_options_json(v: &Value) -> CoreResult<Http2Options> {
         let weight = dep.get("weight").and_then(Value::as_u64).unwrap_or(219) as u8;
         let exclusive = dep.get("exclusive").and_then(Value::as_bool).unwrap_or(true);
         b = b.headers_stream_dependency(StreamDependency::new(StreamId::from(dep_id), weight, exclusive));
+        raw.headers_stream_dependency = Some((dep_id, weight, exclusive));
     }
     if let Some(arr) = obj.get("priorities").and_then(Value::as_array) {
         let mut pb = Priorities::builder();
+        let mut raw_prios = Vec::with_capacity(arr.len());
         for item in arr {
             let pd = item
                 .as_object()
@@ -316,10 +409,97 @@ pub(crate) fn parse_http2_options_json(v: &Value) -> CoreResult<Http2Options> {
                 StreamId::from(sid),
                 StreamDependency::new(StreamId::from(dep_id), weight, exclusive),
             ));
+            raw_prios.push((sid, dep_id, weight, exclusive));
         }
         b = b.priorities(pb.build());
+        raw.priorities = Some(raw_prios);
     }
-    Ok(b.build())
+    Ok((b.build(), raw))
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_quic_options_json(v: &Value) -> CoreResult<QuicOptions> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| CoreError::value("quic_options must be a JSON object"))?;
+    let mut q = QuicOptions::default();
+    if let Some(n) = obj.get("receive_window") {
+        let val = n
+            .as_u64()
+            .and_then(|x| u32::try_from(x).ok())
+            .filter(|&x| x >= 1024)
+            .ok_or_else(|| CoreError::value("quic_options.receive_window must be an integer >= 1024 and <= u32::MAX"))?;
+        q.receive_window = Some(val);
+    }
+    if let Some(n) = obj.get("stream_receive_window") {
+        let val = n
+            .as_u64()
+            .and_then(|x| u32::try_from(x).ok())
+            .filter(|&x| x >= 1024)
+            .ok_or_else(|| CoreError::value("quic_options.stream_receive_window must be an integer >= 1024 and <= u32::MAX"))?;
+        q.stream_receive_window = Some(val);
+    }
+    if let Some(n) = obj.get("send_window") {
+        let val = n
+            .as_u64()
+            .filter(|&x| x >= 1024)
+            .ok_or_else(|| CoreError::value("quic_options.send_window must be an integer >= 1024"))?;
+        q.send_window = Some(val);
+    }
+    if let Some(n) = obj.get("max_concurrent_bidi_streams") {
+        let val = n
+            .as_u64()
+            .and_then(|x| u32::try_from(x).ok())
+            .filter(|&x| x >= 1)
+            .ok_or_else(|| CoreError::value("quic_options.max_concurrent_bidi_streams must be >= 1 and <= u32::MAX"))?;
+        q.max_concurrent_bidi_streams = Some(val);
+    }
+    if let Some(n) = obj.get("max_concurrent_uni_streams") {
+        let val = n
+            .as_u64()
+            .and_then(|x| u32::try_from(x).ok())
+            .filter(|&x| x >= 1)
+            .ok_or_else(|| CoreError::value("quic_options.max_concurrent_uni_streams must be >= 1 and <= u32::MAX"))?;
+        q.max_concurrent_uni_streams = Some(val);
+    }
+    if let Some(n) = obj.get("max_idle_timeout") {
+        let secs = n
+            .as_f64()
+            .ok_or_else(|| CoreError::value("quic_options.max_idle_timeout must be a number (seconds)"))?;
+        q.max_idle_timeout = Some(safe_duration(secs, 0.5, 3600.0));
+    }
+    if let Some(n) = obj.get("keep_alive_interval") {
+        let secs = n
+            .as_f64()
+            .ok_or_else(|| CoreError::value("quic_options.keep_alive_interval must be a number (seconds)"))?;
+        q.keep_alive_interval = Some(safe_duration(secs, 0.5, 3600.0));
+    }
+    if let Some(x) = obj.get("send_grease") {
+        q.send_grease = Some(
+            x.as_bool()
+                .ok_or_else(|| CoreError::value("quic_options.send_grease must be a boolean"))?,
+        );
+    }
+    if let Some(n) = obj.get("max_field_section_size") {
+        let val = n
+            .as_u64()
+            .filter(|&x| x >= 1024)
+            .ok_or_else(|| CoreError::value("quic_options.max_field_section_size must be an integer >= 1024"))?;
+        q.max_field_section_size = Some(val);
+    }
+    if let Some(x) = obj.get("enable_datagram") {
+        q.enable_datagram = Some(
+            x.as_bool()
+                .ok_or_else(|| CoreError::value("quic_options.enable_datagram must be a boolean"))?,
+        );
+    }
+    if let Some(x) = obj.get("enable_extended_connect") {
+        q.enable_extended_connect = Some(
+            x.as_bool()
+                .ok_or_else(|| CoreError::value("quic_options.enable_extended_connect must be a boolean"))?,
+        );
+    }
+    Ok(q)
 }
 
 #[allow(dead_code)]
@@ -670,7 +850,7 @@ fn parse_pseudo_id(name: &str) -> PyResult<PseudoId> {
 }
 
 #[cfg(feature = "python")]
-fn parse_stream_dependency(v: &Bound<'_, PyAny>) -> PyResult<StreamDependency> {
+fn parse_stream_dependency(v: &Bound<'_, PyAny>) -> PyResult<(StreamDependency, (u32, u8, bool))> {
     if let Ok(d) = v.downcast::<PyDict>() {
         let dep_id: u32 = d
             .get_item("stream_id")?
@@ -688,44 +868,73 @@ fn parse_stream_dependency(v: &Bound<'_, PyAny>) -> PyResult<StreamDependency> {
             .map(|x| x.extract())
             .transpose()?
             .unwrap_or(true);
-        return Ok(StreamDependency::new(StreamId::from(dep_id), weight, exclusive));
+        return Ok((
+            StreamDependency::new(StreamId::from(dep_id), weight, exclusive),
+            (dep_id, weight, exclusive),
+        ));
     }
     let (dep_id, weight, exclusive): (u32, u8, bool) = v.extract()?;
-    Ok(StreamDependency::new(StreamId::from(dep_id), weight, exclusive))
+    Ok((
+        StreamDependency::new(StreamId::from(dep_id), weight, exclusive),
+        (dep_id, weight, exclusive),
+    ))
 }
 
 #[cfg(feature = "python")]
-pub(crate) fn parse_http2_options(d: &Bound<'_, PyDict>) -> PyResult<Http2Options> {
+pub(crate) fn parse_http2_options(
+    d: &Bound<'_, PyDict>,
+) -> PyResult<(Http2Options, RawHttp2Config)> {
     let mut b = Http2Options::builder();
+    let mut raw = RawHttp2Config::default();
     if let Some(v) = d.get_item("header_table_size")? {
-        b = b.header_table_size(v.extract::<u32>()?);
+        let val = v.extract::<u32>()?;
+        b = b.header_table_size(val);
+        raw.header_table_size = Some(val);
     }
     if let Some(v) = d.get_item("enable_push")? {
-        b = b.enable_push(v.extract::<bool>()?);
+        let val = v.extract::<bool>()?;
+        b = b.enable_push(val);
+        raw.enable_push = Some(val);
     }
     if let Some(v) = d.get_item("max_concurrent_streams")? {
-        b = b.max_concurrent_streams(v.extract::<u32>()?);
+        let val = v.extract::<u32>()?;
+        b = b.max_concurrent_streams(val);
+        raw.max_concurrent_streams = Some(val);
     }
     if let Some(v) = d.get_item("initial_window_size")? {
-        b = b.initial_window_size(v.extract::<u32>()?);
+        let val = v.extract::<u32>()?;
+        b = b.initial_window_size(val);
+        raw.initial_window_size = Some(val);
     }
     if let Some(v) = d.get_item("initial_connection_window_size")? {
-        b = b.initial_connection_window_size(v.extract::<u32>()?);
+        let val = v.extract::<u32>()?;
+        b = b.initial_connection_window_size(val);
+        raw.initial_connection_window_size = Some(val);
     }
     if let Some(v) = d.get_item("max_frame_size")? {
-        b = b.max_frame_size(v.extract::<u32>()?);
+        let val = v.extract::<u32>()?;
+        b = b.max_frame_size(val);
+        raw.max_frame_size = Some(val);
     }
     if let Some(v) = d.get_item("max_header_list_size")? {
-        b = b.max_header_list_size(v.extract::<u32>()?);
+        let val = v.extract::<u32>()?;
+        b = b.max_header_list_size(val);
+        raw.max_header_list_size = Some(val);
     }
     if let Some(v) = d.get_item("enable_connect_protocol")? {
-        b = b.enable_connect_protocol(v.extract::<bool>()?);
+        let val = v.extract::<bool>()?;
+        b = b.enable_connect_protocol(val);
+        raw.enable_connect_protocol = Some(val);
     }
     if let Some(v) = d.get_item("no_rfc7540_priorities")? {
-        b = b.no_rfc7540_priorities(v.extract::<bool>()?);
+        let val = v.extract::<bool>()?;
+        b = b.no_rfc7540_priorities(val);
+        raw.no_rfc7540_priorities = Some(val);
     }
     if let Some(v) = d.get_item("initial_stream_id")? {
-        b = b.initial_stream_id(v.extract::<u32>()?);
+        let val = v.extract::<u32>()?;
+        b = b.initial_stream_id(val);
+        raw.initial_stream_id = Some(val);
     }
     if let Some(v) = d.get_item("adaptive_window")? {
         b = b.adaptive_window(v.extract::<bool>()?);
@@ -745,25 +954,36 @@ pub(crate) fn parse_http2_options(d: &Bound<'_, PyDict>) -> PyResult<Http2Option
     if let Some(v) = d.get_item("settings_order")? {
         let seq = v.downcast::<PyList>()?;
         let mut ids = Vec::with_capacity(seq.len());
+        let mut raw_ids = Vec::with_capacity(seq.len());
         for item in seq.iter() {
-            ids.push(parse_setting_id(&item)?);
+            let sid = parse_setting_id(&item)?;
+            raw_ids.push(setting_id_to_u16(sid));
+            ids.push(sid);
         }
         b = b.settings_order(SettingsOrder::builder().extend(ids).build());
+        raw.settings_order = Some(raw_ids);
     }
     if let Some(v) = d.get_item("headers_pseudo_order")? {
         let names: Vec<String> = v.extract()?;
         let mut ids = Vec::with_capacity(names.len());
+        let mut raw_ids = Vec::with_capacity(names.len());
         for name in names {
-            ids.push(parse_pseudo_id(&name)?);
+            let pid = parse_pseudo_id(&name)?;
+            raw_ids.push(pseudo_id_to_u8(pid));
+            ids.push(pid);
         }
         b = b.headers_pseudo_order(PseudoOrder::builder().extend(ids).build());
+        raw.headers_pseudo_order = Some(raw_ids);
     }
     if let Some(v) = d.get_item("headers_stream_dependency")? {
-        b = b.headers_stream_dependency(parse_stream_dependency(&v)?);
+        let (dep, raw_dep) = parse_stream_dependency(&v)?;
+        b = b.headers_stream_dependency(dep);
+        raw.headers_stream_dependency = Some(raw_dep);
     }
     if let Some(v) = d.get_item("priorities")? {
         let seq = v.downcast::<PyList>()?;
         let mut pb = Priorities::builder();
+        let mut raw_prios = Vec::with_capacity(seq.len());
         for item in seq.iter() {
             let pd = item.downcast::<PyDict>()?;
             let sid: u32 = pd
@@ -789,10 +1009,75 @@ pub(crate) fn parse_http2_options(d: &Bound<'_, PyDict>) -> PyResult<Http2Option
                 StreamId::from(sid),
                 StreamDependency::new(StreamId::from(dep_id), weight, exclusive),
             ));
+            raw_prios.push((sid, dep_id, weight, exclusive));
         }
         b = b.priorities(pb.build());
+        raw.priorities = Some(raw_prios);
     }
-    Ok(b.build())
+    Ok((b.build(), raw))
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn parse_quic_options(d: &Bound<'_, PyDict>) -> PyResult<QuicOptions> {
+    let mut q = QuicOptions::default();
+    if let Some(v) = d.get_item("receive_window")? {
+        let val = v.extract::<u32>()?;
+        if val < 1024 {
+            return Err(PyValueError::new_err("quic_options.receive_window must be >= 1024"));
+        }
+        q.receive_window = Some(val);
+    }
+    if let Some(v) = d.get_item("stream_receive_window")? {
+        let val = v.extract::<u32>()?;
+        if val < 1024 {
+            return Err(PyValueError::new_err("quic_options.stream_receive_window must be >= 1024"));
+        }
+        q.stream_receive_window = Some(val);
+    }
+    if let Some(v) = d.get_item("send_window")? {
+        let val = v.extract::<u64>()?;
+        if val < 1024 {
+            return Err(PyValueError::new_err("quic_options.send_window must be >= 1024"));
+        }
+        q.send_window = Some(val);
+    }
+    if let Some(v) = d.get_item("max_concurrent_bidi_streams")? {
+        let val = v.extract::<u32>()?;
+        if val < 1 {
+            return Err(PyValueError::new_err("quic_options.max_concurrent_bidi_streams must be >= 1"));
+        }
+        q.max_concurrent_bidi_streams = Some(val);
+    }
+    if let Some(v) = d.get_item("max_concurrent_uni_streams")? {
+        let val = v.extract::<u32>()?;
+        if val < 1 {
+            return Err(PyValueError::new_err("quic_options.max_concurrent_uni_streams must be >= 1"));
+        }
+        q.max_concurrent_uni_streams = Some(val);
+    }
+    if let Some(v) = d.get_item("max_idle_timeout")? {
+        q.max_idle_timeout = Some(safe_duration(v.extract::<f64>()?, 0.5, 3600.0));
+    }
+    if let Some(v) = d.get_item("keep_alive_interval")? {
+        q.keep_alive_interval = Some(safe_duration(v.extract::<f64>()?, 0.5, 3600.0));
+    }
+    if let Some(v) = d.get_item("send_grease")? {
+        q.send_grease = Some(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("max_field_section_size")? {
+        let val = v.extract::<u64>()?;
+        if val < 1024 {
+            return Err(PyValueError::new_err("quic_options.max_field_section_size must be >= 1024"));
+        }
+        q.max_field_section_size = Some(val);
+    }
+    if let Some(v) = d.get_item("enable_datagram")? {
+        q.enable_datagram = Some(v.extract::<bool>()?);
+    }
+    if let Some(v) = d.get_item("enable_extended_connect")? {
+        q.enable_extended_connect = Some(v.extract::<bool>()?);
+    }
+    Ok(q)
 }
 
 #[cfg(feature = "python")]

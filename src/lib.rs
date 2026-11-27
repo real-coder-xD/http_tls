@@ -20,9 +20,9 @@ use h3_transport::{
     clear_h3_pool_sync, decompress_h3_body, execute_h3_request, execute_h3_stream, H3Pool,
     H3RequestSpec,
 };
-use options::build_orig_headers;
+use options::{build_orig_headers, QuicOptions, RawHttp2Config};
 #[cfg(feature = "python")]
-use options::{parse_http2_options, parse_resolve_map, parse_tls_options};
+use options::{parse_http2_options, parse_quic_options, parse_resolve_map, parse_tls_options};
 use presets::{default_h3_browser_headers, resolve_emulation};
 #[cfg(feature = "python")]
 use presets::{is_verified_preset, supported_presets};
@@ -639,6 +639,8 @@ pub(crate) struct SessionConfig {
     pub header_order: Option<Vec<String>>,
     pub tls_options: Option<TlsOptions>,
     pub http2_options: Option<Http2Options>,
+    pub http2_raw: Option<RawHttp2Config>,
+    pub quic_options: Option<QuicOptions>,
     pub http1_only: bool,
     pub http2_only: bool,
     pub http3: bool,
@@ -712,6 +714,8 @@ pub struct NativeSession {
     header_order: Option<Vec<String>>,
     tls_options: Option<TlsOptions>,
     http2_options: Option<Http2Options>,
+    http2_raw: Option<RawHttp2Config>,
+    quic_options: Option<QuicOptions>,
     http1_only: bool,
     http2_only: bool,
     http3: bool,
@@ -813,7 +817,7 @@ impl NativeSession {
         Ok(NativeSession {
             jar: Arc::new(Jar::default()),
             clients: Mutex::new(HashMap::new()),
-            h3_pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            h3_pool: Arc::new(tokio::sync::Mutex::new(Default::default())),
             ech_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             ticket_cache: Arc::new(Mutex::new(HashMap::new())),
             doh_resolver,
@@ -827,6 +831,8 @@ impl NativeSession {
             header_order: cfg.header_order,
             tls_options: cfg.tls_options,
             http2_options: cfg.http2_options,
+            http2_raw: cfg.http2_raw,
+            quic_options: cfg.quic_options,
             http1_only: cfg.http1_only,
             http2_only: cfg.http2_only,
             http3: cfg.http3,
@@ -1281,6 +1287,7 @@ impl NativeSession {
                 preset: preset_name.clone(),
                 ech_doh_url: self.ech_doh_url.clone(),
                 ech_config_list: req.ech_config_list.clone(),
+                http2_config: self.http2_raw.clone(),
             })
         } else {
             None
@@ -1313,6 +1320,7 @@ impl NativeSession {
                 ech: eff_ech,
                 ech_doh_url: self.ech_doh_url.clone(),
                 ech_config_list: req.ech_config_list.clone(),
+                quic_options: self.quic_options.clone(),
             })
         } else {
             None
@@ -1918,6 +1926,7 @@ impl NativeSession {
         header_order = None,
         tls_options = None,
         http2_options = None,
+        quic_options = None,
         http1_only = false,
         http2_only = false,
         http3 = false,
@@ -1953,6 +1962,7 @@ impl NativeSession {
         header_order: Option<Vec<String>>,
         tls_options: Option<&Bound<'_, PyDict>>,
         http2_options: Option<&Bound<'_, PyDict>>,
+        quic_options: Option<&Bound<'_, PyDict>>,
         http1_only: bool,
         http2_only: bool,
         http3: bool,
@@ -1973,6 +1983,13 @@ impl NativeSession {
         tcp_nodelay: Option<bool>,
         tcp_keepalive: Option<f64>,
     ) -> PyResult<Self> {
+        let (http2_options, http2_raw) = match http2_options {
+            Some(d) => {
+                let (opt, raw) = parse_http2_options(d)?;
+                (Some(opt), Some(raw))
+            }
+            None => (None, None),
+        };
         let cfg = SessionConfig {
             impersonate: impersonate.to_string(),
             timeout,
@@ -1989,8 +2006,10 @@ impl NativeSession {
                 Some(d) => Some(parse_tls_options(d)?),
                 None => None,
             },
-            http2_options: match http2_options {
-                Some(d) => Some(parse_http2_options(d)?),
+            http2_options,
+            http2_raw,
+            quic_options: match quic_options {
+                Some(d) => Some(parse_quic_options(d)?),
                 None => None,
             },
             http1_only,
@@ -2476,7 +2495,7 @@ impl NativeSession {
     }
 
     pub fn h3_pool_len(&self) -> usize {
-        self.h3_pool.try_lock().map(|g| g.len()).unwrap_or(0)
+        self.h3_pool.try_lock().map(|g| g.conns.len()).unwrap_or(0)
     }
 
     #[getter]

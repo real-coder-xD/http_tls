@@ -817,3 +817,40 @@ def test_dropin_api_completeness_httpx_requests_cffi(http_server):
         assert client.is_closed
 
     asyncio.run(run_async_dropin())
+
+
+def test_quic_options_and_tcp_ech_h2_config(http_server):
+    base, _ = http_server
+    # Valid quic_options + akamai_h2 + ech session construction and request
+    with http_tls.Session(
+        impersonate="chrome_149",
+        akamai_h2="1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p",
+        quic_options={
+            "receive_window": 16_777_216,
+            "stream_receive_window": 6_291_456,
+            "send_window": 16_777_216,
+            "max_concurrent_bidi_streams": 100,
+            "max_concurrent_uni_streams": 103,
+            "max_idle_timeout": 30.0,
+            "keep_alive_interval": 15.0,
+            "send_grease": True,
+            "max_field_section_size": 262_144,
+            "enable_datagram": True,
+            "enable_extended_connect": True,
+        },
+    ) as s:
+        r = s.get(f"{base}/echo")
+        assert r.status_code == 200
+
+    # Module-level helper forwards quic_options cleanly
+    r2 = http_tls.get(f"{base}/echo", quic_options={"send_grease": True, "max_field_section_size": 65536})
+    assert r2.status_code == 200
+
+    # Bounds validation on quic_options
+    with pytest.raises(ValueError):
+        http_tls.Session(quic_options={"receive_window": 100})
+    with pytest.raises(ValueError):
+        http_tls.Session(quic_options={"max_concurrent_bidi_streams": 0})
+    with pytest.raises(ValueError):
+        http_tls.Session(quic_options={"max_field_section_size": 512})
+

@@ -75,7 +75,7 @@ cargo build --release --manifest-path ffi/Cargo.toml --target-dir target
 | **Async & DNS Stack** | Native Rust Tokio runtime (`pyo3-async-runtimes`) + Hickory async DNS + **Session-wide DNS-over-HTTPS (`doh=True`)** |
 | **Drop-in API Compatibility** | `requests`, `httpx` (`Client`, `AsyncClient`, `stream`), and `curl_cffi` (`BrowserType`, `impersonate`) |
 | **Sync Parallelism** | `session.gather(urls, concurrency=50)` — GIL-free multi-request batching without `async/await` |
-| **Fingerprinting & HTTP/3** | 100+ browser presets, custom JA3, `tls_options`, `http2_options` (`akamai_h2`), Pure BoringSSL UDP QUIC `http3=True` (per-browser QUIC params & TLS 1.3 ticket resumption `resp.tls_resumed`), **Real ECH (`ech=True` on both TCP H2 & UDP H3 -> `sni=encrypted`)**, **SOCKS5 UDP Associate**, auto `Alt-Svc: h3=":443"` upgrade |
+| **Fingerprinting & HTTP/3** | 100+ browser presets, custom JA3, `tls_options`, `http2_options` (`akamai_h2`, synced across both standard H2 & TCP ECH), `quic_options`, Pure BoringSSL UDP QUIC `http3=True` (per-browser QUIC params, HTTP/3 `SETTINGS` GREASE & TLS 1.3 ticket resumption `resp.tls_resumed`), **Real ECH (`ech=True` on both TCP H2 & UDP H3 -> `sni=encrypted`)**, **SOCKS5 UDP Associate**, auto `Alt-Svc: h3=":443"` upgrade |
 | **Built-in Rust Extraction** | **100% Pure Rust** WHATWG HTML5 CSS3 (`:has()`, `:contains()`, `::text`, `::attr()`), native XPath 1.0, `serde_json` `json_path`, linear-time DFA `re` / `between`, unified `resp.find()` / `resp.find_all()` — zero `lxml`/`bs4` needed |
 | **WebSockets & Streaming** | TLS-impersonated sync/async WebSockets, true incremental H2 + H3 streaming, native H2 + H3 multipart `files=` |
 | **Reverse Engineering & Ops** | Wireshark `SSLKEYLOGFILE` / `keylog_file`, HAR 1.2 export, Playwright `storage_state.json`, WAF `resp.challenge` detector |
@@ -152,7 +152,15 @@ Measured directly using the standalone Rust BoringSSL engine (`engine="rust"`, z
 
 ### 1b. Live Pure BoringSSL HTTP/3 (UDP QUIC), Real ECH (TCP H2 & UDP H3), TLS 1.3 Ticket Resumption & SOCKS5 UDP Associate
 
-Unlike Rust clients that fall back to `rustls` for QUIC, `http_tls` drives `quinn` + `h3` directly through **BoringSSL (`SSL_CTX_set_quic_method`)** with Chrome GREASE, extension permutation, Post-Quantum `X25519MLKEM768`, **Real ECH (`SSL_set1_ech_config_list` + DoH DNS Type 65 `HTTPS` record + automatic `SSL_get0_ech_retry_configs` retry on both TCP HTTP/2 and UDP HTTP/3)**, ALPS `h2`/`h3`, Brotli/Zlib/Zstd cert compression, **per-browser QUIC transport parameters (`0x0039` for Chrome, Firefox, Safari)**, **TLS 1.3 Session Ticket Resumption (`resp.tls_resumed`)**, `H3Pool` multiplexing, native H3 multipart `files=` uploads, and **RFC 1928 / RFC 1929 SOCKS5 UDP Associate** proxying:
+Unlike Rust clients that fall back to `rustls` for QUIC, `http_tls` drives `quinn` + `h3` directly through **BoringSSL (`SSL_CTX_set_quic_method`)** with Chrome GREASE, extension permutation, Post-Quantum `X25519MLKEM768`, **Real ECH (`SSL_set1_ech_config_list` + DoH DNS Type 65 `HTTPS` record + automatic `SSL_get0_ech_retry_configs` retry on both TCP HTTP/2 and UDP HTTP/3)**, ALPS `h2`/`h3`, Brotli/Zlib/Zstd cert compression, **per-browser QUIC transport parameters (`0x0039` w/ QUIC GREASE) + HTTP/3 `SETTINGS` GREASE (`send_grease`, `max_field_section_size`, `enable_datagram`, `enable_extended_connect`)**, **per-browser Akamai HTTP/2 parity on TCP ECH**, **TLS 1.3 Session Ticket Resumption (`resp.tls_resumed`)**, `H3Pool` multiplexing, native H3 multipart `files=` uploads, and **RFC 1928 / RFC 1929 SOCKS5 UDP Associate** proxying.
+
+**Live HTTP/3 PERK Fingerprint Audit (`https://fp.impersonate.pro/api/http3`):**
+
+| Browser Preset | HTTP/3 `SETTINGS` (Wire) | QUIC Transport Params (`0x0039`) | Real ECH (`cloudflare-ech.com`) |
+| :--- | :--- | :--- | :--- |
+| `chrome_149` | `GREASE;6:262144;8:1;...;51:1` | `4:15728640;5/6/7:6291456;8:100;9:103;1:30000;GREASE` | `HTTP/3 · sni=encrypted · X25519MLKEM768` |
+| `firefox_151` | `GREASE;6:65536;8:1;...;51:1` | `4:25165824;5/6/7:12582912;8:16;9:16;1:30000;GREASE` | `HTTP/3 · sni=encrypted · X25519MLKEM768` |
+| `safari_26_4` | `GREASE;6:262144;8:0;...;51:0` | `4:16777216;5/6/7:4194304;8:100;9:100;1:30000;GREASE` | `HTTP/3 · sni=encrypted · X25519` |
 
 ```python
 import http_tls
@@ -528,7 +536,7 @@ with http_tls.Session(
         "certificate_compressors": ["brotli", "zlib", "zstd"],
         "extension_permutation": [0, 23, 65281, 10, 11, 35, 16, 5, 13, 51, 45, 43, 27],
     },
-    # Full HTTP/2 frame control (or override individual fields parsed from akamai_h2)
+    # Full HTTP/2 frame control (applied to both standard TCP H2 and TCP Real ECH)
     http2_options={
         "header_table_size": 65536,
         "enable_push": False,
@@ -537,6 +545,17 @@ with http_tls.Session(
         "settings_order": [1, 2, 4, 6],
         "headers_pseudo_order": ["m", "a", "s", "p"],
         "headers_stream_dependency": {"stream_id": 0, "weight": 219, "exclusive": True},
+    },
+    # Fine-grained QUIC transport & HTTP/3 SETTINGS overrides (when http3=True)
+    quic_options={
+        "receive_window": 15728640,
+        "stream_receive_window": 6291456,
+        "max_concurrent_bidi_streams": 100,
+        "max_concurrent_uni_streams": 103,
+        "send_grease": True,
+        "max_field_section_size": 262144,
+        "enable_datagram": True,
+        "enable_extended_connect": True,
     },
     # Enforce exact wire header order and casing
     header_order=["Host", "Connection", "User-Agent", "Accept", "Accept-Language"],
@@ -824,7 +843,7 @@ Full C-ABI Handbook (all 19 functions, JSON schemas, Streaming, WebSockets, PHP/
 | `headers` / `header_order` | `dict \| list[str]` | `None` | Default headers and exact wire header order/casing |
 | `params` / `cookies` | `dict` | `None` | Default query parameters and session cookies |
 | `auth` | `tuple \| AuthBase` | `None` | `(user, pass)`, `BasicAuth`, `BearerAuth`, or `DigestAuth` |
-| `ja3` / `akamai_h2` / `tls_options` / `http2_options` | `str \| dict` | `None` | Custom JA3, Akamai H2 string, and full BoringSSL / H2 overrides |
+| `ja3` / `akamai_h2` / `tls_options` / `http2_options` / `quic_options` | `str \| dict` | `None` | Custom JA3, Akamai H2 (incl. TCP ECH), BoringSSL TLS, H2, and QUIC/H3 framing overrides |
 | `http1_only` / `http2_only` / `http3` / `http3_only` | `bool` | `False` | Force HTTP/1.1, HTTP/2, or pure BoringSSL UDP QUIC HTTP/3 |
 | `auto_upgrade_h3` | `bool` | `True` | Automatically upgrade to UDP QUIC HTTP/3 on `Alt-Svc: h3` (w/ TCP fallback) |
 | `ech` / `ech_doh_url` | `bool \| str` | `False` | Real Encrypted Client Hello (`sni=encrypted`) on both TCP H2 and UDP H3 (pass custom `ech_config_list=bytes` per request) |

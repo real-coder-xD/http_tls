@@ -1,6 +1,7 @@
 // Language: Rust 2021 | File: src/h3_transport.rs | Target: Pure BoringSSL UDP QUIC HTTP/3 Transport, Multiplexed Pool & Incremental Streaming
 use crate::doh::{fetch_ech_config_list, DohResolver, EchCache};
 use crate::error::{CoreError, CoreResult};
+use crate::options::QuicOptions;
 use crate::presets::default_h3_browser_headers;
 use crate::quic_boring::{self, TicketCache};
 use crate::socks5_udp;
@@ -48,6 +49,7 @@ pub(crate) struct H3RequestSpec {
     pub(crate) ech: bool,
     pub(crate) ech_doh_url: String,
     pub(crate) ech_config_list: Option<Vec<u8>>,
+    pub(crate) quic_options: Option<QuicOptions>,
 }
 
 pub(crate) fn decompress_h3_body(raw: Vec<u8>, content_encoding: Option<&str>) -> Vec<u8> {
@@ -97,6 +99,7 @@ fn build_h3_client_config(
     ech_retry_out: Arc<Mutex<Option<Vec<u8>>>>,
     ticket_cache: TicketCache,
     ticket_key: String,
+    quic_options: Option<&QuicOptions>,
 ) -> CoreResult<quinn::ClientConfig> {
     let boring_cfg = quic_boring::BoringQuicClientConfig::new(
         preset,
@@ -118,10 +121,16 @@ fn build_h3_client_config(
     let is_safari = lower.starts_with("safari");
 
     let mut transport = quinn::TransportConfig::default();
-    if let Ok(idle) = Duration::from_secs(30).try_into() {
+    let idle_dur = quic_options
+        .and_then(|q| q.max_idle_timeout)
+        .unwrap_or_else(|| Duration::from_secs(30));
+    if let Ok(idle) = idle_dur.try_into() {
         transport.max_idle_timeout(Some(idle));
     }
-    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    let ka_dur = quic_options
+        .and_then(|q| q.keep_alive_interval)
+        .unwrap_or_else(|| Duration::from_secs(15));
+    transport.keep_alive_interval(Some(ka_dur));
     if is_firefox {
         transport.receive_window(25_165_824u32.into());
         transport.stream_receive_window(12_582_912u32.into());
@@ -141,10 +150,58 @@ fn build_h3_client_config(
         transport.max_concurrent_bidi_streams(100u32.into());
         transport.max_concurrent_uni_streams(103u32.into());
     }
+    if let Some(q) = quic_options {
+        if let Some(v) = q.receive_window {
+            transport.receive_window(v.into());
+        }
+        if let Some(v) = q.stream_receive_window {
+            transport.stream_receive_window(v.into());
+        }
+        if let Some(v) = q.send_window {
+            transport.send_window(v);
+        }
+        if let Some(v) = q.max_concurrent_bidi_streams {
+            transport.max_concurrent_bidi_streams(v.into());
+        }
+        if let Some(v) = q.max_concurrent_uni_streams {
+            transport.max_concurrent_uni_streams(v.into());
+        }
+    }
     transport.send_fairness(false);
     client_cfg.transport_config(Arc::new(transport));
 
     Ok(client_cfg)
+}
+
+/// Build an RFC 9114 HTTP/3 client session builder with per-browser `SETTINGS` framing
+/// (`SETTINGS` GREASE, `MAX_FIELD_SECTION_SIZE`, `H3_DATAGRAM`, `ENABLE_CONNECT_PROTOCOL`)
+/// and optional `quic_options` overrides.
+pub(crate) fn build_h3_session_builder(
+    preset: &str,
+    quic_options: Option<&QuicOptions>,
+) -> h3::client::Builder {
+    let lower = preset.trim().to_ascii_lowercase();
+    let is_firefox = lower.starts_with("firefox") || lower.starts_with("tor");
+    let is_safari = lower.starts_with("safari");
+
+    let send_grease = quic_options.and_then(|q| q.send_grease).unwrap_or(true);
+    let max_field_section = quic_options
+        .and_then(|q| q.max_field_section_size)
+        .unwrap_or(if is_firefox { 65_536 } else { 262_144 });
+    let enable_datagram = quic_options
+        .and_then(|q| q.enable_datagram)
+        .unwrap_or(!is_safari);
+    let enable_ext_connect = quic_options
+        .and_then(|q| q.enable_extended_connect)
+        .unwrap_or(!is_safari);
+
+    let mut builder = h3::client::builder();
+    builder
+        .send_grease(send_grease)
+        .max_field_section_size(max_field_section)
+        .enable_datagram(enable_datagram)
+        .enable_extended_connect(enable_ext_connect);
+    builder
 }
 
 async fn resolve_h3_target(
@@ -224,21 +281,29 @@ impl PooledH3Conn {
     }
 }
 
-pub(crate) type H3Pool = Arc<tokio::sync::Mutex<HashMap<H3PoolKey, PooledH3Conn>>>;
+#[derive(Default)]
+pub(crate) struct H3PoolInner {
+    pub(crate) conns: HashMap<H3PoolKey, PooledH3Conn>,
+    dial_locks: HashMap<H3PoolKey, Arc<tokio::sync::Mutex<()>>>,
+}
+
+pub(crate) type H3Pool = Arc<tokio::sync::Mutex<H3PoolInner>>;
 
 pub(crate) fn clear_h3_pool_sync(h3_pool: &H3Pool) {
     if let Ok(mut guard) = h3_pool.try_lock() {
-        for (_, entry) in guard.drain() {
+        for (_, entry) in guard.conns.drain() {
             entry.close();
         }
+        guard.dial_locks.clear();
         return;
     }
     let pool = Arc::clone(h3_pool);
     runtime().spawn(async move {
         let mut guard = pool.lock().await;
-        for (_, entry) in guard.drain() {
+        for (_, entry) in guard.conns.drain() {
             entry.close();
         }
+        guard.dial_locks.clear();
     });
 }
 
@@ -271,9 +336,9 @@ async fn acquire_h3_conn(
         ech: spec.ech || spec.ech_config_list.is_some(),
     };
 
-    {
+    let dial_lock = {
         let mut pool = h3_pool.lock().await;
-        if let Some(entry) = pool.get(&key) {
+        if let Some(entry) = pool.conns.get(&key) {
             if entry.is_alive() {
                 return Ok((
                     key,
@@ -286,7 +351,38 @@ async fn acquire_h3_conn(
                 ));
             }
         }
-        if let Some(stale) = pool.remove(&key) {
+        if let Some(stale) = pool.conns.remove(&key) {
+            stale.close();
+        }
+        if pool.dial_locks.len() >= 64 && !pool.dial_locks.contains_key(&key) {
+            pool.dial_locks.retain(|_, lk| Arc::strong_count(lk) > 1);
+        }
+        Arc::clone(
+            pool.dial_locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+
+    // Single-flight per-key dial lock prevents thundering-herd concurrent QUIC handshakes
+    // from evicting each other's in-flight streams during cold bursts (e.g. `gather()`).
+    let _dial_guard = dial_lock.lock().await;
+    {
+        let mut pool = h3_pool.lock().await;
+        if let Some(entry) = pool.conns.get(&key) {
+            if entry.is_alive() {
+                return Ok((
+                    key,
+                    entry.send_request.clone(),
+                    entry.remote_addr.clone(),
+                    entry.peer_certificate.clone(),
+                    entry.ech_accepted,
+                    entry.tls_resumed,
+                    true,
+                ));
+            }
+        }
+        if let Some(stale) = pool.conns.remove(&key) {
             stale.close();
         }
     }
@@ -330,6 +426,7 @@ async fn acquire_h3_conn(
             Arc::clone(&ech_retry_out),
             Arc::clone(ticket_cache),
             ticket_key.clone(),
+            spec.quic_options.as_ref(),
         )?;
 
         let ep_cfg = quinn::EndpointConfig::new(Arc::new(quic_boring::BoringHmacKey::random()));
@@ -449,10 +546,13 @@ async fn acquire_h3_conn(
     };
 
     let quinn_conn = h3_quinn::Connection::new(conn.clone());
-    let (mut driver, send_request) = h3::client::new(quinn_conn).await.map_err(|e| {
-        endpoint.close(0u32.into(), b"h3_init_err");
-        CoreError::runtime(format!("[connect] HTTP/3 session init failed: {e}"))
-    })?;
+    let (mut driver, send_request) = build_h3_session_builder(&spec.preset, spec.quic_options.as_ref())
+        .build(quinn_conn)
+        .await
+        .map_err(|e| {
+            endpoint.close(0u32.into(), b"h3_init_err");
+            CoreError::runtime(format!("[connect] HTTP/3 session init failed: {e}"))
+        })?;
 
     let driver_handle = tokio::spawn(async move {
         let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -461,12 +561,28 @@ async fn acquire_h3_conn(
     let pooled_sr = send_request.clone();
     {
         let mut pool = h3_pool.lock().await;
-        if pool.len() >= 16 {
-            for (_, old) in pool.drain() {
+        if pool.conns.len() >= 16 {
+            for (_, old) in pool.conns.drain() {
                 old.close();
             }
         }
-        if let Some(prev) = pool.insert(
+        if let Some(existing) = pool.conns.get(&key) {
+            if existing.is_alive() {
+                // Keep the already-alive pooled connection intact; close the redundant one.
+                driver_handle.abort();
+                endpoint.close(0u32.into(), b"redundant");
+                return Ok((
+                    key,
+                    existing.send_request.clone(),
+                    existing.remote_addr.clone(),
+                    existing.peer_certificate.clone(),
+                    existing.ech_accepted,
+                    existing.tls_resumed,
+                    true,
+                ));
+            }
+        }
+        if let Some(prev) = pool.conns.insert(
             key.clone(),
             PooledH3Conn {
                 endpoint,
@@ -764,7 +880,7 @@ async fn open_h3_single_hop(
             Err(e) => {
                 if reused && attempt == 0 {
                     let mut pool = h3_pool.lock().await;
-                    if let Some(stale) = pool.remove(&key) {
+                    if let Some(stale) = pool.conns.remove(&key) {
                         stale.close();
                     }
                     continue;
@@ -780,7 +896,7 @@ async fn open_h3_single_hop(
                 if let Err(e) = stream.send_data(Bytes::copy_from_slice(body_bytes)).await {
                     if reused && attempt == 0 {
                         let mut pool = h3_pool.lock().await;
-                        if let Some(stale) = pool.remove(&key) {
+                        if let Some(stale) = pool.conns.remove(&key) {
                             stale.close();
                         }
                         continue;
@@ -794,7 +910,7 @@ async fn open_h3_single_hop(
         if let Err(e) = stream.finish().await {
             if reused && attempt == 0 {
                 let mut pool = h3_pool.lock().await;
-                if let Some(stale) = pool.remove(&key) {
+                if let Some(stale) = pool.conns.remove(&key) {
                     stale.close();
                 }
                 continue;
@@ -809,7 +925,7 @@ async fn open_h3_single_hop(
             Err(e) => {
                 if reused && attempt == 0 {
                     let mut pool = h3_pool.lock().await;
-                    if let Some(stale) = pool.remove(&key) {
+                    if let Some(stale) = pool.conns.remove(&key) {
                         stale.close();
                     }
                     continue;

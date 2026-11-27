@@ -11,7 +11,7 @@ use crate::extract::{
 };
 use crate::options::{
     parse_akamai_h2_to_http2_json, parse_http2_options_json, parse_ja3_to_tls_json,
-    parse_resolve_map_json, parse_tls_options_json,
+    parse_quic_options_json, parse_resolve_map_json, parse_tls_options_json,
 };
 use crate::presets::supported_presets;
 use crate::{
@@ -394,8 +394,15 @@ fn parse_session_config_json(obj: &Map<String, Value>) -> CoreResult<SessionConf
             m.insert(k.clone(), v.clone());
         }
     }
-    let http2_options = match h2_map {
-        Some(m) => Some(parse_http2_options_json(&Value::Object(m))?),
+    let (http2_options, http2_raw) = match h2_map {
+        Some(m) => {
+            let (opt, raw) = parse_http2_options_json(&Value::Object(m))?;
+            (Some(opt), Some(raw))
+        }
+        None => (None, None),
+    };
+    let quic_options = match obj.get("quic_options").filter(|v| !v.is_null()) {
+        Some(v) => Some(parse_quic_options_json(v)?),
         None => None,
     };
 
@@ -424,6 +431,8 @@ fn parse_session_config_json(obj: &Map<String, Value>) -> CoreResult<SessionConf
         header_order,
         tls_options,
         http2_options,
+        http2_raw,
+        quic_options,
         http1_only: obj.get("http1_only").and_then(Value::as_bool).unwrap_or(false),
         http2_only: obj.get("http2_only").and_then(Value::as_bool).unwrap_or(false),
         http3: obj.get("http3").and_then(Value::as_bool).unwrap_or(false),
@@ -695,7 +704,7 @@ pub fn capi_version() -> *mut c_char {
             "presets_count": supported_presets().len(),
             "features": [
                 "http1", "http2", "http3", "real_ech_tcp", "real_ech_udp",
-                "doh", "socks5_udp", "ja3", "akamai_h2", "gather",
+                "doh", "socks5_udp", "ja3", "akamai_h2", "quic_options", "h3_grease", "gather",
                 "streaming", "websocket",
                 "challenge_detect", "extract_css", "extract_xpath",
                 "extract_json_path", "extract_regex", "extract_between"
@@ -1740,6 +1749,60 @@ mod tests {
             capi_free_string(ptr3);
             assert_eq!(out3["found"], true);
             assert_eq!(out3["result"], json!(["B"]));
+        }
+    }
+
+    #[test]
+    fn test_quic_options_and_tcp_ech_h2_fingerprint_builders() {
+        // 1. Valid quic_options JSON parsing
+        let q = parse_quic_options_json(&json!({
+            "receive_window": 20_000_000,
+            "stream_receive_window": 8_000_000,
+            "send_window": 20_000_000,
+            "max_concurrent_bidi_streams": 128,
+            "max_concurrent_uni_streams": 128,
+            "max_idle_timeout": 45.0,
+            "keep_alive_interval": 12.5,
+            "send_grease": true,
+            "max_field_section_size": 262_144,
+            "enable_datagram": true,
+            "enable_extended_connect": false
+        }))
+        .unwrap();
+        assert_eq!(q.receive_window, Some(20_000_000));
+        assert_eq!(q.stream_receive_window, Some(8_000_000));
+        assert_eq!(q.send_window, Some(20_000_000));
+        assert_eq!(q.max_concurrent_bidi_streams, Some(128));
+        assert_eq!(q.max_concurrent_uni_streams, Some(128));
+        assert_eq!(q.send_grease, Some(true));
+        assert_eq!(q.max_field_section_size, Some(262_144));
+        assert_eq!(q.enable_datagram, Some(true));
+        assert_eq!(q.enable_extended_connect, Some(false));
+
+        // 2. Reject invalid quic_options bounds / types
+        assert!(parse_quic_options_json(&json!({"receive_window": 64})).is_err());
+        assert!(parse_quic_options_json(&json!({"max_concurrent_bidi_streams": 0})).is_err());
+        assert!(parse_quic_options_json(&json!({"send_grease": "yes"})).is_err());
+        assert!(parse_quic_options_json(&json!({"max_field_section_size": 100})).is_err());
+
+        // 3. RawHttp2Config parsed from Akamai H2 string and applied to http2::client::Builder
+        let ak_map = parse_akamai_h2_to_http2_json(
+            "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p",
+        )
+        .unwrap();
+        let (_h2_opts, raw_h2) = parse_http2_options_json(&Value::Object(ak_map)).unwrap();
+        assert_eq!(raw_h2.header_table_size, Some(65_536));
+        assert_eq!(raw_h2.enable_push, Some(false));
+        assert_eq!(raw_h2.initial_window_size, Some(6_291_456));
+        assert_eq!(raw_h2.max_header_list_size, Some(262_144));
+        assert_eq!(raw_h2.initial_connection_window_size, Some(15_663_105 + 65_535));
+        assert_eq!(raw_h2.settings_order, Some(vec![1, 2, 4, 6]));
+        assert_eq!(raw_h2.headers_pseudo_order, Some(vec![0, 1, 2, 3]));
+
+        for preset in ["chrome_149", "firefox_151", "safari_26_4", "okhttp_5"] {
+            let mut b = http2::client::Builder::new();
+            crate::tcp_ech::apply_h2_fingerprint(&mut b, preset, Some(&raw_h2));
+            let _h3b = crate::h3_transport::build_h3_session_builder(preset, Some(&q));
         }
     }
 }

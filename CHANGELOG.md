@@ -2,6 +2,14 @@
 
 All notable changes to `http_tls` are documented in this file.
 
+## [1.4.0] - 2026-11-27
+
+### HTTP/3 `SETTINGS` GREASE, `quic_options` API & Full Akamai HTTP/2 Parity on TCP Real ECH
+- **HTTP/3 `SETTINGS` GREASE & Per-Browser H3 Framing (`src/h3_transport.rs`):** Replaced default `h3::client::new` with `build_h3_session_builder` using `h3::client::builder()` to emit RFC 9114 HTTP/3 `SETTINGS` GREASE frames (`send_grease(true)`), per-browser `MAX_FIELD_SECTION_SIZE` (`262144` Chrome/Edge/Opera/Safari, `65536` Firefox/Tor), `SETTINGS_H3_DATAGRAM`, and `SETTINGS_ENABLE_CONNECT_PROTOCOL` (verified live on `fp.impersonate.pro/api/http3`).
+- **`quic_options` Configuration Across Python & C-ABI (`src/options.rs`, `src/lib.rs`, `src/ffi.rs`, `python/http_tls/requests.py`, `python/http_tls/__init__.pyi`):** Exposed 11 bounds-checked QUIC transport and HTTP/3 framing controls (`receive_window`, `stream_receive_window`, `send_window`, `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`, `max_idle_timeout`, `keep_alive_interval`, `send_grease`, `max_field_section_size`, `enable_datagram`, `enable_extended_connect`) on `Session`, `AsyncSession`, `Client`, `AsyncClient`, module helpers, and `http_tls_create_session` JSON.
+- **Full Akamai HTTP/2 Fingerprint Parity on TCP Real ECH (`src/tcp_ech.rs`, `src/options.rs`):** Added `RawHttp2Config` and `apply_h2_fingerprint()` so TCP Real ECH (`ech=True`, `http2_only=True`) applies exact per-browser Akamai H2 `SETTINGS`, `settings_order`, `WINDOW_UPDATE`, `headers_pseudo_order`, and `no_rfc7540_priorities` (Chrome/Edge/Opera, Firefox/Tor, Safari, OkHttp) plus full `http2_options` / `akamai_h2` overrides.
+- **Single-Flight `H3Pool` Dial Coalescing (`src/h3_transport.rs`):** Added per-key async dial locking so concurrent cold HTTP/3 bursts (e.g., `gather()` / `asyncio.gather()`) coalesce into a single QUIC handshake and multiplex cleanly instead of evicting in-flight sibling streams.
+
 ## [1.3.1] - 2026-11-26
 
 ### Documentation, Visuals & Release Pipeline

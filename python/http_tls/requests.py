@@ -107,6 +107,7 @@ class Session:
         ja3: Optional[str] = None,
         http2_options: Optional[Dict[str, Any]] = None,
         akamai_h2: Optional[str] = None,
+        quic_options: Optional[Dict[str, Any]] = None,
         http1_only: bool = False,
         http2_only: bool = False,
         http3: bool = False,
@@ -260,6 +261,7 @@ class Session:
                 header_order=list(header_order) if header_order else None,
                 tls_options=merged_tls,
                 http2_options=merged_h2,
+                quic_options=dict(quic_options) if quic_options else None,
                 http1_only=http1_only,
                 http2_only=http2_only,
                 http3=self.http3,
@@ -1393,14 +1395,14 @@ class AsyncSession:
 _SESSION_KEYS = (
     "timeout", "connect_timeout", "read_timeout", "verify", "proxies", "proxy", "proxies_pool",
     "allow_redirects", "follow_redirects", "auth", "cert", "header_order", "tls_options", "ja3",
-    "http2_options", "akamai_h2", "http1_only", "http2_only", "http3", "http3_only", "auto_upgrade_h3",
+    "http2_options", "akamai_h2", "quic_options", "http1_only", "http2_only", "http3", "http3_only", "auto_upgrade_h3",
     "ech", "ech_doh_url", "doh", "doh_url", "resolve", "local_address", "interface",
     "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay", "tcp_keepalive",
     "auto_referer", "fetch_mode", "transport", "retries", "retry_backoff", "retry_statuses",
     "retry_on_challenge", "rotate_impersonate", "event_hooks", "engine",
 )
 _REQ_SKIP_KEYS = {
-    "engine", "cert", "tls_options", "ja3", "http2_options", "akamai_h2", "http1_only", "http2_only",
+    "engine", "cert", "tls_options", "ja3", "http2_options", "akamai_h2", "quic_options", "http1_only", "http2_only",
     "http3_only", "auto_upgrade_h3", "ech_doh_url", "doh", "doh_url",
     "resolve", "interface", "tls_info", "keylog_file", "system_dns", "limits", "tcp_nodelay",
     "tcp_keepalive", "auto_referer", "transport", "connect_timeout", "read_timeout", "proxies_pool",
